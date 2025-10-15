@@ -1138,10 +1138,6 @@ EOL
   sleep 3
 }
 #===========Install Python and Dependencies==========
-# -----------------------------------------
-# Python 3.10.5 Build & Install (dialog gauge + summary)
-# Dynamic pacing during compile step
-# -----------------------------------------
 python310_setup_module() {
   local TITLE="Python 3.10 Setup"
   local BACKTITLE="Python 3.10 Setup"
@@ -1462,7 +1458,7 @@ configure_dnf_automatic() {
     echo "$VALIDATE_OUTPUT" >> "$LOG"
 
     if echo "$VALIDATE_OUTPUT" | grep -q "apply_updates = yes"; then
-        STATUS_MSG=" Security updates enabled.\n"
+        STATUS_MSG="Security updates enabled.\n"
     else
         dialog --title "Error" --msgbox "Configuration failed.\nCheck $CONFIG or $LOG." 7 50
         return 1
