@@ -5,10 +5,6 @@ YELLOW="\033[1;33m"
 TEXTRESET="\033[0m"
 CYAN="\e[36m"
 RESET="\e[0m"
-USER=$(whoami)
-
-
-
 clear
 echo -e "${CYAN}CMDS${TEXTRESET} Builder ${YELLOW}Installation${TEXTRESET}"
 
