@@ -67,7 +67,7 @@ INSTALLER="/root/CMDS2Installer/CMDS2Install.sh"
 
 cat << 'EOF' >> "$PROFILE"
 
-## Run RADS installer on every interactive login ##
+## Run CMDS installer on every interactive login ##
 if [[ $- == *i* ]]; then
   /root/CMDS2Installer/CMDS2Install.sh
 fi
