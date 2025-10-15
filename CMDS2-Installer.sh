@@ -71,7 +71,7 @@ echo -e "${CYAN}==>Retrieving files from Github...${TEXTRESET}"
 sleep 1
 
 
-#Clone RADS
+#Clone CMDS
 
 mkdir -p /root/CMDS2Installer
 rm -rf /root/CMDS2Installer && git clone https://github.com/fumatchu/CMDS2.git /root/CMDS2Installer
