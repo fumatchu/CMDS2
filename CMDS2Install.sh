@@ -1287,18 +1287,17 @@ cleanup_installer_files() {
     echo "# Starting cleanup..." >> "$TMP_PROGRESS"
 
     # Remove DCInstall.sh launch block
-    sed -i '/## Run RADS installer on every interactive login ##/,/fi/d' /root/.bash_profile
-    echo "[INFO] Removed RADS installer launch block" >> "$LOG_FILE"
+    sed -i '/## Run CMDS installer on every interactive login ##/,/fi/d' /root/.bash_profile
+    echo "[INFO] Removed CMDS installer launch block" >> "$LOG_FILE"
     echo "30"; sleep 0.5
 
     # Also remove any straggling DCInstall.sh lines
-    sed -i '/DCInstall.sh/d' /root/.bash_profile
-    echo "[INFO] Removed any additional DCInstall.sh entries" >> "$LOG_FILE"
+    sed -i '/CMDS2Install.sh/d' /root/.bash_profile
+    echo "[INFO] Removed any additional CMDS2Install.sh entries" >> "$LOG_FILE"
     echo "50"; sleep 0.5
 
     # Delete installer-related files
-    rm -rf /root/DC-Installer.sh /root/CMDS2Installer >> "$LOG_FILE" 2>&1
-    rm -f /root/samba*.src.rpm >> "$LOG_FILE" 2>&1
+    rm -rf /root/CMDS2-Installer.sh /root/CMDS2Installer >> "$LOG_FILE" 2>&1
     echo "[INFO] Removed installer files" >> "$LOG_FILE"
     echo "90"; sleep 0.5
 
