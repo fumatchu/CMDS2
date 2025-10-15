@@ -96,7 +96,7 @@ while choice=$(dialog --title "$TITLE" \
   --menu "Please select the install type" 15 65 3 "${items[@]}" \
   2>&1 >/dev/tty); do
   case $choice in
-  1) /root/ADDCInstaller/CMDS2Install.sh ;;
+  1) /root/CMDS2Installer/CMDS2Install.sh ;;
 
 
   esac
