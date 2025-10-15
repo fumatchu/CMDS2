@@ -423,90 +423,110 @@ validate_time_sync() {
 }
 
 # ========= SYSTEM UPDATE & PACKAGE INSTALL =========
+# ========= SYSTEM UPDATE & PACKAGE INSTALL (per-package with gauge text) =========
 update_and_install_packages() {
-  # Simulate progress while enabling EPEL and CRB
-  dialog --backtitle "Base Package Update" --title "Repository Setup" --gauge "Enabling EPEL and CRB repositories..." 10 60 0 < <(
+  local BACK="Base Package Update"
+  local LOGDIR="/var/log/installer"
+  local REPLOG="$LOGDIR/repo-setup.log"
+  local UPDLOG="$LOGDIR/system-upgrade.log"
+  local REQLOG="$LOGDIR/required-packages.log"
+  mkdir -p "$LOGDIR"
+
+  export DNF_COLOR=0
+  export LC_ALL=C LANG=C
+
+  # ------------------ Enable/refresh repos (quiet) with gauge -------------------
+  : >"$REPLOG"
+  dialog --backtitle "$BACK" --title "Repository Setup" --gauge "Enabling EPEL and CRB repositories..." 10 70 0 < <(
     (
-      (
-        dnf install -y epel-release >/dev/null 2>&1
-        dnf config-manager --set-enabled crb >/dev/null 2>&1
-      ) &
+      {
+        dnf -y -q install epel-release                 --setopt=install_weak_deps=False   --color=never >>"$REPLOG" 2>&1
+        dnf -y -q install dnf-plugins-core             --setopt=install_weak_deps=False   --color=never >>"$REPLOG" 2>&1 || true
+        dnf -q config-manager --set-enabled crb                                           --color=never >>"$REPLOG" 2>&1 || true
+        dnf -y -q makecache --refresh                   --setopt=metadata_timer_sync=0     --color=never >>"$REPLOG" 2>&1
+      } &
       PID=$!
       PROGRESS=0
       while kill -0 "$PID" 2>/dev/null; do
         echo "$PROGRESS"
         echo "XXX"
-        echo "Enabling EPEL and CRB..."
+        echo -e "Enabling EPEL and CRB...\n\nLog: $REPLOG"
         echo "XXX"
-        ((PROGRESS += 5))
-        if [[ $PROGRESS -ge 95 ]]; then
-          PROGRESS=5
-        fi
-        sleep 0.5
+        ((PROGRESS+=5)); ((PROGRESS>=95)) && PROGRESS=5
+        sleep 0.4
       done
-      echo "100"
-      echo "XXX"
-      echo "Repositories enabled."
-      echo "XXX"
+      wait "$PID"
+      echo "100"; echo "XXX"; echo -e "Repositories enabled.\n\nLog: $REPLOG"; echo "XXX"
     )
   )
 
-  dialog --backtitle "Base Package Update" --title "System Update" --infobox "Checking for updates. This may take a few moments..." 5 70
-  sleep 2
+  # ----------------------- Build list of upgradable packages --------------------
+  # Use repoquery for reliable parsing (needs dnf-plugins-core, ensured above)
+  mapfile -t PACKAGE_LIST < <(dnf -q repoquery --upgrades --qf '%{name}' 2>/dev/null | sort -u)
 
-  dnf check-update -y &>/dev/null
-
-  TEMP_FILE=$(mktemp)
-  dnf check-update | awk '{print $1}' | grep -vE '^$|Obsoleting|Last' | awk -F'.' '{print $1}' | sort -u > "$TEMP_FILE"
-
-  PACKAGE_LIST=($(cat "$TEMP_FILE"))
   TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
-
   if [[ "$TOTAL_PACKAGES" -eq 0 ]]; then
-    dialog --backtitle "Base Package Update" --title "System Update" --msgbox "No updates available!" 6 50
-    rm -f "$TEMP_FILE"
+    dialog --backtitle "$BACK" --title "System Update" --infobox "No updates available." 6 40
+    sleep 2
   else
-    PIPE=$(mktemp -u)
-    mkfifo "$PIPE"
-    dialog --backtitle "Base Package Update" --title "System Update" --gauge "Installing updates..." 10 70 0 < "$PIPE" &
-    exec 3>"$PIPE"
+    : >"$UPDLOG"
+    PIPE=$(mktemp -u); mkfifo "$PIPE"
+    dialog --backtitle "$BACK" --title "System Update" --gauge "Installing updates..." 10 70 0 < "$PIPE" &
     COUNT=0
-    for PACKAGE in "${PACKAGE_LIST[@]}"; do
-      ((COUNT++))
-      PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
-      echo "$PERCENT" > "$PIPE"
-      echo "XXX" > "$PIPE"
-      echo "Updating: $PACKAGE" > "$PIPE"
-      echo "XXX" > "$PIPE"
-      dnf -y install "$PACKAGE" >/dev/null 2>&1
-    done
-    exec 3>&-
-    rm -f "$PIPE" "$TEMP_FILE"
+    {
+      for PACKAGE in "${PACKAGE_LIST[@]}"; do
+        ((COUNT++))
+        PERCENT=$(( COUNT * 100 / TOTAL_PACKAGES ))
+        echo "$PERCENT"
+        echo "XXX"
+        echo "Updating: $PACKAGE"
+        echo "XXX"
+        # Per-package upgrade (quiet, no ANSI), log output
+        dnf -y -q upgrade --color=never --best --allowerasing "$PACKAGE" >>"$UPDLOG" 2>&1
+      done
+      echo "100"; echo "XXX"; echo -e "Base packages updated.\n\nLog: $UPDLOG"; echo "XXX"
+    } > "$PIPE"
+    wait
+    rm -f "$PIPE"
   fi
 
-  dialog --backtitle "Required Package Install" --title "Package Installation" --infobox "Installing Required Packages..." 5 50
-  sleep 2
-  PACKAGE_LIST=("ntsysv" "iptraf" "expect" "gcc" "tar" "nmap" "openssl-devel" "make" "at" "bc" "bzip2-devel" "libffi-devel" "zlib-devel" "nano" "rsync" "sshpass" "openldap-clients" "fail2ban" "tuned" "cockpit" "tftp-server" "cockpit-storaged" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "git" "dnf-automatic" "dnf-plugins-core" "util-linux" "htop" "iptraf-ng" "mc")
-  TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
+  # ---------------------- Install required packages (per-package) ---------------
+  dialog --backtitle "Required Package Install" --title "Package Installation" \
+         --infobox "Installing required packages..." 5 60
+  sleep 1
 
-  PIPE=$(mktemp -u)
-  mkfifo "$PIPE"
-  dialog --backtitle "Required Package Install" --title "Installing Required Packages" --gauge "Preparing to install packages..." 10 70 0 < "$PIPE" &
-  exec 3>"$PIPE"
-  COUNT=0
-  for PACKAGE in "${PACKAGE_LIST[@]}"; do
-    ((COUNT++))
-    PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
-    echo "$PERCENT" > "$PIPE"
-    echo "XXX" > "$PIPE"
-    echo "Installing: $PACKAGE" > "$PIPE"
-    echo "XXX" > "$PIPE"
-    dnf -y install "$PACKAGE" >/dev/null 2>&1
-  done
-  exec 3>&-
+  : >"$REQLOG"
+  local REQUIRED_PKGS=(
+    ntsysv iptraf expect gcc tar nmap openssl-devel make at bc bzip2-devel
+    libffi-devel zlib-devel nano rsync sshpass openldap-clients fail2ban tuned
+    cockpit tftp-server cockpit-storaged cockpit-files net-tools dmidecode ipcalc
+    bind-utils iotop zip yum-utils curl wget git dnf-automatic dnf-plugins-core
+    util-linux htop iptraf-ng mc
+  )
+
+  local TOTAL_REQ=${#REQUIRED_PKGS[@]}
+  local COUNT=0
+  PIPE=$(mktemp -u); mkfifo "$PIPE"
+  dialog --backtitle "Required Package Install" --title "Installing Required Packages" \
+         --gauge "Preparing to install packages..." 10 70 0 < "$PIPE" &
+  {
+    for PACKAGE in "${REQUIRED_PKGS[@]}"; do
+      ((COUNT++))
+      PERCENT=$(( COUNT * 100 / TOTAL_REQ ))
+      echo "$PERCENT"
+      echo "XXX"
+      echo "Installing: $PACKAGE"
+      echo "XXX"
+      dnf -y -q install --color=never --setopt=tsflags=nodocs "$PACKAGE" >>"$REQLOG" 2>&1
+    done
+    echo "100"; echo "XXX"; echo -e "All required packages processed.\n\nLog: $REQLOG"; echo "XXX"
+  } > "$PIPE"
+  wait
   rm -f "$PIPE"
-  dialog --backtitle "Required Package Install" --title "Installation Complete" --infobox "All packages installed successfully!" 6 50
-  sleep 3
+
+  dialog --backtitle "Required Package Install" --title "Installation Complete" \
+         --infobox "Required package installation complete.\nSee logs in $LOGDIR" 7 70
+  sleep 2
 }
 #===========DETECT VIRT and INSTALL GUEST=============
 # Function to show a dialog infobox
