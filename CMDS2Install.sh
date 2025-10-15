@@ -1141,6 +1141,137 @@ EOL
   dialog --backtitle "Configure Fail2ban for SSH" --title "Success" --infobox "Fail2Ban has been configured and started successfully." 6 60
   sleep 3
 }
+#===========Install Python and Dependencies==========
+# -----------------------------------------
+# Python 3.10.5 Build & Install (dialog gauge + summary)
+# Dynamic pacing during compile step
+# -----------------------------------------
+python310_setup_module() {
+  local TITLE="Python 3.10 Setup"
+  local BACKTITLE="Python 3.10 Setup"
+  local LOGFILE="/var/log/python310-setup.log"
+  local PYVER="3.10.5"
+  local PYTGZ="Python-${PYVER}.tgz"
+  local PYSRC="Python-${PYVER}"
+
+  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+  : > "$LOGFILE"
+
+  # ---- Preflight (auto-close errors) ----
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"ERROR: This function must be run as root (sudo)." 7 60
+    sleep 2; return 1
+  fi
+  local OSMAJOR=""
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+  elif [[ -r /etc/redhat-release ]]; then
+    OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+  fi
+  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"ERROR: This installer supports Rocky Linux 9 or newer." 7 60
+    sleep 2; return 1
+  fi
+
+  # ---- Gauge helpers ----
+  _gauge_update() {  # usage: _gauge_update <pct> <message...>
+    local pct="$1"; shift
+    echo "XXX"; echo "$pct"; echo -e "$*"; echo "XXX"
+  }
+
+  _run_step() {      # usage: _run_step <target_pct> <label> <cmd...>
+    local target_pct="$1"; shift
+    local label="$1"; shift
+    _gauge_update "$((target_pct-1))" "$label..."
+    { "$@" >>"$LOGFILE" 2>&1; } || return 1
+    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+  }
+
+  # Dynamic pacing: faster early, slower near target
+  _run_long_step() { # usage: _run_long_step <start_pct> <target_pct> <label> <cmd...>
+    local start_pct="$1"; local target_pct="$2"; shift 2
+    local label="$1"; shift
+    _gauge_update "$start_pct" "$label (running)..."
+
+    { "$@" >>"$LOGFILE" 2>&1 & }
+    local pid=$!
+    local pct="$start_pct"
+
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      # Increment toward target-1, never reaching it until the command finishes
+      pct=$((pct + 1))
+      if (( pct >= target_pct )); then pct=$((target_pct-1)); fi
+
+      # Dynamic pacing: slow down as we get closer to the target
+      #   <= 60%  : snappy updates
+      #   61–70%  : moderate
+      #   71–(target-1): slower (feels realistic near the end)
+      if   (( pct <= 60 )); then sleep 1
+      elif (( pct <= 70 )); then sleep 5
+      else                       sleep 2
+      fi
+
+      _gauge_update "$pct" "$label (running)..."
+    done
+
+    wait "$pid" || return 1
+    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+  }
+
+  # ---- Run the build with a single gauge ----
+  {
+    _gauge_update 1 "Starting Python ${PYVER} setup (Rocky ${OSMAJOR})..."; sleep 0.4
+
+    _run_step 5  "Preparing /root working directory" bash -lc 'cd /root' || exit 1
+    _run_step 10 "Downloading ${PYTGZ}"             bash -lc "cd /root && wget -q https://www.python.org/ftp/python/${PYVER}/${PYTGZ}" || exit 1
+    _run_step 15 "Extracting ${PYTGZ}"              bash -lc "cd /root && tar xzf ${PYTGZ}" || exit 1
+    _run_step 25 "Configuring (enable optimizations)" bash -lc "cd /root/${PYSRC} && ./configure --enable-optimizations" || exit 1
+
+    local JOBS; JOBS="$(nproc 2>/dev/null || echo 4)"
+    _run_long_step 25 80 "Compiling (make -j ${JOBS})" bash -lc "cd /root/${PYSRC} && make -j ${JOBS}" || exit 1
+
+    _run_step 85 "Installing (make altinstall)"     bash -lc "cd /root/${PYSRC} && make altinstall" || exit 1
+    _run_step 88 "Bootstrapping pip (ensurepip)"    /usr/local/bin/python3.10 -m ensurepip --upgrade || true
+    _run_long_step 90 93 "Upgrading pip/setuptools/wheel" /usr/local/bin/python3.10 -m pip install --upgrade pip setuptools wheel || exit 1
+    _run_long_step 93 96 "Installing meraki & requests"  /usr/local/bin/python3.10 -m pip install -U meraki requests || exit 1
+    _run_step 97 "Relocating sources to /opt/${PYSRC}" bash -lc "mv -f /root/${PYSRC}/ /opt/" || exit 1
+    _run_step 99 "Cleaning /root artifacts"         bash -lc "rm -f /root/Python* 2>/dev/null || true" || exit 1
+    _gauge_update 100 "Finalizing..."; sleep 0.5
+  } | dialog --backtitle "$BACKTITLE" --title "Building Python ${PYVER}" \
+             --gauge "Initializing..." 18 90 0
+
+  # ---- Post-check & summary ----
+  if ! command -v /usr/local/bin/python3.10 >/dev/null 2>&1; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"Python 3.10 installation appears to have failed.
+See log: $LOGFILE" 8 70
+    sleep 2; return 1
+  fi
+
+  local PYBIN="/usr/local/bin/python3.10"
+  local PYV="$("$PYBIN" -V 2>&1 || true)"
+  local PIPV="$("$PYBIN" -m pip --version 2>&1 || true)"
+  local MERAKI_V="$("$PYBIN" -m pip show meraki 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+  local REQ_V="$("$PYBIN" -m pip show requests 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+
+  local REPORT="Python setup complete.
+
+${PYV}
+${PIPV}
+meraki:  ${MERAKI_V:-not installed}
+requests: ${REQ_V:-not installed}
+
+Binary: /usr/local/bin/python3.10
+Sources: /opt/${PYSRC}
+Log: ${LOGFILE}
+
+Continuing..."
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "$REPORT" 14 78
+  sleep 2
+  return 0
+}
 #===========TFTP Server Setup=============
 tftp_setup_module() {
   local TITLE="TFTP Server Configuration"
@@ -1397,6 +1528,7 @@ update_and_install_packages
 vm_detection
 configure_firewall
 update_issue_file
+python310_setup_module
 tftp_setup_module
 configure_fail2ban
 configure_dnf_automatic
