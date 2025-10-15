@@ -490,7 +490,7 @@ update_and_install_packages() {
 
   dialog --backtitle "Required Package Install" --title "Package Installation" --infobox "Installing Required Packages..." 5 50
   sleep 2
-  PACKAGE_LIST=("ntsysv" "iptraf" "expect" "tar" "nmap" "openssl-devel" "make" "at" "bc" "bzip2-devel" "libffi-devel" "zlib-devel" "nano" "rsync" "sshpass" "openldap-clients" "fail2ban" "tuned" "cockpit" "tftp-server" "cockpit-storaged" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "git" "dnf-automatic" "dnf-plugins-core" "util-linux" "htop" "iptraf-ng" "mc")
+  PACKAGE_LIST=("ntsysv" "iptraf" "expect" "gcc" "tar" "nmap" "openssl-devel" "make" "at" "bc" "bzip2-devel" "libffi-devel" "zlib-devel" "nano" "rsync" "sshpass" "openldap-clients" "fail2ban" "tuned" "cockpit" "tftp-server" "cockpit-storaged" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "git" "dnf-automatic" "dnf-plugins-core" "util-linux" "htop" "iptraf-ng" "mc")
   TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
 
   PIPE=$(mktemp -u)
