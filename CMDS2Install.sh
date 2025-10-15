@@ -1485,7 +1485,520 @@ prompt_reboot_now() {
     reboot
   fi
 }
+# ============================================================
+# Service Installer Checklist
+#  - Bind DNS (caching-only)  ✅
+#  - NTP (Chrony)             ✅
+#  - DHCP (Kea)               ✅ (new integration)
+#  - NONE (continue)          ✅
+#  All popups auto-close (no OK buttons) except where inputs/yes-no are needed.
+# ============================================================
 
+service_menu_checklist() {
+  local BACKTITLE="Service Installer"
+  local TITLE="Install/Configure Services"
+
+  # Single-shot checklist (no loop-back)
+  local selection
+  selection=$(dialog --backtitle "$BACKTITLE" --title "$TITLE" --checklist \
+"Space = toggle; Enter = continue. You can pick more than one.
+Select \"Do not install any services (continue)\" to skip and move on." 19 80 8 \
+    BIND "Bind DNS (caching-only)"                   OFF \
+    KEA  "DHCP (Kea)"                                OFF \
+    NTP  "NTP (Chrony)"                              OFF \
+    NONE "Do not install any services (continue)"    OFF \
+    3>&1 1>&2 2>&3)
+
+  local rc=$?
+  [[ $rc -ne 0 ]] && return 0  # ESC/Cancel → continue main installer
+
+  # shellcheck disable=SC2206
+  local choices=($selection)
+
+  if [[ ${#choices[@]} -eq 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"No services selected. Continuing..." 6 60; sleep 2
+    return 0
+  fi
+
+  local tag
+  for tag in "${choices[@]}"; do
+    tag="${tag%\"}"; tag="${tag#\"}"
+    if [[ "$tag" == "NONE" ]]; then
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"No services will be installed. Continuing..." 6 60; sleep 2
+      return 0
+    fi
+  done
+
+  # Run selected installers in sequence, then return to caller
+  for tag in "${choices[@]}"; do
+    tag="${tag%\"}"; tag="${tag#\"}"
+    case "$tag" in
+      BIND) bind_caching_setup ;;
+      KEA)  kea_dhcp_setup ;;
+      NTP)  chrony_setup ;;
+    esac
+  done
+
+  return 0
+}
+
+# -----------------------------
+# Bind (caching-only) installer
+# -----------------------------
+bind_caching_setup() {
+  local BACKTITLE="Service Installer"
+  local TITLE="Bind (Caching-Only) Setup"
+  local LOGFILE="/var/log/bind-caching-setup.log"
+  local NAMED_CONF="/etc/named.conf"
+  local NAMED_BAK="/etc/named.conf.bak.$(date +%Y%m%d-%H%M%S)"
+
+  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+  : > "$LOGFILE"
+
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+           --infobox "ERROR: This must be run as root (sudo)." 7 55
+    sleep 2; return 1
+  fi
+  local OSMAJOR=""
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+  elif [[ -r /etc/redhat-release ]]; then
+    OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+  fi
+  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+           --infobox "ERROR: Rocky Linux 9 or newer is required." 7 55
+    sleep 2; return 1
+  fi
+
+  _gauge_update() { echo "XXX"; echo "$1"; shift; echo -e "$*"; echo "XXX"; }
+  _run_step() { local pct="$1"; shift; local label="$1"; shift
+    _gauge_update "$((pct-1))" "$label..."
+    { "$@" >>"$LOGFILE" 2>&1; } || return 1
+    _gauge_update "$pct" "$label...done"; sleep 0.3
+  }
+
+  {
+    _gauge_update 1  "Starting Bind (caching-only) setup..."
+    sleep 0.4
+    _run_step 8  "Installing bind & bind-utils"    dnf -y -q install bind bind-utils || exit 1
+    _run_step 15 "Enabling DNS service in firewall" firewall-cmd --zone=public --add-service=dns --permanent || exit 1
+    _run_step 20 "Reloading firewall"               firewall-cmd --complete-reload || exit 1
+    _run_step 30 "Backing up named.conf"            cp -f "$NAMED_CONF" "$NAMED_BAK" || exit 1
+
+    _gauge_update 50 "Updating named.conf for caching-only..."
+    {
+      awk '
+        BEGIN { inopt=0 }
+        /^[[:space:]]*options[[:space:]]*\{/ {
+          inopt=1
+          print
+          print "        listen-on port 53 { any; };"
+          print "        listen-on-v6 { any; };"
+          print "        allow-query { any; };"
+          print "        recursion yes;"
+          next
+        }
+        inopt && /^[[:space:]]*\}/ { inopt=0; print; next }
+        inopt {
+          if ($0 ~ /^[[:space:]]*listen-on([[:space:]]+port[[:space:]]+53)?[[:space:]]*\{/) next
+          if ($0 ~ /^[[:space:]]*listen-on-v6([[:space:]]+port[[:space:]]+53)?[[:space:]]*\{/) next
+          if ($0 ~ /^[[:space:]]*allow-query[[:space:]]*\{/) next
+          if ($0 ~ /^[[:space:]]*recursion[[:space:]]+/) next
+          print; next
+        }
+        { print }
+      ' "$NAMED_CONF" > "${NAMED_CONF}.tmp" && mv -f "${NAMED_CONF}.tmp" "$NAMED_CONF"
+    } >>"$LOGFILE" 2>&1 || exit 1
+    _gauge_update 60 "Updating named.conf for caching-only...done"; sleep 0.3
+    _run_step 70 "Validating named.conf"            named-checkconf -z || exit 1
+    _run_step 85 "Enabling named (systemd)"         systemctl enable named || exit 1
+    _run_step 95 "Starting named"                   systemctl restart named || exit 1
+    _gauge_update 100 "Finalizing..."; sleep 0.5
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" --gauge "Initializing..." 18 90 0
+
+  local NAMED_STATUS="unknown"
+  systemctl is-active named >/dev/null 2>&1 && NAMED_STATUS="active" || NAMED_STATUS="inactive"
+
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"Bind (caching-only) setup complete.
+
+• named service: ${NAMED_STATUS}
+• Config: /etc/named.conf (backup: ${NAMED_BAK})
+• Log: ${LOGFILE}
+
+Continuing..." 12 70
+  sleep 2
+  return 0
+}
+
+# -----------------------------
+# Chrony NTP installer (from earlier)
+# -----------------------------
+chrony_setup() {
+  local BACKTITLE="Service Installer"
+  local TITLE="Chrony NTP Configuration"
+  local LOG_NTP="/tmp/chrony_ntp_configure.log"
+  local OSMAJOR=""
+
+  touch "$LOG_NTP"
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "ERROR: This must be run as root (sudo)." 7 55
+    sleep 2; return 1
+  fi
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+  elif [[ -r /etc/redhat-release ]]; then
+    OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+  fi
+  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "ERROR: Rocky Linux 9 or newer is required." 7 55
+    sleep 2; return 1
+  fi
+
+  _gauge_update() { echo "XXX"; echo "$1"; shift; echo -e "$*"; echo "XXX"; }
+  {
+    _gauge_update 10 "Installing chrony..."
+    dnf -y -q install chrony >>"$LOG_NTP" 2>&1 || exit 1
+    _gauge_update 60 "Enabling and starting chronyd..."
+    systemctl enable --now chronyd >>"$LOG_NTP" 2>&1 || exit 1
+    _gauge_update 100 "Chrony base installed."
+    sleep 0.4
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" --gauge "Preparing..." 10 70 0
+
+  declare -a ADDR
+
+  log_ntp() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_NTP"; }
+  validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; }
+
+  prompt_ntp_servers() {
+    while true; do
+      NTP_SERVERS=$(dialog --title "Chrony NTP Configuration" --backtitle "Configure NTP" \
+        --inputbox "Enter up to 3 comma-separated NTP server IPs or FQDNs:" 8 70 3>&1 1>&2 2>&3)
+      local exit_status=$?
+      [[ $exit_status -ne 0 ]] && return 1
+      if [[ -n "$NTP_SERVERS" ]]; then
+        IFS=',' read -ra ADDR <<< "$NTP_SERVERS"
+        if (( ${#ADDR[@]} > 3 )); then
+          dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "You may only enter up to 3 servers." 6 60
+          sleep 2; continue
+        fi
+        return 0
+      else
+        dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "The input cannot be blank. Please try again." 6 60
+        sleep 2
+      fi
+    done
+  }
+
+  prompt_allow_networks() {
+    while true; do
+      ALLOW_NET=$(dialog --title "Allow NTP Access" --backtitle "Configure NTP" \
+        --inputbox "Enter the CIDR range to allow NTP access (e.g., 192.168.1.0/24):" 8 80 3>&1 1>&2 2>&3)
+      local exit_status=$?
+      [[ $exit_status -ne 0 ]] && return 1
+      if validate_cidr "$ALLOW_NET"; then
+        return 0
+      else
+        dialog --backtitle "Configure NTP" --infobox "Invalid CIDR format. Please try again." 6 60
+        sleep 2
+      fi
+    done
+  }
+
+  update_chrony_config() {
+    cp /etc/chrony.conf /etc/chrony.conf.bak
+    sed -i '/^\(server\|pool\|allow\)[[:space:]]/d' /etc/chrony.conf
+    for srv in "${ADDR[@]}"; do
+      echo "server ${srv} iburst" >> /etc/chrony.conf
+      log_ntp "Added server ${srv} to chrony.conf"
+    done
+    if [[ -n "$ALLOW_NET" ]]; then
+      echo "allow $ALLOW_NET" >> /etc/chrony.conf
+      log_ntp "Added allow $ALLOW_NET to chrony.conf"
+    fi
+    systemctl restart chronyd
+    sleep 1
+  }
+
+  validate_time_sync() {
+    local attempt=1 success=0 TRACKING=""
+    while (( attempt <= 3 )); do
+      dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "Validating time sync... Attempt $attempt/3" 5 60
+      sleep 5
+      TRACKING=$(chronyc tracking 2>&1)
+      echo "$TRACKING" >> "$LOG_NTP"
+      if echo "$TRACKING" | grep -q "Leap status[[:space:]]*:[[:space:]]*Normal"; then success=1; break; fi
+      ((attempt++))
+    done
+    if [[ "$success" -eq 1 ]]; then
+      dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "Time synchronized successfully:\n\n$TRACKING" 15 100
+      sleep 2; return 0
+    else
+      dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --yesno "Time sync failed after 3 attempts.\nDo you want to proceed anyway?" 8 80
+      [[ $? -eq 0 ]] || return 1
+      return 0
+    fi
+  }
+
+  if ! prompt_ntp_servers; then
+    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "NTP configuration cancelled." 6 50
+    sleep 2; return 1
+  fi
+  if ! prompt_allow_networks; then
+    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "No network was allowed. Configuration cancelled." 6 60
+    sleep 2; return 1
+  fi
+  update_chrony_config
+  if ! validate_time_sync; then
+    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "Chrony configuration aborted." 6 50
+    sleep 2; return 1
+  fi
+  dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "NTP configuration completed successfully.\nLog: $LOG_NTP" 7 80
+  sleep 2; return 0
+}
+
+# -----------------------------
+# Kea DHCP installer (NEW)
+# -----------------------------
+# Helpers used by Kea flow
+_kea_infobox() { dialog --backtitle "Service Installer" --title "$1" --infobox "$2" "${3:-7}" "${4:-70}"; }
+_enable_repos_with_gauge() {
+  local log="/tmp/repo-setup.$(date +%s).log"; : >"$log"
+  (
+    dnf -y install dnf-plugins-core >>"$log" 2>&1 || exit 1
+    dnf -y install epel-release     >>"$log" 2>&1 || exit 1
+    dnf config-manager --set-enabled crb >>"$log" 2>&1 || exit 1
+    dnf -y makecache --refresh      >>"$log" 2>&1 || exit 1
+  ) &
+  local pid=$!
+  (
+    local pct=0 msg="Enabling EPEL and CRB..."
+    while kill -0 "$pid" 2>/dev/null; do
+      (( pct < 95 )) && pct=$((pct+5))
+      echo "$pct"; echo "XXX"; echo -e "$msg\n\nLog: $log"; echo "XXX"; sleep 0.5
+    done
+    echo 100; echo "XXX"; echo -e "Repositories enabled and metadata refreshed.\n\nLog: $log"; echo "XXX"
+  ) | dialog --backtitle "Service Installer" --title "Repository Setup" --gauge "Preparing..." 10 70 0
+  wait "$pid" || { _kea_infobox "Repository Setup Failed" "There was a problem enabling repositories.\n\nLog: $log"; sleep 2; return 1; }
+  return 0
+}
+_run_gauge_cmd() {
+  local title="$1"; shift
+  local log="/tmp/$(basename "$1")-install.$(date +%s).log"; : >"$log"
+  ( "$@" &> "$log"; echo $? >/tmp/.cmd_rc.$$ ) & local pid=$!
+  (
+    local pct=0
+    while kill -0 "$pid" 2>/dev/null; do
+      echo "$pct"; echo "XXX"; echo -e "Installing... Please wait.\nLog: $log"; echo "XXX"
+      sleep 0.3; pct=$(( (pct + 2) % 97 ))
+    done
+    echo 100; echo "XXX"; echo "Finishing up..."; echo "XXX"
+  ) | dialog --backtitle "Service Installer" --title "$title" --gauge "Preparing..." 10 70 0
+  local rc=1
+  [[ -f /tmp/.cmd_rc.$$ ]] && { rc="$(cat /tmp/.cmd_rc.$$)"; rm -f /tmp/.cmd_rc.$$; }
+  if [[ "$rc" -ne 0 ]]; then
+    _kea_infobox "Error" "$title failed.\n\nLog: $log"; sleep 2; return "$rc"
+  else
+    _kea_infobox "Success" "$title completed.\n\nLog: $log"; sleep 2; return 0
+  fi
+}
+# IP / CIDR helpers
+_is_valid_ip(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { IFS=.; read -r a b c d <<<"$1"; [[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]; }; }
+_ip_to_int(){ local IFS=.; read -r a b c d <<<"$1"; echo $(( (a<<24)+(b<<16)+(c<<8)+d )); }
+_int_to_ip(){ local i=$1; printf "%d.%d.%d.%d" $(( (i>>24)&255 )) $(( (i>>16)&255 )) $(( (i>>8)&255 )) $(( i&255 )); }
+_cidr_to_netmask(){ local c=$1; local m=$(( 0xFFFFFFFF << (32-c) & 0xFFFFFFFF )); _int_to_ip "$m"; }
+_netmask_to_cidr(){
+  local ip=$1; $_is_valid_ip "$ip" || { echo -1; return; }
+  local n=$(_ip_to_int "$ip") c=0 saw_zero=0
+  for ((i=31;i>=0;i--)); do
+    if (( (n>>i)&1 )); then (( saw_zero )) && { echo -1; return; }; ((c++))
+    else saw_zero=1; fi
+  done; echo "$c"
+}
+_network_from_ip_cidr(){ local ip=$1 c=$2; local m=$(( 0xFFFFFFFF << (32-c) & 0xFFFFFFFF )); _int_to_ip $(( $(_ip_to_int "$ip") & m )); }
+_broadcast_from_ip_cidr(){ local ip=$1 c=$2; local m=$(( 0xFFFFFFFF << (32-c) & 0xFFFFFFFF )); _int_to_ip $(( $(_ip_to_int "$ip") | (~m & 0xFFFFFFFF) )); }
+_ip_in_cidr(){
+  local ip=$1 net=$2 c=$3
+  local m=$(( 0xFFFFFFFF << (32-c) & 0xFFFFFFFF ))
+  (( ( $(_ip_to_int "$ip") & m ) == ( $(_ip_to_int "$net") & m ) ))
+}
+_is_valid_domain(){
+  local d="$1"
+  [[ -n "$d" ]] || return 1
+  [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+kea_dhcp_setup() {
+  local BACKTITLE="Service Installer"
+  local TITLE="Kea DHCP Setup"
+  local KEA_CONF="/etc/kea/kea-dhcp4.conf"
+
+  # Root & OS checks
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "ERROR: Must be run as root (sudo)." 7 60
+    sleep 2; return 1
+  fi
+  local OSMAJOR=""
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+  elif [[ -r /etc/redhat-release ]]; then
+    OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+  fi
+  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "ERROR: Rocky Linux 9 or newer is required." 7 60
+    sleep 2; return 1
+  fi
+  command -v nmcli >/dev/null 2>&1 || { dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "ERROR: nmcli not found. Install NetworkManager." 7 70; sleep 2; return 1; }
+
+  # Enable repos + install kea
+  _enable_repos_with_gauge || return 1
+  _run_gauge_cmd "Installing Kea DHCP (kea)" dnf -y install kea || return 1
+
+  # Detect interface and addressing
+  local iface inet4_line INET4 CIDR NETWORK NETMASK BROADCAST
+  iface=$(nmcli -t -f DEVICE,STATE device status | awk -F: '$2=="connected"{print $1; exit}')
+  if [[ -z "$iface" ]]; then dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "No active interface found." 6 50; sleep 2; return 1; fi
+  inet4_line=$(nmcli -g IP4.ADDRESS device show "$iface" | head -n 1)
+  if [[ -z "$inet4_line" ]]; then dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "No IPv4 address found on $iface." 6 60; sleep 2; return 1; fi
+
+  INET4=${inet4_line%/*}
+  CIDR=${inet4_line#*/}
+  NETWORK=$(_network_from_ip_cidr "$INET4" "$CIDR")
+  NETMASK=$(_cidr_to_netmask "$CIDR")
+  BROADCAST=$(_broadcast_from_ip_cidr "$INET4" "$CIDR")
+
+  # Gather settings
+  local POOL_START POOL_END ROUTER DOM_SUFFIX SEARCH_DOMAIN DNS_SERVERS SUBNET_DESC
+  local DEF_SUFFIX="$(hostname -d 2>/dev/null || true)"
+  local DEF_SEARCH="${DEF_SUFFIX}"
+
+  while true; do
+    while true; do
+      POOL_START=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+        "Enter beginning IP of DHCP lease range (in $NETWORK/$CIDR):" 8 78)
+      [[ -n "$POOL_START" ]] && _is_valid_ip "$POOL_START" && _ip_in_cidr "$POOL_START" "$NETWORK" "$CIDR" && break
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Start IP must be a valid IPv4 within $NETWORK/$CIDR." 6 78; sleep 2
+    done
+    while true; do
+      POOL_END=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+        "Enter ending IP of DHCP lease range:" 8 78)
+      [[ -n "$POOL_END" ]] && _is_valid_ip "$POOL_END" && _ip_in_cidr "$POOL_END" "$NETWORK" "$CIDR" && \
+        (( $(_ip_to_int "$POOL_START") <= $(_ip_to_int "$POOL_END") )) && break
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "End IP must be valid, in $NETWORK/$CIDR, and ≥ start IP." 6 78; sleep 2
+    done
+    while true; do
+      ROUTER=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+        "Enter default gateway for clients (in $NETWORK/$CIDR):" 8 78)
+      [[ -n "$ROUTER" ]] && _is_valid_ip "$ROUTER" && _ip_in_cidr "$ROUTER" "$NETWORK" "$CIDR" && break
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Gateway must be a valid IPv4 within $NETWORK/$CIDR." 6 78; sleep 2
+    done
+    while true; do
+      DOM_SUFFIX=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+        "Enter domain suffix (for 'domain-name'):" 8 78 "${DEF_SUFFIX}")
+      _is_valid_domain "$DOM_SUFFIX" && break
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Please enter a valid domain suffix like 'ad.example.com'." 6 78; sleep 2
+    done
+    while true; do
+      SEARCH_DOMAIN=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+        "Enter search domain(s) for clients (comma-separated if multiple):" 9 78 "${DEF_SEARCH}")
+      local ok=1 IFS=, item
+      for item in $SEARCH_DOMAIN; do item="${item// /}"; _is_valid_domain "$item" || { ok=0; break; }; done
+      [[ $ok -eq 1 ]] && break
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "One or more domains are invalid. Use comma-separated FQDNs." 6 78; sleep 2
+    done
+    DNS_SERVERS=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+      "Enter DNS servers (comma separated, or leave default to use $INET4):" 8 78 "$INET4")
+    SUBNET_DESC=$(dialog --backtitle "$BACKTITLE" --stdout --inputbox \
+      "Enter a friendly name/description for this subnet:" 8 78)
+
+    dialog --backtitle "$BACKTITLE" --title "Kea DHCP Settings Review" --yesno \
+"Interface:     $iface
+Interface IP:  $INET4/$CIDR
+Subnet:        $NETWORK/$CIDR
+Broadcast:     $BROADCAST
+Range:         $POOL_START  →  $POOL_END
+Gateway:       $ROUTER
+DNS:           $DNS_SERVERS
+Domain:        $DOM_SUFFIX
+Search:        $SEARCH_DOMAIN
+Description:   $SUBNET_DESC
+
+Are these settings correct?" 20 72 && break
+  done
+
+  # Write config
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Creating $KEA_CONF ..." 6 60; sleep 1
+  mkdir -p /etc/kea; touch "$KEA_CONF"
+  cat <<EOF > "$KEA_CONF"
+{
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": [ "$iface" ]
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases4.csv"
+    },
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "$NETWORK/$CIDR",
+        "interface": "$iface",
+        "comment": "$SUBNET_DESC",
+        "pools": [ { "pool": "$POOL_START - $POOL_END" } ],
+        "option-data": [
+          { "name": "routers",               "data": "$ROUTER" },
+          { "name": "domain-name-servers",   "data": "$DNS_SERVERS" },
+          { "name": "ntp-servers",           "data": "$DNS_SERVERS" },
+          { "name": "domain-name",           "data": "$DOM_SUFFIX" },
+          { "name": "domain-search",         "data": "$SEARCH_DOMAIN" }
+        ]
+      }
+    ],
+    "authoritative": true
+  }
+}
+EOF
+  chown root:kea "$KEA_CONF"
+  chmod 640 "$KEA_CONF"
+  restorecon "$KEA_CONF" 2>/dev/null || true
+
+  # Syntax check, enable, start, firewall
+  local syntax=""
+  if ! syntax="$(kea-dhcp4 -t "$KEA_CONF" 2>&1)"; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Kea config test failed:\n\n$syntax" 12 100
+    sleep 3; return 1
+  fi
+
+  systemctl enable --now kea-dhcp4 >/dev/null 2>&1 || {
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Failed to start kea-dhcp4. Check: systemctl status kea-dhcp4" 7 80
+    sleep 2; return 1
+  }
+
+  firewall-cmd --zone=public --add-service=dhcp --permanent >/dev/null 2>&1 || true
+  firewall-cmd --reload >/dev/null 2>&1 || true
+
+  # Final status
+  local SVC="kea-dhcp4" ok_svc=0
+  systemctl is-active --quiet "$SVC" && ok_svc=1
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"Kea DHCP setup complete.
+
+• Service:      $SVC ($( [[ $ok_svc -eq 1 ]] && echo active || echo inactive ))
+• Config file:  $KEA_CONF
+
+Tip:
+  journalctl -u $SVC -b --no-pager | tail -n 50
+
+Continuing..." 14 80
+  sleep 2
+  return 0
+}
 # ========= MAIN =========
 detect_active_interface
 prompt_static_ip_if_dhcp
@@ -1494,27 +2007,28 @@ check_and_enable_selinux
 check_internet_connectivity
 validate_and_set_hostname
 show_server_checklist
-configure_dhcp_server
+service_menu_checklist
+#configure_dhcp_server
 # === Set Time ===
-if ! prompt_ntp_servers; then
-    dialog --title "Chrony NTP Configuration" --msgbox "NTP configuration was cancelled." 6 40
-    exit 1
-fi
+#if ! prompt_ntp_servers; then
+#    dialog --title "Chrony NTP Configuration" --msgbox "NTP configuration was cancelled." 6 40
+#    exit 1
+#fi
 
-if ! prompt_allow_networks; then
-    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --msgbox "No network was allowed. Configuration cancelled." 6 50
-    exit 1
-fi
+#if ! prompt_allow_networks; then
+#    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --msgbox "No network was allowed. Configuration cancelled." 6 50
+#    exit 1
+#fi
 
-update_chrony_config
+#update_chrony_config
 
-if ! validate_time_sync; then
-    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --msgbox "Chrony configuration aborted." 6 40
-    exit 1
-fi
+#if ! validate_time_sync; then
+#    dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --msgbox "Chrony configuration aborted." 6 40
+#    exit 1
+#fi
 
-dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "NTP configuration completed successfully." 4 60
-sleep 3
+#dialog --backtitle "Configure NTP" --title "Chrony NTP Configuration" --infobox "NTP configuration completed successfully." 4 60
+#sleep 3
 #=== End Set time ===
 update_and_install_packages
 vm_detection
