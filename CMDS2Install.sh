@@ -1021,17 +1021,6 @@ $( [[ -n "$syntax" ]] && echo -e "Syntax check output:\n\n$syntax" || echo "No s
   clear
   return 1
 }
-#===========SET SELINUX=============
-configure_selinux() {
-  dialog --backtitle "SELinux setsbool Configuration" --title "SELinux Configuration" --infobox "Applying SELinux settings for Samba..." 5 50
-  sleep 2
-  setsebool -P samba_create_home_dirs=on \
-             samba_domain_controller=on \
-             samba_enable_home_dirs=on \
-             samba_portmapper=on \
-             use_samba_home_dirs=on
-sleep2
-}
 #===========CONFGIURE FIREWALL=============
 configure_firewall() {
   dialog --backtitle "Firewall Services Configuration" --title "Firewall Configuration" --infobox "Applying firewall rules for AD services..." 5 60
@@ -1406,7 +1395,6 @@ sleep 3
 #=== End Set time ===
 update_and_install_packages
 vm_detection
-configure_selinux
 configure_firewall
 update_issue_file
 tftp_setup_module
