@@ -1019,7 +1019,7 @@ $( [[ -n "$syntax" ]] && echo -e "Syntax check output:\n\n$syntax" || echo "No s
 }
 #===========CONFGIURE FIREWALL=============
 configure_firewall() {
-  dialog --backtitle "Firewall Services Configuration" --title "Firewall Configuration" --infobox "Applying firewall rules for AD services..." 5 60
+  dialog --backtitle "Firewall Services Configuration" --title "Firewall Configuration" --infobox "Applying firewall rules for services..." 5 60
   firewall-cmd --permanent --add-service=tftp >/dev/null
   firewall-cmd --permanent --add-service=ntp >/dev/null
 
