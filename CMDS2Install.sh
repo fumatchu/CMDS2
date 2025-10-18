@@ -2174,6 +2174,7 @@ configure_firewall
 update_issue_file
 python310_setup_module
 tftp_setup_module
+http_repo_setup_module
 configure_fail2ban
 configure_dnf_automatic
 check_and_enable_services
