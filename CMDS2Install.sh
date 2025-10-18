@@ -1357,13 +1357,130 @@ tftp_setup_module() {
 • Log: ${LOGFILE}" 10 60
   sleep 2
 }
+#===========HTTP Repo Setup=============
+http_repo_setup_module() {
+  local TITLE="HTTP Repository Configuration"
+  local BACKTITLE="HTTP Repo Setup"
+  local LOGFILE="/var/log/http-repo-setup.log"
+
+  local IMAGES_DIR="/var/lib/tftpboot/images"
+  local SITE_CONF="/etc/httpd/conf.d/tftp-images.conf"
+  local SEND_FILE_CONF="/etc/httpd/conf.d/00-sendfile.conf"
+
+  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+  : > "$LOGFILE"
+
+  if [[ $EUID -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+           --msgbox "This function must be run as root." 7 50
+    return 1
+  fi
+
+  _server_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
+      || hostname -I 2>/dev/null | awk '{print $1}' \
+      || echo "127.0.0.1"
+  }
+
+  local total=8
+  local step=0
+  _gauge_step() {
+    step=$((step + 1))
+    local pct=$(( step * 100 / total ))
+    echo "XXX"
+    echo "$pct"
+    echo -e "$1"
+    echo "XXX"
+    sleep 0.5
+  }
+
+  local selinux_persist="applied"
+  {
+    _gauge_step "Ensuring repository directories exist and permissions set..."
+    mkdir -p "$IMAGES_DIR" >>"$LOGFILE" 2>&1
+    chmod 755 /var/lib/tftpboot /var/lib/tftpboot/images >>"$LOGFILE" 2>&1
+
+    _gauge_step "Writing Apache alias config to\n$SITE_CONF ..."
+    cat > "$SITE_CONF" <<'CONF'
+# Serve TFTP images via HTTP at /images
+Alias /images /var/lib/tftpboot/images
+<Directory "/var/lib/tftpboot/images">
+    Options Indexes FollowSymLinks
+    AllowOverride None
+    Require all granted
+</Directory>
+CONF
+    echo "Wrote $SITE_CONF" >>"$LOGFILE"
+
+    _gauge_step "Writing global sendfile config to\n$SEND_FILE_CONF ..."
+    cat > "$SEND_FILE_CONF" <<'CONF'
+EnableSendfile Off
+CONF
+    echo "Wrote $SEND_FILE_CONF" >>"$LOGFILE"
+
+    _gauge_step "Making existing image files world-readable (644)..."
+    if [ -d "$IMAGES_DIR" ]; then
+      find "$IMAGES_DIR" -maxdepth 1 -type f -exec chmod 644 {} + >>"$LOGFILE" 2>&1 || true
+    fi
+
+    _gauge_step "Adding persistent SELinux labels (if semanage exists)..."
+    if command -v semanage >/dev/null 2>&1; then
+      semanage fcontext -a -t httpd_sys_content_t "/var/lib/tftpboot(/.*)?"  >>"$LOGFILE" 2>&1 \
+        || semanage fcontext -m -t httpd_sys_content_t "/var/lib/tftpboot(/.*)?" >>"$LOGFILE" 2>&1
+      semanage fcontext -a -t httpd_sys_content_t "/var/lib/tftpboot/images(/.*)?" >>"$LOGFILE" 2>&1 \
+        || semanage fcontext -m -t httpd_sys_content_t "/var/lib/tftpboot/images(/.*)?" >>"$LOGFILE" 2>&1
+    else
+      echo "semanage not found; skipping persistent fcontext rules." >>"$LOGFILE"
+      selinux_persist="skipped"
+    fi
+
+    _gauge_step "Restoring SELinux contexts for /var/lib/tftpboot..."
+    restorecon -Rv /var/lib/tftpboot >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Generating index.html in $IMAGES_DIR ..."
+    {
+      echo "<!doctype html><meta charset=utf-8><title>Images</title><h1>Images</h1><ul>"
+      for f in "$IMAGES_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        bn=$(basename "$f")
+        [[ "$bn" == "index.html" ]] && continue
+        printf '  <li><a href="./%s">%s</a></li>\n' "$bn" "$bn"
+      done
+      echo "</ul>"
+    } > "$IMAGES_DIR/index.html"
+    echo "Wrote $IMAGES_DIR/index.html" >>"$LOGFILE"
+
+    _gauge_step "Finalizing (no httpd reload; will take effect after reboot)..."
+    sleep 0.5
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+             --gauge "Configuring HTTP repository...\n(Logging to $LOGFILE)" 12 70 0
+
+  local IP=$(_server_ip)
+  local BASE_URL="http://${IP}/images"
+
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"HTTP repo setup complete.
+
+• Alias: /images  →  /var/lib/tftpboot/images
+• Config files:
+    - $SITE_CONF
+    - $SEND_FILE_CONF
+• SELinux persistent labels: ${selinux_persist}
+• Index page: $IMAGES_DIR/index.html
+• Log: $LOGFILE
+
+No reload/start performed (as requested).
+After your reboot, files should be available at:
+  ${BASE_URL}/<filename>" 17 76
+  sleep 3
+}
 #===========SERVICE CHECK & ENABLE PROGRESS=============
 check_and_enable_services() {
   TMP_LOG=$(mktemp)
   TMP_BAR=$(mktemp)
 
   # List the services you want to manage
-  SERVICES=("fail2ban" "tftp.socket" "cockpit.socket")  # <-- add or remove services as needed
+  SERVICES=("fail2ban" "tftp.socket" "cockpit.socket" "httpd")  # <-- add or remove services as needed
 
   total=${#SERVICES[@]}
   count=0
