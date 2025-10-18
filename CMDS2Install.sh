@@ -1042,6 +1042,7 @@ configure_firewall() {
   dialog --backtitle "Firewall Services Configuration" --title "Firewall Configuration" --infobox "Applying firewall rules for services..." 5 60
   firewall-cmd --permanent --add-service=tftp >/dev/null
   firewall-cmd --permanent --add-service=ntp >/dev/null
+  firewall-cmd --permanent --add-service=http >/dev/null
 
   firewall-cmd --reload >/dev/null
   systemctl restart firewalld
