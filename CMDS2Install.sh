@@ -1327,8 +1327,8 @@ tftp_setup_module() {
     _gauge_step "Creating TFTP root and subdirectories..."
     mkdir -p /var/lib/tftpboot/images \
              /var/lib/tftpboot/wlc \
-             /var/lib/tftpboot/mon_switch \
-             /var/lib/tftpboot/mig_switch >>"$LOGFILE" 2>&1
+             /var/lib/tftpboot/hybrid \
+             /var/lib/tftpboot/mig >>"$LOGFILE" 2>&1
 
     _gauge_step "Applying permissions..."
     chmod 777 -R /var/lib/tftpboot >>"$LOGFILE" 2>&1
