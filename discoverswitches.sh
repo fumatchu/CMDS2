@@ -2,8 +2,8 @@
 # Catalyst/Meraki discovery + plan with split-screen dialog UI + selection
 # - nmap discover -> SSH probe -> parse hostname/version/PID/SN
 # - Builds upgrade plan (JSON/CSV)
-# - NEW: Dialog checklist to pick which switches to upgrade; writes selected_upgrade.{json,csv,env}
-# - Safe UI teardown; robust nmap/ssh handling
+# - Dialog checklist to pick switches to upgrade; writes selected_upgrade.{json,csv,env}
+# - The final screen is the selection summary (no upgrade-plan display)
 
 set -Euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -41,9 +41,6 @@ MAX_SSH_FANOUT="${MAX_SSH_FANOUT:-1}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-30}"
 DEBUG="${DISCOVERY_DEBUG:-0}"
 UI_MODE="${UI_MODE:-dialog}"                    # dialog|plain
-
-# Firmware ENV (used for plan selection)
-#   FW_CAT9K_* and FW_CAT9K_LITE_* expected if you want target versions/paths filled
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
 need nmap; need jq; need awk; need sed
@@ -100,14 +97,12 @@ _ui_calc_layout() {
   TAIL_W=$((cols - 4));   (( TAIL_W < 68 )) && TAIL_W=68
   GAUGE_H=7; GAUGE_W=$TAIL_W; GAUGE_ROW=$((TAIL_H + 2)); GAUGE_COL=2
 }
-
 _ui_fd_open() {
   [[ -n "${PROG_FD:-}" ]] || return 1
   if [[ -e "/proc/$$/fd/$PROG_FD" ]]; then return 0; fi
   { : >&"$PROG_FD"; } 2>/dev/null || return 1
   return 0
 }
-
 ui_start() {
   _ui_calc_layout
   if (( DIALOG_AVAILABLE )); then
@@ -150,15 +145,6 @@ ui_stop() {
     fi
   fi
   rm -f "$STATUS_FILE" 2>/dev/null || true
-}
-show_textbox() {
-  local title="$1" file="$2"
-  if (( DIALOG_AVAILABLE )); then
-    ui_stop
-    dialog --no-shadow --title "$title" --textbox "$file" 22 100
-  else
-    echo "===== $title ====="; sed -n '1,200p' "$file"
-  fi
 }
 trap 'ui_stop' EXIT
 
@@ -257,12 +243,10 @@ resolve_targets() {
 }
 
 nmap_cmd_base() { local opts=(-n); [[ $(id -u) -ne 0 ]] && opts+=(--privileged); (( USE_IFACE )) && opts+=(-e "$DISCOVERY_INTERFACE"); printf '%s ' "${opts[@]}"; }
-pass_a() { local probes=(-PE -PS22,80,443,830 -PA22,443); (( USE_IFACE )) && probes+=(-PR); local cmd=(nmap $(nmap_cmd_base) -sn "${probes[@]}" --max-retries 2 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/nu
-ll | awk '/Up$/{print $2}' || true; }
+pass_a() { local probes=(-PE -PS22,80,443,830 -PA22,443); (( USE_IFACE )) && probes+=(-PR); local cmd=(nmap $(nmap_cmd_base) -sn "${probes[@]}" --max-retries 2 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
 pass_b() { local cmd=(nmap $(nmap_cmd_base) -sn -PE "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
 pass_c() { local cmd=(nmap $(nmap_cmd_base) -sn -Pn -PS22,80,443 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Status: Up/{print $2}' || true; }
-pass_fping() { command -v fping >/dev/null 2>&1 || return 0; local out=(); for t in "${TARGETS[@]}"; do if [[ "$t" =~ / ]]; then mapfile -t out < <(fping -a -q -g "$t" 2>/dev/null || true); else mapfile -t
- out < <(printf '%s\n' "$t" | fping -a -q 2>/dev/null || true); fi; done; printf '%s\n' "${out[@]}" | awk 'NF'; }
+pass_fping() { command -v fping >/dev/null 2>&1 || return 0; local out=(); for t in "${TARGETS[@]}"; do if [[ "$t" =~ / ]]; then mapfile -t out < <(fping -a -q -g "$t" 2>/dev/null || true); else mapfile -t out < <(printf '%s\n' "$t" | fping -a -q 2>/dev/null || true); fi; done; printf '%s\n' "${out[@]}" | awk 'NF'; }
 
 discover_targets() {
   ui_status "Discovering live hosts (pass 1/3)…"; ui_gauge 5 "Scanning (hybrid)…"
@@ -286,8 +270,7 @@ filter_ssh_open() {
   return 0
 }
 
-emit_extra_json() { local hosts=("$@"); for ip in "${hosts[@]}"; do if [[ -n "${TCP22[$ip]:-}" ]]; then printf '{"ip":"%s","ssh":true,"login":false}\n' "$ip"; else printf '{"ip":"%s","ssh":false,"login":fa
-lse}\n' "$ip"; fi; done | jq -s '.'; }
+emit_extra_json() { local hosts=("$@"); for ip in "${hosts[@]}"; do if [[ -n "${TCP22[$ip]:-}" ]]; then printf '{"ip":"%s","ssh":true,"login":false}\n' "$ip"; else printf '{"ip":"%s","ssh":false,"login":false}\n' "$ip"; fi; done | jq -s '.'; }
 
 # Worker pool
 HAS_WAIT_N=0; if help wait >/dev/null 2>&1 && help wait 2>&1 | grep -q -- '-n'; then HAS_WAIT_N=1; fi
@@ -352,7 +335,8 @@ do_selection_dialog() {
   done < <(jq -r '.[] | [.ip, (.hostname//"-"), (.pid//"-"), (.current_version//"?"), (.target_version//"?"), (.needs_upgrade//false)] | @tsv' "$UP_JSON_OUT")
 
   if (( ${#items[@]} == 0 )); then
-    ui_status "No items in upgrade plan."
+    dialog --no-shadow --infobox "No devices available for selection.\n(Upgrade plan had zero items.)" 7 60
+    sleep 3
     return 1
   fi
 
@@ -366,6 +350,8 @@ do_selection_dialog() {
   local rc=$?
   if (( rc != 0 )); then
     rm -f "$tmp_sel"
+    dialog --no-shadow --infobox "Selection cancelled." 5 40
+    sleep 2
     return 2
   fi
 
@@ -374,7 +360,8 @@ do_selection_dialog() {
   rm -f "$tmp_sel"
 
   if (( ${#SEL_ARR[@]} == 0 )); then
-    dialog --msgbox "No switches selected. Nothing to do." 7 60
+    dialog --no-shadow --infobox "No switches selected. Nothing to do." 6 50
+    sleep 2
     return 3
   fi
 
@@ -397,16 +384,16 @@ do_selection_dialog() {
     printf "export UPGRADE_SELECTED_CSV=%q\n" "$SEL_CSV_OUT"
   } > "$SEL_ENV_OUT"
 
-  dialog --no-shadow --title "Selection saved" --msgbox \
-"Saved:
-  ${SEL_ENV_OUT}
-This env references your original env:
-  ${ENV_FILE}
+  dialog --no-shadow --infobox \
+"Selection saved.
+
+Env:  $SEL_ENV_OUT
 
 Selected IPs:
   ${SEL_ARR[*]}
 
-Use this in your upgrade step." 12 80
+Use this env in your upgrade step." 12 80
+  sleep 3
   return 0
 }
 
@@ -442,9 +429,9 @@ main() {
     jq -r '.[] | [.ip, .ssh, .login, (.hostname//""), (.version//""), (.pid//""), (.serial//"")] | @csv' "$JSON_OUT" >> "$CSV_OUT"
     make_upgrade_plan
     if (( DIALOG_AVAILABLE )); then
-      do_selection_dialog || show_textbox "Upgrade Plan (CSV)" "$UP_CSV_OUT"
+      do_selection_dialog || true   # no fallback display
     else
-      show_textbox "Upgrade Plan (CSV)" "$UP_CSV_OUT"
+      echo "Selection UI skipped (dialog not available)."
     fi
     return 0
   fi
@@ -458,8 +445,7 @@ main() {
 
   mapfile -t probed_ips < <(jq -r '.[].ip' <(jq -s '.' "$TMPJSON")); declare -A seen; for ip in "${probed_ips[@]}"; do seen["$ip"]=1; done
   extra=(); for ip in "${live[@]}"; do [[ -n "${seen[$ip]:-}" ]] || extra+=("$ip"); done
-  if [[ ${#extra[@]} -gt 0 ]]; then EXTRA_JSON="$(emit_extra_json "${extra[@]}")"; jq -s '.[0] + .[1]' <(jq -s '.' "$TMPJSON") <(printf '%s' "$EXTRA_JSON") > "$JSON_OUT"; else jq -s '.' "$TMPJSON" > "$JSON
-_OUT"; fi
+  if [[ ${#extra[@]} -gt 0 ]]; then EXTRA_JSON="$(emit_extra_json "${extra[@]}")"; jq -s '.[0] + .[1]' <(jq -s '.' "$TMPJSON") <(printf '%s' "$EXTRA_JSON") > "$JSON_OUT"; else jq -s '.' "$TMPJSON" > "$JSON_OUT"; fi
   rm -f "$TMPJSON"
 
   printf "ip,ssh,login,hostname,version,pid,serial\n" > "$CSV_OUT"
@@ -469,9 +455,9 @@ _OUT"; fi
   make_upgrade_plan
 
   if (( DIALOG_AVAILABLE )); then
-    do_selection_dialog || show_textbox "Upgrade Plan (CSV)" "$UP_CSV_OUT"
+    do_selection_dialog || true   # no fallback display
   else
-    show_textbox "Upgrade Plan (CSV)" "$UP_CSV_OUT"
+    echo "Selection UI skipped (dialog not available)."
   fi
 }
 
