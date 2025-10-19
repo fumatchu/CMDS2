@@ -1474,6 +1474,119 @@ After your reboot, files should be available at:
   ${BASE_URL}/<filename>" 17 76
   sleep 3
 }
+#===========IOS-XE Images Symlink Setup=============
+create_iosxe_symlink_module() {
+  # Optional overrides:
+  # create_iosxe_symlink_module "/root/IOS-XE_images" "/var/lib/tftpboot/images"
+  local LINK_PATH="${1:-/root/IOS-XE_images}"
+  local TARGET_PATH="${2:-/var/lib/tftpboot/images}"
+
+  local TITLE="IOS-XE Images Symlink Configuration"
+  local BACKTITLE="Server Prep"
+  local LOGFILE="/var/log/iosxe-images-symlink.log"
+
+  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+  : > "$LOGFILE"
+
+  if [[ $EUID -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+           --msgbox "This function must be run as root." 7 50
+    return 1
+  fi
+
+  local total=5
+  local step=0
+  _gauge_step() {
+    step=$((step + 1))
+    local pct=$(( step * 100 / total ))
+    echo "XXX"
+    echo "$pct"
+    echo -e "$1"
+    echo "XXX"
+    sleep 0.3
+  }
+
+  _link_current_target() { [[ -L "$LINK_PATH" ]] && readlink -f "$LINK_PATH" || true; }
+
+  local replaced="no"
+  local status_msg=""
+
+  {
+    _gauge_step "Ensuring target directory exists: $TARGET_PATH ..."
+    mkdir -p "$TARGET_PATH" >>"$LOGFILE" 2>&1
+    chmod 755 "$TARGET_PATH" >>"$LOGFILE" 2>&1
+
+    _gauge_step "Checking existing link/path at: $LINK_PATH ..."
+    if [[ -e "$LINK_PATH" || -L "$LINK_PATH" ]]; then
+      local cur="$(_link_current_target)"
+      if [[ -L "$LINK_PATH" && "$cur" == "$(readlink -f "$TARGET_PATH")" ]]; then
+        echo "Link already correct ($LINK_PATH -> $cur)" >>"$LOGFILE"
+      else
+        echo "Existing path at $LINK_PATH (type: $(stat -c %F "$LINK_PATH" 2>/dev/null || echo 'unknown'))" >>"$LOGFILE"
+        echo "REPLACE_PROMPT" >>"$LOGFILE"
+      fi
+    fi
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+             --gauge "Preparing symlink...\n(Logging to $LOGFILE)" 10 70 0
+
+  if [[ -e "$LINK_PATH" || -L "$LINK_PATH" ]]; then
+    local cur="$(_link_current_target)"
+    if [[ ! ( -L "$LINK_PATH" && "$cur" == "$(readlink -f "$TARGET_PATH")" ) ]]; then
+      dialog --backtitle "$BACKTITLE" --title "$TITLE" --yesno \
+"Path exists at:
+  $LINK_PATH
+$( [[ -n "$cur" ]] && echo "Currently points to: $cur" || echo "Not a matching symlink.")
+
+Replace it with a new symlink to:
+  $TARGET_PATH ?" 12 70
+      local rc=$?
+      if (( rc != 0 )); then
+        dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"Aborted. Existing path was left untouched:
+
+$LINK_PATH" 8 70
+        sleep 2
+        return 2
+      fi
+      replaced="yes"
+      rm -rf -- "$LINK_PATH" >>"$LOGFILE" 2>&1 || true
+    fi
+  fi
+
+  {
+    _gauge_step "Creating symlink: $LINK_PATH -> $TARGET_PATH ..."
+    ln -sfn "$TARGET_PATH" "$LINK_PATH" >>"$LOGFILE" 2>&1
+
+    _gauge_step "Verifying symlink..."
+    local final_target=""
+    [[ -L "$LINK_PATH" ]] && final_target="$(readlink -f "$LINK_PATH" || true)"
+    if [[ "$final_target" == "$(readlink -f "$TARGET_PATH")" ]]; then
+      status_msg="Symlink OK"
+      echo "Verified: $LINK_PATH -> $final_target" >>"$LOGFILE"
+    else
+      status_msg="Verification failed"
+      echo "Verification failed: $LINK_PATH" >>"$LOGFILE"
+    fi
+
+    _gauge_step "Finalizing..."
+    sleep 0.3
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+             --gauge "Creating symlink...\n(Logging to $LOGFILE)" 10 70 0
+
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"IOS-XE images symlink setup complete.
+
+• Link:   $LINK_PATH
+• Target: $TARGET_PATH
+• Replaced existing path: $replaced
+• Status: $status_msg
+• Log:    $LOGFILE
+
+Tip: copy files into $LINK_PATH (the link), e.g.:
+  cp -av /root/IOS-XE_images/*.bin $LINK_PATH/
+" 14 78
+  sleep 3
+}
 #===========SERVICE CHECK & ENABLE PROGRESS=============
 check_and_enable_services() {
   TMP_LOG=$(mktemp)
@@ -2175,6 +2288,7 @@ update_issue_file
 python310_setup_module
 tftp_setup_module
 http_repo_setup_module
+create_iosxe_symlink_module
 configure_fail2ban
 configure_dnf_automatic
 check_and_enable_services
