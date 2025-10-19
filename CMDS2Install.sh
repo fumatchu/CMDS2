@@ -1357,13 +1357,18 @@ tftp_setup_module() {
 • Log: ${LOGFILE}" 10 60
   sleep 2
 }
-#===========HTTP Repo Setup=============
+#===========HTTP Repo Setup (images via HTTP; hybrid/wlc/mig = TFTP R/W)=============
 http_repo_setup_module() {
   local TITLE="HTTP Repository Configuration"
   local BACKTITLE="HTTP Repo Setup"
   local LOGFILE="/var/log/http-repo-setup.log"
 
-  local IMAGES_DIR="/var/lib/tftpboot/images"
+  local TFTP_ROOT="/var/lib/tftpboot"
+  local IMAGES_DIR="$TFTP_ROOT/images"
+  local HYBRID_DIR="$TFTP_ROOT/hybrid"
+  local WLC_DIR="$TFTP_ROOT/wlc"
+  local MIG_DIR="$TFTP_ROOT/mig"
+
   local SITE_CONF="/etc/httpd/conf.d/tftp-images.conf"
   local SEND_FILE_CONF="/etc/httpd/conf.d/00-sendfile.conf"
 
@@ -1382,96 +1387,89 @@ http_repo_setup_module() {
       || echo "127.0.0.1"
   }
 
-  local total=8
-  local step=0
+  local total=12 step=0
   _gauge_step() {
     step=$((step + 1))
     local pct=$(( step * 100 / total ))
-    echo "XXX"
-    echo "$pct"
-    echo -e "$1"
-    echo "XXX"
-    sleep 0.5
+    echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
+    sleep 0.35
   }
 
   local selinux_persist="applied"
   {
-    _gauge_step "Ensuring repository directories exist and permissions set..."
-    mkdir -p "$IMAGES_DIR" >>"$LOGFILE" 2>&1
-    chmod 755 /var/lib/tftpboot /var/lib/tftpboot/images >>"$LOGFILE" 2>&1
+    _gauge_step "Ensuring directories exist (images, hybrid, wlc, mig)…"
+    mkdir -p "$IMAGES_DIR" "$HYBRID_DIR" "$WLC_DIR" "$MIG_DIR" >>"$LOGFILE" 2>&1
+    # allow Apache to traverse 'images'; others are for TFTP only
+    chmod 755 "$IMAGES_DIR" >>"$LOGFILE" 2>&1
 
-    _gauge_step "Writing Apache alias config to\n$SITE_CONF ..."
-    cat > "$SITE_CONF" <<'CONF'
-# Serve TFTP images via HTTP at /images
-Alias /images /var/lib/tftpboot/images
-<Directory "/var/lib/tftpboot/images">
+    _gauge_step "Writing Apache alias for /images → $IMAGES_DIR…"
+    cat > "$SITE_CONF" <<CONF
+# Serve firmware from TFTP images over HTTP at /images
+Alias /images $IMAGES_DIR
+<Directory "$IMAGES_DIR">
     Options Indexes FollowSymLinks
     AllowOverride None
     Require all granted
 </Directory>
+# NOTE: hybrid/, wlc/, mig/ are NOT exposed over HTTP
 CONF
-    echo "Wrote $SITE_CONF" >>"$LOGFILE"
 
-    _gauge_step "Writing global sendfile config to\n$SEND_FILE_CONF ..."
+    _gauge_step "Disabling sendfile globally…"
     cat > "$SEND_FILE_CONF" <<'CONF'
 EnableSendfile Off
 CONF
-    echo "Wrote $SEND_FILE_CONF" >>"$LOGFILE"
 
-    _gauge_step "Making existing image files world-readable (644)..."
-    if [ -d "$IMAGES_DIR" ]; then
-      find "$IMAGES_DIR" -maxdepth 1 -type f -exec chmod 644 {} + >>"$LOGFILE" 2>&1 || true
-    fi
-
-    _gauge_step "Adding persistent SELinux labels (if semanage exists)..."
+    _gauge_step "Remove any old broad fcontext rules on /var/lib/tftpboot…"
     if command -v semanage >/dev/null 2>&1; then
-      semanage fcontext -a -t httpd_sys_content_t "/var/lib/tftpboot(/.*)?"  >>"$LOGFILE" 2>&1 \
-        || semanage fcontext -m -t httpd_sys_content_t "/var/lib/tftpboot(/.*)?" >>"$LOGFILE" 2>&1
-      semanage fcontext -a -t httpd_sys_content_t "/var/lib/tftpboot/images(/.*)?" >>"$LOGFILE" 2>&1 \
-        || semanage fcontext -m -t httpd_sys_content_t "/var/lib/tftpboot/images(/.*)?" >>"$LOGFILE" 2>&1
-    else
-      echo "semanage not found; skipping persistent fcontext rules." >>"$LOGFILE"
-      selinux_persist="skipped"
+      semanage fcontext -d "$TFTP_ROOT(/.*)?" >>"$LOGFILE" 2>&1 || true
     fi
 
-    _gauge_step "Restoring SELinux contexts for /var/lib/tftpboot..."
-    restorecon -Rv /var/lib/tftpboot >>"$LOGFILE" 2>&1 || true
+    _gauge_step "Set SELinux type ONLY for images/ as public_content_rw_t…"
+    if command -v semanage >/dev/null 2>&1; then
+      semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1 \
+        || semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1
+      selinux_persist="applied"
+    else
+      selinux_persist="skipped (no semanage)"
+    fi
 
-    _gauge_step "Generating index.html in $IMAGES_DIR ..."
-    {
-      echo "<!doctype html><meta charset=utf-8><title>Images</title><h1>Images</h1><ul>"
-      for f in "$IMAGES_DIR"/*; do
-        [[ -f "$f" ]] || continue
-        bn=$(basename "$f")
-        [[ "$bn" == "index.html" ]] && continue
-        printf '  <li><a href="./%s">%s</a></li>\n' "$bn" "$bn"
-      done
-      echo "</ul>"
-    } > "$IMAGES_DIR/index.html"
-    echo "Wrote $IMAGES_DIR/index.html" >>"$LOGFILE"
+    _gauge_step "Restore SELinux contexts (hybrid/wlc/mig stay tftpdir_rw_t)…"
+    restorecon -RFv "$TFTP_ROOT" >>"$LOGFILE" 2>&1 || true
 
-    _gauge_step "Finalizing (no httpd reload; will take effect after reboot)..."
-    sleep 0.5
+    _gauge_step "Allow TFTP to write into public_content_rw_t (boolean)…"
+    if command -v setsebool >/dev/null 2>&1; then
+      setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
+    fi
+
+    _gauge_step "Open read/execute on images/ for Apache…"
+    chmod -R a+rX "$IMAGES_DIR" >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Ensure autoindex (remove stale index.html)…"
+    rm -f "$IMAGES_DIR/index.html" >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Finalizing…"
+    sleep 0.3
   } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-             --gauge "Configuring HTTP repository...\n(Logging to $LOGFILE)" 12 70 0
+             --gauge "Configuring HTTP repo (images via HTTP; hybrid/wlc/mig = TFTP R/W)…\n(Logging to $LOGFILE)" 12 74 0
 
   local IP=$(_server_ip)
-  local BASE_URL="http://${IP}/images"
-
   dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
 "HTTP repo setup complete.
 
-• Alias: /images  →  /var/lib/tftpboot/images
-• Config files:
-    - $SITE_CONF
-    - $SEND_FILE_CONF
-• SELinux persistent labels: ${selinux_persist}
-• Index page: $IMAGES_DIR/index.html
+• Served via HTTP:
+    /images  →  $IMAGES_DIR  (SELinux: public_content_rw_t)
+• TFTP R/W only (not served via HTTP):
+    $HYBRID_DIR, $WLC_DIR, $MIG_DIR  (SELinux: tftpdir_rw_t)
+• SELinux:
+    fcontext images/* → public_content_rw_t   (persist: $selinux_persist)
+    boolean tftp_anon_write=on
+• Configs:
+    $SITE_CONF
+    $SEND_FILE_CONF
 • Log: $LOGFILE
 
-No reload/start performed (as requested).
-After your reboot, files should be available at:
-  ${BASE_URL}/<filename>" 17 76
+URL after reboot:
+  http://$IP/images/" 20 80
   sleep 3
 }
 #===========IOS-XE Images Symlink Setup=============
