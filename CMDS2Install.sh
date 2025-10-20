@@ -1595,6 +1595,187 @@ Tip: copy files into $LINK_PATH (the link), e.g.:
 " 14 78
   sleep 3
 }
+#===========Images Auto-Fix (HTTP/TFTP images dir)=============
+images_autofix_module() {
+  local TITLE="Images Auto-Fix Configuration"
+  local BACKTITLE="Server Prep"
+  local LOGFILE="/var/log/images-autofix-setup.log"
+
+  # Paths (same as your latest script)
+  local IMAGES_DIR="/var/lib/tftpboot/images"
+  local FIX_SCRIPT="/usr/local/sbin/tftp-images-autofix.sh"
+  local SVC="/etc/systemd/system/tftp-images-autofix.service"
+  local PATHU="/etc/systemd/system/tftp-images-autofix.path"
+  local TIMER="/etc/systemd/system/tftp-images-autofix.timer"
+
+  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+  : > "$LOGFILE"
+
+  if [[ $EUID -ne 0 ]]; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+           --msgbox "This function must be run as root." 7 54
+    return 1
+  fi
+
+  local total=10 step=0
+  _gauge_step() {
+    step=$((step + 1))
+    local pct=$(( step * 100 / total ))
+    echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
+    sleep 0.3
+  }
+
+  {
+    _gauge_step "Ensuring images directory exists..."
+    mkdir -p "$IMAGES_DIR" >>"$LOGFILE" 2>&1
+
+    _gauge_step "Installing fix script..."
+    cat > "$FIX_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IMAGES_DIR="/var/lib/tftpboot/images"
+[[ -d "$IMAGES_DIR" ]] || exit 0
+
+# Prevent overlapping runs
+exec 9>/run/tftp-images-autofix.lock
+flock -n 9 || exit 0
+
+export LANG=C LC_ALL=C
+
+STATE="/run/tftp-images-autofix.state"
+now=$(date +%s)
+last=0
+[[ -f "$STATE" ]] && last=$(<"$STATE" || echo 0)
+
+# Self-throttle: if we ran within the last 2s, skip
+if (( last > 0 && now - last < 2 )); then
+  exit 0
+fi
+
+# If nothing newer than last successful run, skip heavy work
+if [[ -f "$STATE" ]]; then
+  if ! find "$IMAGES_DIR" -type f -newer "$STATE" -print -quit | grep -q . ; then
+    exit 0
+  fi
+fi
+
+# Persistent SELinux label rule
+if command -v semanage >/dev/null 2>&1; then
+  semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >/dev/null 2>&1 \
+    || semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >/dev/null 2>&1
+fi
+
+RESTORECON_BIN="$(command -v restorecon || true)"
+CHMOD_BIN="$(command -v chmod || true)"
+LOGGER_BIN="$(command -v logger || true)"
+
+# Quiet repairs
+"$RESTORECON_BIN" -RF "$IMAGES_DIR" >/dev/null 2>&1 || true
+"$CHMOD_BIN"    -R a+rX "$IMAGES_DIR" >/dev/null 2>&1 || true
+
+# Mark successful run
+echo "$now" > "$STATE"
+
+# Light log
+[[ -n "$LOGGER_BIN" ]] && "$LOGGER_BIN" -t tftp-images-autofix "Repaired labels/perms under $IMAGES_DIR" || true
+exit 0
+SH
+    chmod 755 "$FIX_SCRIPT" >>"$LOGFILE" 2>&1
+
+    _gauge_step "Writing systemd service..."
+    cat > "$SVC" <<SERVICE
+[Unit]
+Description=Auto-fix SELinux labels/permissions under $IMAGES_DIR
+ConditionPathExists=$IMAGES_DIR
+# Disable rate limiting to avoid 'start-limit-hit'
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=$FIX_SCRIPT
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SERVICE
+
+    _gauge_step "Writing systemd path unit (PathModified)..."
+    cat > "$PATHU" <<PATHUNIT
+[Unit]
+Description=Watch $IMAGES_DIR for changes and run auto-fix
+
+[Path]
+Unit=tftp-images-autofix.service
+MakeDirectory=true
+PathModified=$IMAGES_DIR
+
+[Install]
+WantedBy=paths.target
+PATHUNIT
+
+    _gauge_step "Writing 30s safety timer..."
+    cat > "$TIMER" <<TIMER
+[Unit]
+Description=Periodic auto-fix for $IMAGES_DIR (every 30s)
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=tftp-images-autofix.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+    _gauge_step "Reloading systemd & clearing old failures..."
+    systemctl daemon-reload >>"$LOGFILE" 2>&1
+    systemctl reset-failed tftp-images-autofix.service 2>/dev/null || true
+    systemctl reset-failed tftp-images-autofix.path 2>/dev/null || true
+    systemctl reset-failed tftp-images-autofix.timer 2>/dev/null || true
+
+    _gauge_step "Enabling path trigger + safety timer..."
+    systemctl enable --now tftp-images-autofix.path  >>"$LOGFILE" 2>&1
+    systemctl enable --now tftp-images-autofix.timer >>"$LOGFILE" 2>&1
+
+    _gauge_step "Initial run (oneshot; quiet)..."
+    systemctl start tftp-images-autofix.service >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Quick self-test (touch → path trigger)..."
+    date > "$IMAGES_DIR/.autofix-test" 2>>"$LOGFILE"
+    sleep 2
+    rm -f "$IMAGES_DIR/.autofix-test" 2>>"$LOGFILE"
+
+    _gauge_step "Finalizing..."
+    sleep 0.2
+  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+             --gauge "Setting up Images Auto-Fix...\n(Logging to $LOGFILE)" 12 74 0
+
+  # Summarize states (quiet)
+  local path_state="inactive" timer_state="inactive"
+  systemctl is-active tftp-images-autofix.path  >/dev/null 2>&1 && path_state="active"
+  systemctl is-active tftp-images-autofix.timer >/dev/null 2>&1 && timer_state="active"
+
+  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"Images Auto-Fix ready.
+
+• Watch path: ${IMAGES_DIR}
+• Units:
+    - tftp-images-autofix.path  : ${path_state}
+    - tftp-images-autofix.timer : ${timer_state}
+    - tftp-images-autofix.service (oneshot)
+• Fix script:
+    ${FIX_SCRIPT}
+• Log:
+    ${LOGFILE}
+
+Behavior:
+  - Runs on changes to ${IMAGES_DIR}
+  - Also runs every 30s as a safety net
+  - Idempotent; quiet; no rate-limit issues" 17 78
+  sleep 3
+}
+
 #===========SERVICE CHECK & ENABLE PROGRESS=============
 check_and_enable_services() {
   TMP_LOG=$(mktemp)
@@ -2297,6 +2478,7 @@ python310_setup_module
 tftp_setup_module
 http_repo_setup_module
 create_iosxe_symlink_module
+images_autofix_module
 configure_fail2ban
 configure_dnf_automatic
 check_and_enable_services
