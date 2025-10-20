@@ -1291,6 +1291,8 @@ tftp_setup_module() {
   local BACKTITLE="TFTP Server Setup"
   local LOGFILE="/var/log/tftp-setup.log"
   local TFTP_ROOT="/var/lib/tftpboot"
+  local SVC="/etc/systemd/system/tftp-server.service"
+  local SOCK="/etc/systemd/system/tftp-server.socket"
 
   mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
   : > "$LOGFILE"
@@ -1301,41 +1303,42 @@ tftp_setup_module() {
     return 1
   fi
 
-  local total=11 step=0
+  local total=13 step=0
   _gauge_step() {
     step=$((step + 1))
     local pct=$(( step * 100 / total ))
     echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
-    sleep 0.4
+    sleep 0.35
   }
 
   {
     _gauge_step "Copying systemd unit files..."
-    \cp -f /usr/lib/systemd/system/tftp.service /etc/systemd/system/tftp-server.service >>"$LOGFILE" 2>&1
-    \cp -f /usr/lib/systemd/system/tftp.socket  /etc/systemd/system/tftp-server.socket  >>"$LOGFILE" 2>&1
+    \cp -f /usr/lib/systemd/system/tftp.service "$SVC"  >>"$LOGFILE" 2>&1
+    \cp -f /usr/lib/systemd/system/tftp.socket  "$SOCK" >>"$LOGFILE" 2>&1
 
-    _gauge_step "Updating systemd service Requires=..."
-    sed -i '/^Requires=/c\Requires=tftp-server.socket' /etc/systemd/system/tftp-server.service >>"$LOGFILE" 2>&1
+    _gauge_step "Pointing socket to tftp-server.service..."
+    if grep -q '^Service=' "$SOCK"; then
+      sed -i 's/^Service=.*/Service=tftp-server.service/' "$SOCK" >>"$LOGFILE" 2>&1
+    else
+      echo 'Service=tftp-server.service' >>"$SOCK"
+    fi
 
-    _gauge_step "Setting ExecStart for in.tftpd..."
-    # -c create; -s chroot to /var/lib/tftpboot; -p is harmless on many builds
-    sed -i '/^ExecStart=/c\ExecStart=/usr/sbin/in.tftpd -c -p -s /var/lib/tftpboot' /etc/systemd/system/tftp-server.service >>"$LOGFILE" 2>&1
+    _gauge_step "Updating Requires= in service..."
+    sed -i '/^Requires=/c\Requires=tftp-server.socket' "$SVC" >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Setting ExecStart with create (-c), chroot (-s)..."
+    sed -i '/^ExecStart=/c\ExecStart=/usr/sbin/in.tftpd -c -p -s /var/lib/tftpboot' "$SVC" >>"$LOGFILE" 2>&1
 
     _gauge_step "Creating TFTP root and subdirectories..."
-    mkdir -p "$TFTP_ROOT/images" \
-             "$TFTP_ROOT/hybrid" \
-             "$TFTP_ROOT/wlc" \
-             "$TFTP_ROOT/mig" >>"$LOGFILE" 2>&1
+    mkdir -p "$TFTP_ROOT/images" "$TFTP_ROOT/hybrid" "$TFTP_ROOT/wlc" "$TFTP_ROOT/mig" >>"$LOGFILE" 2>&1
 
     _gauge_step "Applying permissive POSIX perms (R/W for uploads)…"
     chmod 777 -R "$TFTP_ROOT" >>"$LOGFILE" 2>&1
 
-    _gauge_step "Restoring SELinux contexts for TFTP (defaults on tree)…"
-    # If the HTTP module set a persistent fcontext for images/, restorecon will keep it (public_content_rw_t);
-    # otherwise, everything stays tftpdir_rw_t until HTTP module runs.
+    _gauge_step "Restoring SELinux contexts on the tree…"
     restorecon -RFv "$TFTP_ROOT" >>"$LOGFILE" 2>&1 || true
 
-    _gauge_step "Allowing TFTP writes even under public_content_rw_t (SELinux boolean)…"
+    _gauge_step "Allowing anonymous TFTP writes (SELinux)…"
     if command -v setsebool >/dev/null 2>&1; then
       setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
     fi
@@ -1343,13 +1346,16 @@ tftp_setup_module() {
     _gauge_step "Reloading systemd daemon..."
     systemctl daemon-reload >>"$LOGFILE" 2>&1
 
+    _gauge_step "Disabling stock tftp.socket to avoid conflicts…"
+    systemctl disable --now tftp.socket >>"$LOGFILE" 2>&1 || true
+
     _gauge_step "Enabling and starting tftp-server.socket..."
     systemctl enable --now tftp-server.socket >>"$LOGFILE" 2>&1
 
     _gauge_step "Finalizing..."
     sleep 0.3
   } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-             --gauge "Configuring TFTP server...\n(Logging to $LOGFILE)" 12 72 0
+             --gauge "Configuring TFTP server...\n(Logging to $LOGFILE)" 12 74 0
 
   local status="inactive"
   systemctl is-active tftp-server.socket >/dev/null 2>&1 && status="active"
@@ -1359,11 +1365,14 @@ tftp_setup_module() {
 
 • Socket status: ${status}
 • Root: $TFTP_ROOT
-• Subdirs (all TFTP R/W): images, hybrid, wlc, mig
+• Subdirs (TFTP R/W): images, hybrid, wlc, mig
 • SELinux:
-    - Tree relabeled (restorecon)
-    - tftp_anon_write=on (write OK even if images/ is public_content_rw_t)
-• Log: ${LOGFILE}" 15 76
+    - restorecon applied to tree
+    - tftp_anon_write=on
+• Units:
+    - $SVC
+    - $SOCK (Service=tftp-server.service)
+• Log: ${LOGFILE}" 15 78
   sleep 3
 }
 #===========HTTP Repo Setup (images via HTTP; ALL dirs writable via TFTP)=============
