@@ -1290,6 +1290,7 @@ tftp_setup_module() {
   local TITLE="TFTP Server Configuration"
   local BACKTITLE="TFTP Server Setup"
   local LOGFILE="/var/log/tftp-setup.log"
+  local TFTP_ROOT="/var/lib/tftpboot"
 
   mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
   : > "$LOGFILE"
@@ -1300,17 +1301,12 @@ tftp_setup_module() {
     return 1
   fi
 
-  local total=8
-  local step=0
-
+  local total=11 step=0
   _gauge_step() {
     step=$((step + 1))
     local pct=$(( step * 100 / total ))
-    echo "XXX"
-    echo "$pct"
-    echo -e "$1"
-    echo "XXX"
-    sleep 0.5   # slows down each visible step slightly
+    echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
+    sleep 0.4
   }
 
   {
@@ -1322,16 +1318,27 @@ tftp_setup_module() {
     sed -i '/^Requires=/c\Requires=tftp-server.socket' /etc/systemd/system/tftp-server.service >>"$LOGFILE" 2>&1
 
     _gauge_step "Setting ExecStart for in.tftpd..."
+    # -c create; -s chroot to /var/lib/tftpboot; -p is harmless on many builds
     sed -i '/^ExecStart=/c\ExecStart=/usr/sbin/in.tftpd -c -p -s /var/lib/tftpboot' /etc/systemd/system/tftp-server.service >>"$LOGFILE" 2>&1
 
     _gauge_step "Creating TFTP root and subdirectories..."
-    mkdir -p /var/lib/tftpboot/images \
-             /var/lib/tftpboot/wlc \
-             /var/lib/tftpboot/hybrid \
-             /var/lib/tftpboot/mig >>"$LOGFILE" 2>&1
+    mkdir -p "$TFTP_ROOT/images" \
+             "$TFTP_ROOT/hybrid" \
+             "$TFTP_ROOT/wlc" \
+             "$TFTP_ROOT/mig" >>"$LOGFILE" 2>&1
 
-    _gauge_step "Applying permissions..."
-    chmod 777 -R /var/lib/tftpboot >>"$LOGFILE" 2>&1
+    _gauge_step "Applying permissive POSIX perms (R/W for uploads)…"
+    chmod 777 -R "$TFTP_ROOT" >>"$LOGFILE" 2>&1
+
+    _gauge_step "Restoring SELinux contexts for TFTP (defaults on tree)…"
+    # If the HTTP module set a persistent fcontext for images/, restorecon will keep it (public_content_rw_t);
+    # otherwise, everything stays tftpdir_rw_t until HTTP module runs.
+    restorecon -RFv "$TFTP_ROOT" >>"$LOGFILE" 2>&1 || true
+
+    _gauge_step "Allowing TFTP writes even under public_content_rw_t (SELinux boolean)…"
+    if command -v setsebool >/dev/null 2>&1; then
+      setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
+    fi
 
     _gauge_step "Reloading systemd daemon..."
     systemctl daemon-reload >>"$LOGFILE" 2>&1
@@ -1340,24 +1347,26 @@ tftp_setup_module() {
     systemctl enable --now tftp-server.socket >>"$LOGFILE" 2>&1
 
     _gauge_step "Finalizing..."
-    sleep 0.5
+    sleep 0.3
   } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-             --gauge "Configuring TFTP server...\n(Logging to $LOGFILE)" 12 70 0
+             --gauge "Configuring TFTP server...\n(Logging to $LOGFILE)" 12 72 0
 
   local status="inactive"
-  if systemctl is-active tftp-server.socket >/dev/null 2>&1; then
-    status="active"
-  fi
+  systemctl is-active tftp-server.socket >/dev/null 2>&1 && status="active"
 
   dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
 "TFTP setup complete.
 
 • Socket status: ${status}
-• Root directory: /var/lib/tftpboot
-• Log: ${LOGFILE}" 10 60
-  sleep 2
+• Root: $TFTP_ROOT
+• Subdirs (all TFTP R/W): images, hybrid, wlc, mig
+• SELinux:
+    - Tree relabeled (restorecon)
+    - tftp_anon_write=on (write OK even if images/ is public_content_rw_t)
+• Log: ${LOGFILE}" 15 76
+  sleep 3
 }
-#===========HTTP Repo Setup (images via HTTP; hybrid/wlc/mig = TFTP R/W)=============
+#===========HTTP Repo Setup (images via HTTP; ALL dirs writable via TFTP)=============
 http_repo_setup_module() {
   local TITLE="HTTP Repository Configuration"
   local BACKTITLE="HTTP Repo Setup"
@@ -1399,8 +1408,7 @@ http_repo_setup_module() {
   {
     _gauge_step "Ensuring directories exist (images, hybrid, wlc, mig)…"
     mkdir -p "$IMAGES_DIR" "$HYBRID_DIR" "$WLC_DIR" "$MIG_DIR" >>"$LOGFILE" 2>&1
-    # allow Apache to traverse 'images'; others are for TFTP only
-    chmod 755 "$IMAGES_DIR" >>"$LOGFILE" 2>&1
+    # NOTE: Do NOT chmod 755 here; keep your TFTP module's 777 so TFTP can write everywhere.
 
     _gauge_step "Writing Apache alias for /images → $IMAGES_DIR…"
     cat > "$SITE_CONF" <<CONF
@@ -1424,7 +1432,7 @@ CONF
       semanage fcontext -d "$TFTP_ROOT(/.*)?" >>"$LOGFILE" 2>&1 || true
     fi
 
-    _gauge_step "Set SELinux type ONLY for images/ as public_content_rw_t…"
+    _gauge_step "Label ONLY images/ as public_content_rw_t (Apache-readable, still TFTP-writable)…"
     if command -v semanage >/dev/null 2>&1; then
       semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1 \
         || semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1
@@ -1441,8 +1449,8 @@ CONF
       setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
     fi
 
-    _gauge_step "Open read/execute on images/ for Apache…"
-    chmod -R a+rX "$IMAGES_DIR" >>"$LOGFILE" 2>&1 || true
+    _gauge_step "Ensure Apache can read/traverse images/ without reducing write bits…"
+    chmod -R a+rX "$IMAGES_DIR" >>"$LOGFILE" 2>&1 || true   # adds r/X; doesn't remove existing write
 
     _gauge_step "Ensure autoindex (remove stale index.html)…"
     rm -f "$IMAGES_DIR/index.html" >>"$LOGFILE" 2>&1 || true
@@ -1450,7 +1458,7 @@ CONF
     _gauge_step "Finalizing…"
     sleep 0.3
   } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-             --gauge "Configuring HTTP repo (images via HTTP; hybrid/wlc/mig = TFTP R/W)…\n(Logging to $LOGFILE)" 12 74 0
+             --gauge "Configuring HTTP repo (images via HTTP; ALL TFTP R/W)…\n(Logging to $LOGFILE)" 12 74 0
 
   local IP=$(_server_ip)
   dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
@@ -1458,8 +1466,10 @@ CONF
 
 • Served via HTTP:
     /images  →  $IMAGES_DIR  (SELinux: public_content_rw_t)
-• TFTP R/W only (not served via HTTP):
-    $HYBRID_DIR, $WLC_DIR, $MIG_DIR  (SELinux: tftpdir_rw_t)
+• TFTP R/W (all four dirs, writable by design):
+    $IMAGES_DIR, $HYBRID_DIR, $WLC_DIR, $MIG_DIR
+    (POSIX perms left as set by TFTP module; SELinux:
+      images/* public_content_rw_t, others tftpdir_rw_t)
 • SELinux:
     fcontext images/* → public_content_rw_t   (persist: $selinux_persist)
     boolean tftp_anon_write=on
@@ -1469,7 +1479,7 @@ CONF
 • Log: $LOGFILE
 
 URL after reboot:
-  http://$IP/images/" 20 80
+  http://$IP/images/" 20 84
   sleep 3
 }
 #===========IOS-XE Images Symlink Setup=============
