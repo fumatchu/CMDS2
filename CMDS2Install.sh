@@ -1791,7 +1791,7 @@ check_and_enable_services() {
   TMP_BAR=$(mktemp)
 
   # List the services you want to manage
-  SERVICES=("fail2ban" "tftp.socket" "cockpit.socket" "httpd")  # <-- add or remove services as needed
+  SERVICES=("fail2ban" "tftp-server.socket" "cockpit.socket" "httpd")  # <-- add or remove services as needed
 
   total=${#SERVICES[@]}
   count=0
