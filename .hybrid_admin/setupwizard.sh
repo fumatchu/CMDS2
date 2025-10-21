@@ -15,14 +15,21 @@ need dialog
 need python3
 need find
 
-trim() { printf '%s' "$1" | awk '{$1=$1; print}'; }
-hbytes() {
-  if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec --suffix=B --format="%.1f" "$1";
-  else awk -v b="$1" 'function f(x){s="B KMGTPE";i=1;while(x>=1024&&i<7){x/=1024;i++} printf("%.1f%sB", x, substr(s,i,1))} BEGIN{f(b)}';
-  fi
+# ---------- Helpers ----------
+# ---------- Helpers ----------
+# Trim leading/trailing whitespace and strip CRs (already in your file)
+trim() {
+  printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
-version_from_name() { printf '%s' "$1" | sed -nE 's/.*([0-9]{2}\.[0-9]{1,2}\.[0-9]{1,2}).*/\1/p'; }
 
+# Use python -c so argv handling is rock solid
+is_valid_ip() {
+  python3 -c 'import sys, ipaddress; ipaddress.ip_address(sys.argv[1])' "$1" 2>/dev/null
+}
+
+is_valid_cidr() {
+  python3 -c 'import sys, ipaddress; ipaddress.ip_network(sys.argv[1], strict=False)' "$1" 2>/dev/null
+}
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname)"
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
@@ -31,90 +38,152 @@ dlg() { _tmp="$(mktemp)"; dialog "$@" 2>"$_tmp"; _rc=$?; DOUT=""; [ -s "$_tmp" ]
 TERM_COLS="$(tput cols 2>/dev/null)"; [ -z "$TERM_COLS" ] && TERM_COLS=140
 BOX_W=$((TERM_COLS - 4)); [ "$BOX_W" -lt 80 ] && BOX_W=80; [ "$BOX_W" -gt 200 ] && BOX_W=200
 
+# Narrower width for multi-line edit boxes (scan/list). Clamp to 50–90 chars.
+EDIT_W=${EDIT_W:-$(( TERM_COLS - 40 ))}
+[ "$EDIT_W" -lt 50 ] && EDIT_W=50
+[ "$EDIT_W" -gt 90 ] && EDIT_W=90
+
 ###############################################################################
 # 1) MODE
 ###############################################################################
 log "Prompt: mode"
 dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" \
-    --menu "How do you want to provide targets?" 12 "$BOX_W" 2 \
+    --menu "How do you want to provide targets?" 12 "$EDIT_W" 2 \
     scan "Discover live hosts by scanning CIDR networks" \
     list "Use a manual list of IPs (one per line)"
 rc=$?; MODE="$(trim "${DOUT:-}")"; log "Mode rc=$rc val='$MODE'"
 [ $rc -eq 0 ] || { clear; exit 1; }
 
 ###############################################################################
-# 2) TARGETS
+# 2) TARGETS  (loop until valid or user cancels)
 ###############################################################################
 DISCOVERY_NETWORKS=""
 DISCOVERY_IPS=""
 
 if [ "$MODE" = "scan" ]; then
   log "Mode=scan"
-  tmpnets="$(mktemp)"; printf '%s\n' "10.0.0.0/24" >"$tmpnets"
-  dlg --clear --backtitle "$BACKTITLE" --title "Networks to Scan (one per line)" --editbox "$tmpnets" 12 "$BOX_W"
-  rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"; log "scan editbox rc=$rc"; [ $rc -eq 0 ] || { clear; exit 1; }
 
-  tmpin_nets="$(mktemp)"; printf '%s\n' "$NETS_RAW" >"$tmpin_nets"
-  while IFS= read -r line; do
-    line="$(trim "$line")"; [ -z "$line" ] && continue
-    case "$line" in \#*) continue;; esac
-    python3 - <<'PY' "$line" || exit 2
-import sys, ipaddress
-try:
-  ipaddress.ip_network(sys.argv[1], strict=False)
-except Exception:
-  sys.exit(1)
-PY
-    [ $? -ne 0 ] && { dlg --title "Invalid Network" --msgbox "Invalid: '$line'\nUse CIDR, one per line." 8 56; clear; rm -f "$tmpin_nets"; exit 2; }
-    [ -z "$DISCOVERY_NETWORKS" ] && DISCOVERY_NETWORKS="$line" || DISCOVERY_NETWORKS="$DISCOVERY_NETWORKS,$line"
-  done <"$tmpin_nets"
-  rm -f "$tmpin_nets"
-  [ -n "$DISCOVERY_NETWORKS" ] || { dlg --title "No Networks" --msgbox "Provide at least one valid CIDR." 7 "$BOX_W"; clear; exit 2; }
+  NETS_PREV="$(cat <<'EOF'
+# Paste or type CIDR networks (one per line).
+# Tips: Ctrl+Shift+V (most terminals), Shift+Insert, or right-click Paste.
+# Lines starting with '#' and blank lines are ignored.
+10.0.0.0/24
+EOF
+)"
+
+  while :; do
+    tmpnets="$(mktemp)"; printf '%s\n' "$NETS_PREV" >"$tmpnets"
+    dlg --clear --backtitle "$BACKTITLE" --title "Networks to Scan (one per line)" \
+        --editbox "$tmpnets" 14 "$EDIT_W"
+    rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"; log "scan editbox rc=$rc"
+    [ $rc -eq 0 ] || { clear; exit 1; }
+
+    NETS_PREV="$NETS_RAW"
+    tmpin_nets="$(mktemp)"; printf '%s\n' "$NETS_RAW" >"$tmpin_nets"
+
+    DISCOVERY_NETWORKS=""
+    invalid_line=""
+    while IFS= read -r raw; do
+      line="$(trim "$raw")"
+      [ -z "$line" ] && continue
+      case "$line" in \#*) continue;; esac
+      if ! is_valid_cidr "$line"; then invalid_line="$line"; break; fi
+      [ -z "$DISCOVERY_NETWORKS" ] && DISCOVERY_NETWORKS="$line" || DISCOVERY_NETWORKS="$DISCOVERY_NETWORKS,$line"
+    done <"$tmpin_nets"
+    rm -f "$tmpin_nets"
+
+    if [ -n "$invalid_line" ]; then
+      dlg --title "Invalid Network" --msgbox "Invalid: '$invalid_line'\nUse proper CIDR (e.g., 10.0.0.0/24), one per line." 8 64
+      continue
+    fi
+    if [ -z "$DISCOVERY_NETWORKS" ]; then
+      dlg --title "No Networks" --msgbox "Provide at least one valid CIDR." 7 "$BOX_W"
+      continue
+    fi
+    break
+  done
+
 else
   log "Mode=list"
-  tmpips="$(mktemp)"; printf '%s\n%s\n' "192.168.1.10" "192.168.1.11" >"$tmpips"
-  dlg --clear --backtitle "$BACKTITLE" --title "Manual IP List (one per line)" --editbox "$tmpips" 14 "$BOX_W"
-  rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"; log "list editbox rc=$rc"; [ $rc -eq 0 ] || { clear; exit 1; }
 
-  ips_file="$(mktemp)"; printf '%s\n' "$IPS_RAW" >"$ips_file"
-  DISCOVERY_IPS=""
-  while IFS= read -r line; do
-    ip="$(trim "$line")"; [ -z "$ip" ] && continue
-    case "$ip" in \#*) continue;; esac
-    python3 - <<'PY' "$ip" || exit 2
-import sys, ipaddress
-try:
-  ipaddress.ip_address(sys.argv[1])
-except Exception:
-  sys.exit(1)
-PY
-    [ $? -ne 0 ] && { dlg --title "Invalid IP" --msgbox "Invalid IP: '$ip'\nOne per line." 8 56; clear; rm -f "$ips_file"; exit 2; }
-    case " $DISCOVERY_IPS " in *" $ip "*) ;; *) DISCOVERY_IPS="$DISCOVERY_IPS $ip";; esac
-  done <"$ips_file"
-  rm -f "$ips_file"
-  DISCOVERY_IPS="$(trim "$DISCOVERY_IPS")"
-  [ -n "$DISCOVERY_IPS" ] || { dlg --title "No IPs" --msgbox "Provide at least one valid IP." 7 "$BOX_W"; clear; exit 2; }
+  IPS_PREV="$(cat <<'EOF'
+# Paste or type one IP per line.
+# Tips: Ctrl+Shift+V (most terminals), Shift+Insert, or right-click Paste.
+# Lines starting with '#' and blank lines are ignored.
+192.168.1.10
+192.168.1.11
+EOF
+)"
+
+  while :; do
+    tmpips="$(mktemp)"; printf '%s\n' "$IPS_PREV" >"$tmpips"
+    dlg --clear --backtitle "$BACKTITLE" --title "Manual IP List (one per line)" \
+        --editbox "$tmpips" 16 "$EDIT_W"
+    rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"; log "list editbox rc=$rc"
+    [ $rc -eq 0 ] || { clear; exit 1; }
+
+    IPS_PREV="$IPS_RAW"
+    ips_file="$(mktemp)"; printf '%s\n' "$IPS_RAW" >"$ips_file"
+
+    DISCOVERY_IPS=""
+    invalid_ip=""
+    SEEN_TMP="$(mktemp)"; : >"$SEEN_TMP"
+
+    while IFS= read -r raw; do
+      ip="$(trim "$raw")"
+      [ -z "$ip" ] && continue
+      case "$ip" in \#*) continue;; esac
+      if ! is_valid_ip "$ip"; then invalid_ip="$ip"; break; fi
+      if ! grep -qx -- "$ip" "$SEEN_TMP" 2>/dev/null; then
+        printf '%s\n' "$ip" >>"$SEEN_TMP"
+        [ -z "$DISCOVERY_IPS" ] && DISCOVERY_IPS="$ip" || DISCOVERY_IPS="$DISCOVERY_IPS $ip"
+      fi
+    done <"$ips_file"
+    rm -f "$ips_file"
+
+    if [ -n "$invalid_ip" ]; then
+      rm -f "$SEEN_TMP"
+      dlg --title "Invalid IP" --msgbox "Invalid IP: '$invalid_ip'\nEnter IPv4/IPv6 literal, one per line." 8 64
+      continue
+    fi
+    if [ -z "$DISCOVERY_IPS" ]; then
+      rm -f "$SEEN_TMP"
+      dlg --title "No IPs" --msgbox "Provide at least one valid IP." 7 "$BOX_W"
+      continue
+    fi
+    rm -f "$SEEN_TMP"
+    break
+  done
 fi
 
 ###############################################################################
-# 3) SSH CREDS
+# 3) SSH CREDS (require non-empty)
 ###############################################################################
 log "Prompt: username"
-dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" --inputbox "Enter SSH username:" 8 50 "admin"
-[ $? -eq 0 ] || { clear; exit 1; }
-SSH_USERNAME="$(trim "${DOUT:-}")"; [ -n "$SSH_USERNAME" ] || { clear; exit 1; }
+while :; do
+  dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" --inputbox "Enter SSH username:" 8 50
+  [ $? -eq 0 ] || { clear; exit 1; }
+  SSH_USERNAME="$(trim "${DOUT:-}")"
+  [ -n "$SSH_USERNAME" ] && break
+  dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 44
+done
 
 log "Prompt: password"
-dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" --passwordbox "Enter SSH password (masked with *):" 9 60
-[ $? -eq 0 ] || { clear; exit 1; }
-SSH_PASSWORD="${DOUT:-}"
+while :; do
+  dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" \
+      --insecure --passwordbox "Enter SSH password (masked with *):" 9 60
+  [ $? -eq 0 ] || { clear; exit 1; }
+  SSH_PASSWORD="$(trim "${DOUT:-}")"
+  [ -n "$SSH_PASSWORD" ] && break
+  dlg --title "Missing Password" --msgbox "Password cannot be empty." 7 44
+done
 
 ###############################################################################
 # 3b) MERAKI API KEY
 ###############################################################################
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" \
-      --passwordbox "Paste your Meraki Dashboard API key:\n(It will be masked; last 4 shown in summary.)" 10 "$BOX_W"
+      --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$BOX_W"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 40; continue; }
@@ -136,29 +205,16 @@ while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "DNS Fallback — Primary" --inputbox "Primary DNS server (optional):" 8 60 "$DNS_PRIMARY"
   rc=$?; val="$(trim "${DOUT:-}")"; [ $rc -ne 0 ] && val=""
   [ -z "$val" ] && { DNS_PRIMARY=""; break; }
-  python3 - <<'PY' "$val" || true
-import sys, ipaddress
-try: ipaddress.ip_address(sys.argv[1]); print("OK")
-except: pass
-PY
-  [ "$(python3 - <<'PY' "$val"
-import sys, ipaddress
-try: ipaddress.ip_address(sys.argv[1]); print("1")
-except: print("0")
-PY
-)" = "1" ] && { DNS_PRIMARY="$val"; break; } || dlg --msgbox "Invalid IP address: '$val'." 7 50
+  if is_valid_ip "$val"; then DNS_PRIMARY="$val"; break; fi
+  dlg --msgbox "Invalid IP address: '$val'." 7 50
 done
 
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "DNS Fallback — Secondary" --inputbox "Secondary DNS server (optional):" 8 60 "$DNS_SECONDARY"
   rc=$?; val="$(trim "${DOUT:-}")"; [ $rc -ne 0 ] && val=""
   [ -z "$val" ] && { DNS_SECONDARY=""; break; }
-  [ "$(python3 - <<'PY' "$val"
-import sys, ipaddress
-try: ipaddress.ip_address(sys.argv[1]); print("1")
-except: print("0")
-PY
-)" = "1" ] && { DNS_SECONDARY="$val"; break; } || dlg --msgbox "Invalid IP address: '$val'." 7 50
+  if is_valid_ip "$val"; then DNS_SECONDARY="$val"; break; fi
+  dlg --msgbox "Invalid IP address: '$val'." 7 50
 done
 
 ###############################################################################
@@ -173,8 +229,7 @@ while :; do
   rc=$?; val="$(trim "${DOUT:-}")"
   [ $rc -ne 0 ] && val=""
   [ -z "$val" ] && break
-  # Validate integer in 1..4094
-  python3 - <<'PY' "$val" || ok=0
+  python3 - "$val" <<'PY' || ok=1
 import sys
 s=sys.argv[1]
 ok = s.isdigit() and 1 <= int(s) <= 4094
@@ -193,7 +248,7 @@ done
 # 4) FIRMWARE PICK (Cat9k universal + Cat9k-Lite)
 ###############################################################################
 mkdir -p "$FIRMWARE_DIR"
-command -v restorecon >/dev/null 2>&1 && restorecon -R "$FIRMWARE_DIR" >/dev/null 2>&1
+command -v restorecon >/dev/null 2>/dev/null && restorecon -R "$FIRMWARE_DIR" >/dev/null 2>&1
 
 list_files() {
   find "$FIRMWARE_DIR" -maxdepth 1 -type f -regextype posix-extended \
