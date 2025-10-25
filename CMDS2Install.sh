@@ -1797,8 +1797,8 @@ install_hybrid_admin_module() (
   LOG_FILE="/var/log/hybrid-admin-install.log"
   SRC_HA="${SRC_BASE}/.hybrid_admin"
   DEST_HA="/root/.hybrid_admin"
-  SRC_MM="${SRC_BASE}/meraki_migration"
-  DEST_MM="/usr/local/bin/meraki_migration"
+  SRC_MM="${SRC_BASE}/meraki_migration.sh"
+  DEST_MM="/usr/local/bin/meraki_migration.sh"
   BASH_PROFILE="/root/.bash_profile"
 
   # --- deps ---
@@ -1861,7 +1861,7 @@ install_hybrid_admin_module() (
   # 3) Enable autostart on root login
   gauge 55 "Enabling menu autostart for root login…"; sleep "$STEP_PAUSE"
   mkdir -p "$(dirname "$BASH_PROFILE")"; touch "$BASH_PROFILE"
-  AUTOSTART_LINE='if tty -s && command -v meraki_migration >/dev/null 2>&1; then meraki_migration; fi'
+  AUTOSTART_LINE='if tty -s && command -v meraki_migration.sh >/dev/null 2>&1; then meraki_migration.sh; fi'
   grep -Fq "$AUTOSTART_LINE" "$BASH_PROFILE" || printf '\n# Hybrid Admin autostart\n%s\n' "$AUTOSTART_LINE" >> "$BASH_PROFILE"
 
   # 4) Verify
