@@ -1837,7 +1837,93 @@ check_and_enable_services() {
 
   rm -f "$TMP_LOG" "$TMP_BAR"
 }
+# ========= RECLAIM SPACE FROM HOME MAPPER (LVM) — QUIET NO-OP =========
+remove_home_mapper() {
+    # deps (quietly require essentials)
+    need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
+    need findmnt; need rsync; need lvs; need lvremove; need lvextend; need df; need awk
+    command -v xfs_growfs >/dev/null 2>&1 || true
+    command -v resize2fs  >/dev/null 2>&1 || true
 
+    # no-op banner toggle (optional): export HOME_MAPPER_NOOP_INFO=1 to show brief notice
+    NOOP_INFO="${HOME_MAPPER_NOOP_INFO:-0}"
+
+    # dialog fallback if absent
+    if ! command -v dialog >/dev/null 2>&1; then
+        dialog() { :; }  # swallow messages when dialog isn't present
+    fi
+
+    # detect mounts/devices
+    HOME_DEV="$(findmnt -n -o SOURCE /home 2>/dev/null || true)"
+    ROOT_DEV="$(findmnt -n -o SOURCE /      2>/dev/null || true)"
+    ROOT_FSTYPE="$(findmnt -n -o FSTYPE /   2>/dev/null || true)"
+
+    # If /home is not a separate mount or not an LVM LV → quiet no-op
+    if [[ -z "$HOME_DEV" ]] || [[ "$HOME_DEV" == "$ROOT_DEV" ]]; then
+        if [[ "$NOOP_INFO" == "1" ]]; then dialog --infobox "No separate /home detected. Skipping…" 3 60; sleep 2; fi
+        return 0
+    fi
+    # Confirm it's actually an LVM LV; if not, also treat as no-op
+    if ! lvs --noheadings "$HOME_DEV" >/dev/null 2>&1; then
+        if [[ "$NOOP_INFO" == "1" ]]; then dialog --infobox "/home is not an LVM LV. Skipping…" 3 60; sleep 2; fi
+        return 0
+    fi
+
+    BACKUP_DIR="/root/home-backup"
+
+    dialog --infobox "Backing up /home to $BACKUP_DIR …" 3 60
+    mkdir -p "$BACKUP_DIR"
+    if ! rsync -aHAX --numeric-ids --delete --exclude '/lost+found' /home/ "$BACKUP_DIR"/; then
+        dialog --msgbox "Backup of /home failed. Aborting; nothing changed." 6 70
+        return 1
+    fi
+
+    dialog --infobox "Unmounting /home …" 3 40
+    if ! umount /home 2>/dev/null; then
+        command -v fuser >/dev/null 2>&1 && fuser -km /home || true
+        sleep 1
+        umount -l /home || { dialog --msgbox "Could not unmount /home. Aborting." 6 60; return 1; }
+    fi
+
+    dialog --infobox "Removing logical volume $HOME_DEV …" 3 70
+    if ! lvremove -y "$HOME_DEV" >/dev/null 2>&1; then
+        dialog --msgbox "lvremove failed for $HOME_DEV. Backup left at $BACKUP_DIR; /home is unmounted." 7 70
+        return 1
+    fi
+
+    # Fallback if ROOT_DEV wasn't detected cleanly
+    [[ -n "$ROOT_DEV" ]] || ROOT_DEV="/dev/mapper/rl-root"
+
+    dialog --infobox "Extending root LV to use all free space …" 3 70
+    if ! lvextend -y -l +100%FREE "$ROOT_DEV" >/dev/null 2>&1; then
+        dialog --msgbox "lvextend failed. Free space remains in the VG; please investigate." 6 70
+    fi
+
+    dialog --infobox "Growing root filesystem ($ROOT_FSTYPE) …" 3 60
+    case "$ROOT_FSTYPE" in
+      xfs)  xfs_growfs / >/dev/null 2>&1 || dialog --msgbox "xfs_growfs failed; grow root FS manually." 6 70 ;;
+      ext4|ext3) resize2fs "$ROOT_DEV" >/dev/null 2>&1 || dialog --msgbox "resize2fs failed; grow root FS manually." 6 70 ;;
+      *)    dialog --msgbox "Unknown root FS '$ROOT_FSTYPE'. Could not auto-grow." 6 70 ;;
+    esac
+
+    # Recreate /home and restore user data
+    mkdir -p /home && chmod 755 /home
+    if ! rsync -aHAX --numeric-ids "$BACKUP_DIR"/ /home/; then
+        dialog --msgbox "Restore to /home failed. Data preserved in $BACKUP_DIR." 6 70
+        return 1
+    fi
+    command -v restorecon >/dev/null 2>&1 && restorecon -R /home || true
+    rm -rf "$BACKUP_DIR" || true
+
+    # Remove /home from fstab if present
+    if grep -Eq '^[^#].*[[:space:]]/home[[:space:]]' /etc/fstab; then
+        cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
+        sed -i '/^[[:space:]]*[^#].*[[:space:]]\/home[[:space:]]/d' /etc/fstab
+    fi
+
+    dialog --infobox "Reclaimed /home space and merged into root. Done." 3 60
+    sleep 1
+}
 #===========CLEANUP INSTALLATION FILES=============
 cleanup_installer_files() {
   LOG_FILE="/var/log/rads-cleanup.log"
