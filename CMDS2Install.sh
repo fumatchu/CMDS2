@@ -1784,7 +1784,94 @@ Behavior:
   - Idempotent; quiet; no rate-limit issues" 17 78
   sleep 3
 }
+install_hybrid_admin_module() (
+  set -Eeuo pipefail
 
+  # --- configurable (override before calling) ---
+  : "${STEP_PAUSE:=0.7}"
+  : "${BACKTITLE:=Installing Hybrid Admin Module}"
+  : "${TITLE:=Hybrid Admin Installer}"
+  : "${SRC_BASE:=/root/CMDS2Installer}"
+
+  # --- paths ---
+  LOG_FILE="/var/log/hybrid-admin-install.log"
+  SRC_HA="${SRC_BASE}/.hybrid_admin"
+  DEST_HA="/root/.hybrid_admin"
+  SRC_MM="${SRC_BASE}/meraki_migration"
+  DEST_MM="/usr/local/bin/meraki_migration"
+  BASH_PROFILE="/root/.bash_profile"
+
+  # --- deps ---
+  command -v dialog >/dev/null 2>&1 || { echo "Missing: dialog" >&2; exit 3; }
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log(){ printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"; }
+
+  # --- gauge plumbing ---
+  PIPE="" PROG_FD="" DIALOG_PID=""
+  cleanup() {
+    { [[ -n "${PROG_FD:-}" ]] && exec {PROG_FD}>&-; } 2>/dev/null || true
+    { [[ -n "${DIALOG_PID:-}" ]] && kill "$DIALOG_PID" 2>/dev/null; } || true
+    { [[ -n "${PIPE:-}" && -p "$PIPE" ]] && rm -f "$PIPE"; } || true
+    tput cnorm 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  start_gauge() {
+    PIPE="$(mktemp -u)"
+    mkfifo "$PIPE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" \
+           --gauge "Starting…" 10 70 0 < "$PIPE" & DIALOG_PID=$!
+    exec {PROG_FD}> "$PIPE"
+    rm -f "$PIPE"
+  }
+  gauge(){ local p="$1"; shift; local m="${*:-Working…}"; printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; }
+
+  # --- work ---
+  log "=== Hybrid Admin install start ==="
+  start_gauge
+  gauge 1  "Initializing…"; sleep "$STEP_PAUSE"
+
+  # 1) Move/merge .hybrid_admin → /root and chmod 700
+  gauge 10 "Staging Hybrid Admin files…"; sleep "$STEP_PAUSE"
+  if [[ -d "$SRC_HA" ]]; then
+    if [[ -d "$DEST_HA" ]]; then
+      gauge 18 "Merging existing .hybrid_admin…"; sleep "$STEP_PAUSE"
+      rsync -a "$SRC_HA"/ "$DEST_HA"/ >>"$LOG_FILE" 2>&1 || true
+      rm -rf "$SRC_HA"
+    else
+      gauge 18 "Moving .hybrid_admin to /root…"; sleep "$STEP_PAUSE"
+      mv "$SRC_HA" "$DEST_HA" >>"$LOG_FILE" 2>&1
+    fi
+  fi
+  if [[ -d "$DEST_HA" ]]; then
+    chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
+  fi
+
+  # 2) Install meraki_migration in PATH
+  gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
+  if [[ -f "$SRC_MM" ]]; then
+    install -m 700 -o root -g root "$SRC_MM" "$DEST_MM" >>"$LOG_FILE" 2>&1
+  fi
+  if [[ ! -x "$DEST_MM" ]]; then
+    gauge 100 "Failed: meraki_migration not found/installed"; sleep 1
+    log "ERROR: $DEST_MM missing or not executable"
+    exit 2
+  fi
+
+  # 3) Enable autostart on root login
+  gauge 55 "Enabling menu autostart for root login…"; sleep "$STEP_PAUSE"
+  mkdir -p "$(dirname "$BASH_PROFILE")"; touch "$BASH_PROFILE"
+  AUTOSTART_LINE='if tty -s && command -v meraki_migration >/dev/null 2>&1; then meraki_migration; fi'
+  grep -Fq "$AUTOSTART_LINE" "$BASH_PROFILE" || printf '\n# Hybrid Admin autostart\n%s\n' "$AUTOSTART_LINE" >> "$BASH_PROFILE"
+
+  # 4) Verify
+  gauge 75 "Verifying installation…"; sleep "$STEP_PAUSE"
+  [[ -d "$DEST_HA" ]] && chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
+
+  gauge 100 "Done! Hybrid Admin Module installed. Menu will launch on next root login."
+  sleep 1.2
+  log "=== Hybrid Admin install complete ==="
+)
 #===========SERVICE CHECK & ENABLE PROGRESS=============
 check_and_enable_services() {
   TMP_LOG=$(mktemp)
@@ -2577,6 +2664,7 @@ images_autofix_module
 configure_fail2ban
 configure_dnf_automatic
 remove_home_mapper
+install_hybrid_admin_module
 check_and_enable_services
 cleanup_installer_files
 prompt_reboot_now
