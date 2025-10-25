@@ -2576,6 +2576,7 @@ create_iosxe_symlink_module
 images_autofix_module
 configure_fail2ban
 configure_dnf_automatic
+remove_home_mapper
 check_and_enable_services
 cleanup_installer_files
 prompt_reboot_now
