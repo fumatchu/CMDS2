@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Main Dialog Menu for CMDS-Deployment Server
+# Runs the hybrid menu from its own directory so relative paths resolve to /root/.hybrid_admin
 
 set -Eeuo pipefail
 
@@ -36,15 +37,19 @@ while true; do
 
   case "$CHOICE" in
     1)
-      if [[ -x "$HYBRID_MENU" ]]; then
+      if [[ -f "$HYBRID_MENU" ]]; then
         clear
-        bash "$HYBRID_MENU" || {
+        HYBRID_DIR="$(cd -- "$(dirname "$HYBRID_MENU")" >/dev/null 2>&1 && pwd -P)"
+        export HYBRID_HOME="$HYBRID_DIR"   # optional: available to child scripts
+
+        # Run the menu FROM its directory so all relative paths write to /root/.hybrid_admin
+        (
+          cd "$HYBRID_DIR" || exit 1
+          exec bash "./$(basename "$HYBRID_MENU")"
+        ) || {
           dialog --no-shadow --backtitle "$BACKTITLE" --title "Hybrid Menu" \
                  --msgbox "The script returned a non-zero status.\n\nPath: $HYBRID_MENU" 9 70
         }
-      elif [[ -f "$HYBRID_MENU" ]]; then
-        clear
-        bash "$HYBRID_MENU" || true
       else
         dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
                --msgbox "Cannot find:\n$HYBRID_MENU" 7 60
