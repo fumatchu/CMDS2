@@ -18,7 +18,7 @@ MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
-  # (None yet for IOS-XE Upgrade / Deploy IOS-XE)
+  # (None yet for IOS-XE Upgrade / Deploy IOS-XE / Schedule Image Upgrade)
 )
 
 # Items: label -> script path
@@ -39,6 +39,7 @@ declare -A HELP_RAW=(
   ["Switch Discovery"]="Discover live Catalyst switches, probe via SSH, and build the selection for upgrades."
   ["IOS-XE Upgrade"]="Run IOS-XE install/activate/commit workflows and tools."
   ["Deploy IOS-XE"]="Copy image to flash, then install/activate/commit on selected switches."
+  ["Schedule Image Upgrade"]="Schedule a future image upgrade (snapshots envs, uses 'at')."
 )
 
 # Display order (main menu)
@@ -96,14 +97,24 @@ submenu_iosxe(){
   local SUB_TITLE="IOS-XE Upgrade"
   while true; do
     local MENU_ITEMS=()
+    local -A PATH_BY_TAG=()
+    local -A LABEL_BY_TAG=()
     local i=1
 
-    # First (and currently only) submenu entry
-    local lbl="Deploy IOS-XE"
-    MENU_ITEMS+=("$i" "$lbl" "$(colorize_help "$lbl")")
-    local path="/root/.hybrid_admin/image_upgrade.sh"
-    declare -A PATH_BY_TAG=( ["$i"]="$path" )
-    declare -A LABEL_BY_TAG=( ["$i"]="$lbl" )
+    # Deploy now
+    local lbl1="Deploy IOS-XE"
+    local path1="/root/.hybrid_admin/image_upgrade.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(colorize_help "$lbl1")")
+    PATH_BY_TAG["$i"]="$path1"
+    LABEL_BY_TAG["$i"]="$lbl1"
+    ((i++))
+
+    # NEW: Schedule Image Upgrade
+    local lbl2="Schedule Image Upgrade"
+    local path2="/root/.hybrid_admin/scheduler.sh"
+    MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2")")
+    PATH_BY_TAG["$i"]="$path2"
+    LABEL_BY_TAG["$i"]="$lbl2"
     ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to main menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
@@ -124,7 +135,6 @@ submenu_iosxe(){
 
 # ---------- Main menu loop ----------
 while true; do
-  # Build menu (TAG  SHOWN_LABEL  HELP)
   MENU_ITEMS=()
   declare -A PATH_BY_TAG=()
   declare -A LABEL_BY_TAG=()
