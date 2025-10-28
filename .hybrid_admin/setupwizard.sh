@@ -1,6 +1,7 @@
 #!/bin/sh
 # discovery_prompt.sh — targets + SSH creds (+ login test) + Meraki API key
-# + DNS fallbacks + mandatory HTTP client SVI + firmware selection
+# + DNS (required) + NTP (at least one) fallbacks + mandatory HTTP client SVI + firmware selection
+# + Enable password (optional) + on-box verification to privilege 15
 # POSIX /bin/sh; dialog UI; writes ./meraki_discovery.env
 
 TITLE="CMDS Switch Discovery — Setup"
@@ -11,6 +12,7 @@ COCKPIT_UPLOAD_DIR="${COCKPIT_UPLOAD_DIR:-/root/IOS-XE_images}" # Cockpit opens 
 DEBUG_LOG="${DEBUG_LOG:-/tmp/cmds_discovery_prompt.log}"
 
 log() { [ "${DEBUG:-0}" = "1" ] && printf '[%s] %s\n' "$(date -u '+%F %T')" "$*" >>"$DEBUG_LOG"; }
+_dnslog(){ [ "${DEBUG:-0}" = "1" ] && printf '[DNSDBG] %s\n' "$*" >>"$DEBUG_LOG"; }
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need dialog
@@ -22,7 +24,6 @@ need timeout
 
 # ---------- Helpers ----------
 trim() { printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-
 is_valid_ip()   { python3 -c 'import sys,ipaddress; ipaddress.ip_address(sys.argv[1])' "$1" 2>/dev/null; }
 is_valid_cidr() { python3 -c 'import sys,ipaddress; ipaddress.ip_network(sys.argv[1], strict=False)' "$1" 2>/dev/null; }
 
@@ -35,6 +36,46 @@ ssh_login_ok() {
     -o NumberOfPasswordPrompts=1 -tt "$2@$1" "exit" >/dev/null 2>&1
 }
 
+# Test 'enable' password by forcing a re-auth attempt even if we already have priv 15.
+# Sequence:
+#  terminal length 0
+#  show privilege
+#  disable            (ignored if not in priv 15)
+#  enable
+#  <enable-password>
+#  show privilege     (must report "Current privilege level is 15")
+ssh_enable_ok() {
+  host="$1"; user="$2"; pass="$3"; enable_pass="$4"
+  [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$enable_pass" ] || return 1
+
+  OUT="$(
+    {
+      printf 'terminal length 0\n'
+      printf 'show privilege\n'
+      printf 'disable\n'
+      printf 'enable\n'
+      printf '%s\n' "$enable_pass"
+      printf 'show privilege\n'
+      printf 'exit\n'
+    } | sshpass -p "$pass" ssh \
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=8 -o PreferredAuthentications=password,keyboard-interactive \
+          -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
+          -o NumberOfPasswordPrompts=1 -tt "$user@$host" 2>/dev/null
+  )"
+  [ "${DEBUG:-0}" = "1" ] && printf '[ENABLEDBG] raw:\n%s\n' "$OUT" >>"$DEBUG_LOG"
+  printf '%s' "$OUT" | LC_ALL=C grep -Eiq 'Current privilege level is[[:space:]]+15'
+}
+
+# Returns 0 if the NTP server replies. Accepts hostname or IP.
+ntp_server_works() {
+  srv="$1"
+  [ -n "$srv" ] || return 1
+  out="$(timeout 6s chronyc -n ntpdate "$srv" 2>&1)"; rc=$?
+  [ "${DEBUG:-0}" = "1" ] && printf '[NTPDBG] srv=%s rc=%s out=%s\n' "$srv" "$rc" "$out" >>"$DEBUG_LOG"
+  [ $rc -eq 0 ]
+}
+
 # human bytes
 hbytes() {
   awk 'function hb(b){if(b<1024)printf "%d B",b;else if(b<1048576)printf "%.1f KB",b/1024;else if(b<1073741824)printf "%.1f MB",b/1048576;else printf "%.2f GB",b/1073741824}
@@ -42,13 +83,10 @@ hbytes() {
 ${1:-0}
 EOF
 }
-# version x.y.z from filename
 # Extract IOS XE version from filename safely (e.g., cat9k_iosxe.17.15.03.SPA.bin -> 17.15.03)
 version_from_name() {
   b="$(basename -- "$1" 2>/dev/null || printf '%s' "$1")"
-  # Prefer "iosxe.<ver>" if present
   v="$(printf '%s\n' "$b" | sed -nE 's/.*iosxe\.([0-9]+(\.[0-9]+){1,4}).*/\1/p' | head -n1)"
-  # Fallback: version preceded by a non-digit boundary (prevents eating the leading "1")
   [ -n "$v" ] || v="$(printf '%s\n' "$b" | sed -nE 's/.*[^0-9]([0-9]{1,2}(\.[0-9]+){1,3}).*/\1/p' | head -n1)"
   printf '%s\n' "$v"
 }
@@ -58,7 +96,6 @@ HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 # Ensure Cockpit upload path exists (and points to the scanner dir if missing)
 ensure_cockpit_upload_dir() {
   if [ ! -e "$COCKPIT_UPLOAD_DIR" ]; then
-    # If parent exists, create a symlink so uploads land in the scanner dir
     ln -s "$FIRMWARE_DIR" "$COCKPIT_UPLOAD_DIR" 2>/dev/null || mkdir -p "$COCKPIT_UPLOAD_DIR"
   fi
 }
@@ -67,48 +104,120 @@ ensure_cockpit_upload_dir
 # dialog wrapper
 dlg() { _tmp="$(mktemp)"; dialog "$@" 2>"$_tmp"; _rc=$?; DOUT=""; [ -s "$_tmp" ] && DOUT="$(cat "$_tmp")"; rm -f "$_tmp"; return $_rc; }
 
-# Clickable link helper (OSC-8). Safe even if terminal doesn’t support it.
-osc8_link() { # usage: osc8_link URL [TEXT]
-  url="$1"; txt="${2:-$1}"
-  # OSC-8 begin + text + OSC-8 end
-  printf '\033]8;;%s\033\\%s\033]8;;\033\\\n' "$url" "$txt"
+# Returns 0 if DNS server answers for google.com, else non-zero
+dns_server_works() {
+  srv="$1"
+  [ -n "$srv" ] || return 1
+  ans="$(dig +time=3 +tries=1 +short google.com @"$srv" 2>/dev/null | awk 'NF{print; exit}')"
+  [ -n "$ans" ]
 }
 
+#===========VALIDATE DNS SERVERS AND EXPORT (robust)=============
+# Requires: dialog, dig; helpers: trim, is_valid_ip, dlg; vars: BACKTITLE, W_DEF
+validate_dns_servers() {
+  command -v dig >/dev/null 2>&1 || {
+    dialog --msgbox "Missing: dig (bind-utils). Install it and re-run." 7 70
+    return 1
+  }
+
+  DNS_PRIMARY="${DNS_PRIMARY:-}"; DNS_SECONDARY="${DNS_SECONDARY:-}"
+
+  _prompt_ip() {
+    while :; do
+      dlg --clear --backtitle "$BACKTITLE" --title "$1" \
+          --inputbox "Enter a valid DNS server IP:" 8 "$W_DEF" "$2"
+      rc=$?; _dnslog "inputbox rc=$rc title='$1'"
+      [ $rc -eq 0 ] || { clear; return 1; }
+      val="$(trim "${DOUT:-}")"
+      if [ -n "$val" ] && is_valid_ip "$val"; then OUT_IP="$val"; return 0; fi
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Invalid IP" \
+             --msgbox "Please enter a valid IPv4/IPv6 address." 7 "$W_DEF"
+    done
+  }
+
+  _check_one_dns() {
+    srv="$1"
+    out="$(dig +time=3 +tries=1 +noall +answer google.com @"$srv" 2>&1)"
+    echo "$out" | awk '
+      /^[^;].*[[:space:]](A|AAAA)[[:space:]][0-9a-fA-F:.]+$/ {print $NF; ok=1; exit}
+      END{exit ok?0:1}
+    '
+  }
+
+  while :; do
+    OUT_IP=""; _prompt_ip "DNS — Primary (required)"   "$DNS_PRIMARY"   || { _dnslog "primary prompt: cancel"; return 1; }
+    DNS_PRIMARY="$OUT_IP"
+    OUT_IP=""; _prompt_ip "DNS — Secondary (required)" "$DNS_SECONDARY" || { _dnslog "secondary prompt: cancel"; return 1; }
+    DNS_SECONDARY="$OUT_IP"
+
+    dlg --backtitle "$BACKTITLE" --title "Testing DNS" \
+        --infobox "Resolving google.com via:\n  Primary  : $DNS_PRIMARY\n  Secondary: $DNS_SECONDARY" 7 "$W_DEF"
+    sleep 0.6
+
+    P_ANS="$(_check_one_dns "$DNS_PRIMARY")"; P_OK=$?
+    S_ANS="$(_check_one_dns "$DNS_SECONDARY")"; S_OK=$?
+    _dnslog "dig primary ok=$P_OK ans='${P_ANS:-}' secondary ok=$S_OK ans='${S_ANS:-}'"
+
+    if [ $P_OK -eq 0 ] && [ $S_OK -eq 0 ]; then
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "DNS Validation" --msgbox \
+"google.com resolved successfully:
+
+  Primary   ($DNS_PRIMARY): ${P_ANS}
+  Secondary ($DNS_SECONDARY): ${S_ANS}" 11 "$W_DEF"
+      export DNS_PRIMARY DNS_SECONDARY
+      _dnslog "both OK → proceed"
+      return 0
+    fi
+
+    RESULT_MSG=$(cat <<EOF
+DNS test results for google.com:
+
+  Primary   ($DNS_PRIMARY): ${P_ANS:-FAILED}
+  Secondary ($DNS_SECONDARY): ${S_ANS:-FAILED}
+
+Re-enter the DNS servers?
+  • Yes  = re-enter both and test again
+  • No   = keep these values and continue
+  • Esc  = abort
+EOF
+)
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "DNS Check Failed" \
+           --yesno "$RESULT_MSG" 16 "$W_DEF"
+    YN_RC=$?; _dnslog "yesno rc=$YN_RC (0=yes, 1=no, 255=esc)"
+
+    case "$YN_RC" in
+      0)  continue ;;
+      1)  export DNS_PRIMARY DNS_SECONDARY; return 0 ;;
+      255) clear; return 1 ;;
+      *)  continue ;;
+    esac
+  done
+}
+
+# Clickable link helper (OSC-8)
+osc8_link() { url="$1"; txt="${2:-$1}"; printf '\033]8;;%s\033\\%s\033]8;;\033\\\n' "$url" "$txt"; }
+
 print_cockpit_link_and_wait() {
-  # Encode the friendly path for Cockpit's file browser
   HOST_SHOW="${HOST_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
   ENC_PATH="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$COCKPIT_UPLOAD_DIR")"
-
-  # Two URL forms Cockpit understands
   URL_A="https://${HOST_SHOW}:9090/files#/?path=${ENC_PATH}"
   URL_B="https://${HOST_SHOW}:9090/=${HOST_SHOW}/files#/?path=${ENC_PATH}"
-
   clear
   echo "=== Upload firmware via Cockpit ==="
-  echo
-  echo "Click one of these links in your local terminal (Ctrl/Cmd+Click):"
   echo "  $URL_A"
   echo "  $URL_B"
-  echo
-  echo "Clickable (OSC-8) variants:"
-  osc8_link "$URL_A" "Open Cockpit Files at /root/IOS-XE_images"
-  osc8_link "$URL_B"
-  echo
-  echo "Upload your images into: $COCKPIT_UPLOAD_DIR"
-  [ -L "$COCKPIT_UPLOAD_DIR" ] && echo "(This path symlinks to: $FIRMWARE_DIR)"
-  printf "Press Enter when done to return… "
-  IFS= read -r _junk
-  stty sane 2>/dev/null || true
+  echo "Clickable:"
+  osc8_link "$URL_A" "Open Cockpit Files at /root/IOS-XE_images"; osc8_link "$URL_B"
+  echo "Upload to: $COCKPIT_UPLOAD_DIR"; [ -L "$COCKPIT_UPLOAD_DIR" ] && echo "(symlink to: $FIRMWARE_DIR)"
+  printf "Press Enter when done… "; IFS= read -r _junk; stty sane 2>/dev/null || true
 }
 
 # -------- Box widths --------
 TERM_COLS="$(tput cols 2>/dev/null)"; [ -z "$TERM_COLS" ] && TERM_COLS=140
-BOX_W=$((TERM_COLS - 4)); [ "$BOX_W" -lt 80 ] && BOX_W=80; [ "$BOX_W" -gt 200 ] && BOX_W=200    # max wide
-W_WIDE="$BOX_W"                                                                                  # for API key & long lists
-W_MODE="${W_MODE:-68}"; [ "$W_MODE" -lt 60 ] && W_MODE=60; [ "$W_MODE" -gt 90 ] && W_MODE=90     # width you liked on MODE
-# Global/default width = MODE width (your request)
+BOX_W=$((TERM_COLS - 4)); [ "$BOX_W" -lt 80 ] && BOX_W=80; [ "$BOX_W" -gt 200 ] && BOX_W=200
+W_WIDE="$BOX_W"
+W_MODE="${W_MODE:-68}"; [ "$W_MODE" -lt 60 ] && W_MODE=60; [ "$W_MODE" -gt 90 ] && W_MODE=90
 W_DEF="$W_MODE"
-# Editors for IP/CIDR: also use MODE width (to match)
 W_EDIT="$W_MODE"
 
 ###############################################################################
@@ -123,27 +232,19 @@ rc=$?; MODE="$(trim "${DOUT:-}")"; log "Mode rc=$rc val='$MODE'"
 [ $rc -eq 0 ] || { clear; exit 1; }
 
 ###############################################################################
-# 2) TARGETS  (loop until valid or user cancels)
+# 2) TARGETS
 ###############################################################################
 DISCOVERY_NETWORKS=""; DISCOVERY_IPS=""
-
 if [ "$MODE" = "scan" ]; then
-  NETS_PREV="$(cat <<'EOF'
-# Paste or type CIDR networks (one per line).
+  NETS_PREV="# Paste or type CIDR networks (one per line).
 # Lines starting with '#' and blank lines are ignored.
-10.0.0.0/24
-EOF
-)"
+10.0.0.0/24"
   while :; do
     tmpnets="$(mktemp)"; printf '%s\n' "$NETS_PREV" >"$tmpnets"
-    dlg --clear --backtitle "$BACKTITLE" --title "Networks to Scan (one per line)" \
-        --editbox "$tmpnets" 14 "$W_EDIT"
-    rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"
-    [ $rc -eq 0 ] || { clear; exit 1; }
-
+    dlg --clear --backtitle "$BACKTITLE" --title "Networks to Scan (one per line)" --editbox "$tmpnets" 14 "$W_EDIT"
+    rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"; [ $rc -eq 0 ] || { clear; exit 1; }
     NETS_PREV="$NETS_RAW"
     tmpin_nets="$(mktemp)"; printf '%s\n' "$NETS_RAW" >"$tmpin_nets"
-
     DISCOVERY_NETWORKS=""; invalid_line=""
     while IFS= read -r raw; do
       line="$(trim "$raw")"; [ -z "$line" ] && continue
@@ -152,30 +253,21 @@ EOF
       [ -z "$DISCOVERY_NETWORKS" ] && DISCOVERY_NETWORKS="$line" || DISCOVERY_NETWORKS="$DISCOVERY_NETWORKS,$line"
     done <"$tmpin_nets"
     rm -f "$tmpin_nets"
-
     [ -z "$invalid_line" ] || { dlg --title "Invalid Network" --msgbox "Invalid: '$invalid_line'\nUse CIDR like 10.0.0.0/24." 8 "$W_DEF"; continue; }
     [ -n "$DISCOVERY_NETWORKS" ] || { dlg --title "No Networks" --msgbox "Provide at least one valid CIDR." 7 "$W_DEF"; continue; }
     break
   done
-
 else
-  IPS_PREV="$(cat <<'EOF'
-# Paste or type one IP per line.
+  IPS_PREV="# Paste or type one IP per line.
 # Lines starting with '#' and blank lines are ignored.
 192.168.1.10
-192.168.1.11
-EOF
-)"
+192.168.1.11"
   while :; do
     tmpips="$(mktemp)"; printf '%s\n' "$IPS_PREV" >"$tmpips"
-    dlg --clear --backtitle "$BACKTITLE" --title "Manual IP List (one per line)" \
-        --editbox "$tmpips" 16 "$W_EDIT"
-    rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"
-    [ $rc -eq 0 ] || { clear; exit 1; }
-
+    dlg --clear --backtitle "$BACKTITLE" --title "Manual IP List (one per line)" --editbox "$tmpips" 16 "$W_EDIT"
+    rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"; [ $rc -eq 0 ] || { clear; exit 1; }
     IPS_PREV="$IPS_RAW"
     ips_file="$(mktemp)"; printf '%s\n' "$IPS_RAW" >"$ips_file"
-
     DISCOVERY_IPS=""; invalid_ip=""; SEEN_TMP="$(mktemp)"; : >"$SEEN_TMP"
     while IFS= read -r raw; do
       ip="$(trim "$raw")"; [ -z "$ip" ] && continue
@@ -187,7 +279,6 @@ EOF
       fi
     done <"$ips_file"
     rm -f "$ips_file"
-
     [ -z "$invalid_ip" ] || { rm -f "$SEEN_TMP"; dlg --title "Invalid IP" --msgbox "Invalid IP: '$invalid_ip'." 7 "$W_DEF"; continue; }
     [ -n "$DISCOVERY_IPS" ] || { rm -f "$SEEN_TMP"; dlg --title "No IPs" --msgbox "Provide at least one valid IP." 7 "$W_DEF"; continue; }
     rm -f "$SEEN_TMP"; break
@@ -204,10 +295,8 @@ while :; do
   [ -n "$SSH_USERNAME" ] && break
   dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 "$W_DEF"
 done
-
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" \
-      --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF"
+  dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
   SSH_PASSWORD="$(trim "${DOUT:-}")"
   [ -n "$SSH_PASSWORD" ] && break
@@ -218,14 +307,12 @@ SSH_TEST_IP=""
 if [ -n "$DISCOVERY_IPS" ]; then
   MENU_ARGS=""; for ip in $DISCOVERY_IPS; do MENU_ARGS="$MENU_ARGS $ip -"; done
   # shellcheck disable=SC2086
-  dlg --clear --backtitle "$BACKTITLE" --title "Test Device" \
-      --menu "We'll verify your SSH credentials on one device.\nSelect an IP:" 16 "$W_DEF" 12 $MENU_ARGS
+  dlg --clear --backtitle "$BACKTITLE" --title "Test Device" --menu "We'll verify your SSH credentials on one device.\nSelect an IP:" 16 "$W_DEF" 12 $MENU_ARGS
   [ $? -eq 0 ] || { clear; exit 1; }
   SSH_TEST_IP="$(trim "${DOUT:-}")"
 else
   while :; do
-    dlg --clear --backtitle "$BACKTITLE" --title "Test Device IP" \
-        --inputbox "Enter an IP address to test the SSH login:" 9 "$W_DEF" "$SSH_TEST_IP"
+    dlg --clear --backtitle "$BACKTITLE" --title "Test Device IP" --inputbox "Enter an IP address to test the SSH login:" 9 "$W_DEF" "$SSH_TEST_IP"
     rc=$?; [ $rc -eq 0 ] || { clear; exit 1; }
     val="$(trim "${DOUT:-}")"
     [ -n "$val" ] && is_valid_ip "$val" && SSH_TEST_IP="$val" && break
@@ -239,10 +326,9 @@ while :; do
   if ssh_login_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD"; then
     dlg --backtitle "$BACKTITLE" --title "SSH Test" --infobox "Login OK to ${SSH_TEST_IP}." 5 "$W_DEF"; sleep 1; break
   fi
-  dlg --backtitle "$BACKTITLE" --title "Login Failed" --yesno \
-      "Could not log in to ${SSH_TEST_IP} as ${SSH_USERNAME}.\n\nRe-enter username and password?" 9 "$W_DEF"
+  dlg --backtitle "$BACKTITLE" --title "Login Failed" --yesno "Could not log in. Re-enter username and password?" 8 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
-
+  # Re-enter loops
   while :; do
     dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" --inputbox "Enter SSH username:" 8 "$W_DEF" "$SSH_USERNAME"
     [ $? -eq 0 ] || { clear; exit 1; }
@@ -251,8 +337,7 @@ while :; do
     dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 "$W_DEF"
   done
   while :; do
-    dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" \
-        --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF"
+    dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF"
     [ $? -eq 0 ] || { clear; exit 1; }
     SSH_PASSWORD="$(trim "${DOUT:-}")"
     [ -n "$SSH_PASSWORD" ] && break
@@ -261,11 +346,51 @@ while :; do
 done
 
 ###############################################################################
+# 3a) ENABLE PASSWORD (optional) + verify escalation to priv 15
+###############################################################################
+ENABLE_PASSWORD=""
+ENABLE_TEST_OK="0"
+while :; do
+  dlg --clear --backtitle "$BACKTITLE" --title "Enable Password (optional)" \
+      --insecure --passwordbox "If your device uses an enable password, enter it to verify we can reach privilege 15.\n\n(Leave blank and press OK to skip.)" 12 "$W_DEF"
+  rc=$?; [ $rc -ne 0 ] && { clear; exit 1; }   # treat Esc as cancel whole flow
+  ENABLE_PASSWORD="$(trim "${DOUT:-}")"
+
+  # Skip if empty
+  if [ -z "$ENABLE_PASSWORD" ]; then
+    ENABLE_TEST_OK="0"
+    break
+  fi
+
+  dlg --backtitle "$BACKTITLE" --title "Testing Enable" \
+      --infobox "Verifying enable password on ${SSH_TEST_IP}…" 6 "$W_DEF"
+  if ssh_enable_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD" "$ENABLE_PASSWORD"; then
+    ENABLE_TEST_OK="1"
+    dlg --backtitle "$BACKTITLE" --title "Enable Test" --msgbox "Enable password verified (privilege 15 confirmed)." 7 "$W_DEF"
+    break
+  fi
+
+  CH=$(
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Enable Test Failed" --menu \
+"Could not escalate to privilege 15 using the provided enable password on ${SSH_TEST_IP}.
+
+Choose:" 12 "$W_DEF" 6 \
+      1 "Re-enter enable password" \
+      2 "Proceed without enable password" \
+      3>&1 1>&2 2>&3
+  ) || CH=1
+  case "$CH" in
+    1) continue ;;
+    2) ENABLE_PASSWORD=""; ENABLE_TEST_OK="0"; break ;;
+    *) continue ;;
+  esac
+done
+
+###############################################################################
 # 3b) MERAKI API KEY (keep WIDE)
 ###############################################################################
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" \
-      --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WIDE"
+  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WIDE"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
@@ -275,25 +400,105 @@ while :; do
 done
 
 ###############################################################################
-# 3c) DNS (compact = MODE width)
+# 3c) DNS — REQUIRED (validated with dig)
 ###############################################################################
-dlg --clear --backtitle "$BACKTITLE" --title "Optional DNS Servers" --msgbox \
-"We will NOT overwrite existing DNS on switches.\nIf a switch cannot resolve DNS, we will apply these fallback entries.\n\nLeave fields blank to skip." 10 "$W_DEF"
+if ! validate_dns_servers; then
+  clear
+  exit 1   # user hit Esc/cancel
+fi
+# DNS_PRIMARY and DNS_SECONDARY are exported by the function
 
-DNS_PRIMARY=""; DNS_SECONDARY=""
+###############################################################################
+# 3c.1) NTP — validate (Primary required; Secondary optional)
+# Accepts IP or hostname; tries ntpdate/chronyd/sntp
+###############################################################################
+probe_ntp_host() {
+  local host="${1:-}"; [ -n "$host" ] || return 1
+
+  if command -v ntpdate >/dev/null 2>&1; then
+    timeout 8s ntpdate -u -q -t 4 "$host" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v chronyd >/dev/null 2>&1; then
+    local kind="server"
+    case "$host" in
+      pool.*|*.pool.ntp.*|*.pool.ntp.org) kind="pool" ;;
+    esac
+    timeout 10s chronyd -Q -t 4 "$kind $host iburst maxsamples 1" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v sntp >/dev/null 2>&1; then
+    timeout 8s sntp -r "$host" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+dlg --clear --backtitle "$BACKTITLE" --title "NTP Servers" --msgbox \
+"Enter at least one NTP server (hostname or IP).\nWe won't overwrite working NTP on switches; these are fallbacks." 10 "$W_DEF"
+
+NTP_PRIMARY=""; NTP_SECONDARY=""
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "DNS Fallback — Primary" --inputbox "Primary DNS server (optional):" 8 "$W_DEF" "$DNS_PRIMARY"
-  rc=$?; val="$(trim "${DOUT:-}")"; [ $rc -ne 0 ] && val=""
-  [ -z "$val" ] && { DNS_PRIMARY=""; break; }
-  is_valid_ip "$val" && DNS_PRIMARY="$val" && break
-  dlg --msgbox "Invalid IP address: '$val'." 7 "$W_DEF"
-done
-while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "DNS Fallback — Secondary" --inputbox "Secondary DNS server (optional):" 8 "$W_DEF" "$DNS_SECONDARY"
-  rc=$?; val="$(trim "${DOUT:-}")"; [ $rc -ne 0 ] && val=""
-  [ -z "$val" ] && { DNS_SECONDARY=""; break; }
-  is_valid_ip "$val" && DNS_SECONDARY="$val" && break
-  dlg --msgbox "Invalid IP address: '$val'." 7 "$W_DEF"
+  while :; do
+    dlg --clear --backtitle "$BACKTITLE" --title "NTP — Primary (required)" \
+        --inputbox "Primary NTP server (hostname or IP):" 8 "$W_DEF" "$NTP_PRIMARY"
+    rc=$?; [ $rc -eq 0 ] || { clear; exit 1; }
+    val="$(trim "${DOUT:-}")"
+    [ -n "$val" ] && NTP_PRIMARY="$val" && break
+    dlg --msgbox "Primary NTP cannot be empty." 7 "$W_DEF"
+  done
+
+  dlg --clear --backtitle "$BACKTITLE" --title "NTP — Secondary (optional)" \
+      --inputbox "Secondary NTP server (hostname or IP, optional):" 8 "$W_DEF" "$NTP_SECONDARY"
+  rc=$?; [ $rc -ne 0 ] && NTP_SECONDARY="" || NTP_SECONDARY="$(trim "${DOUT:-}")"
+
+  dlg --backtitle "$BACKTITLE" --title "NTP Validation" \
+      --infobox "Checking:\n  Primary  : ${NTP_PRIMARY}\n  Secondary: ${NTP_SECONDARY:-<none>}" 7 "$W_DEF"
+  sleep 0.5
+
+  P_OK=0; S_OK=2
+  if probe_ntp_host "$NTP_PRIMARY"; then P_OK=1; fi
+  if [ -n "$NTP_SECONDARY" ]; then
+    S_OK=0
+    if probe_ntp_host "$NTP_SECONDARY"; then S_OK=1; fi
+  fi
+
+  if [ $P_OK -eq 1 ] && { [ $S_OK -eq 1 ] || [ $S_OK -eq 2 ]; }; then
+    dlg --clear --backtitle "$BACKTITLE" --title "NTP Validation" --msgbox \
+"Validated NTP server(s):
+  Primary  (${NTP_PRIMARY}): OK
+  Secondary(${NTP_SECONDARY:-<none>}): $( [ $S_OK -eq 1 ] && echo OK || echo skipped )" 11 "$W_DEF"
+    break
+  fi
+
+  msg="NTP check results:
+  Primary  (${NTP_PRIMARY}): $( [ $P_OK -eq 1 ] && echo OK || echo FAILED )
+  Secondary(${NTP_SECONDARY:-<none>}): "
+  if   [ $S_OK -eq 1 ]; then msg="${msg}OK"
+  elif [ $S_OK -eq 0 ]; then msg="${msg}FAILED"
+  else                     msg="${msg}(skipped)"; fi
+
+  if [ $P_OK -eq 0 ] && { [ $S_OK -eq 0 ] || [ $S_OK -eq 2 ]; }; then
+    dlg --backtitle "$BACKTITLE" --title "NTP Validation" --msgbox \
+"Neither NTP server responded:
+
+  Primary  (${NTP_PRIMARY}): $( [ $P_OK -eq 1 ] && echo OK || echo FAILED )
+  Secondary(${NTP_SECONDARY:-<none>}): $( [ $S_OK -eq 1 ] && echo OK || ([ $S_OK -eq 0 ] && echo FAILED || echo skipped) )
+
+Please re-enter at least one working server." 14 "$W_DEF"
+    continue
+  fi
+
+  CH=$(
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "NTP Validation" --menu \
+"${msg}
+
+Do you want to re-enter the NTP servers or proceed with the current values?" 13 "$W_DEF" 6 \
+      1 "Re-enter NTP servers" \
+      2 "Proceed with these values" \
+      3>&1 1>&2 2>&3
+  ) || CH=1
+  [ "$CH" = "2" ] && break
 done
 
 ###############################################################################
@@ -318,7 +523,7 @@ PY
 done
 
 ###############################################################################
-# 4) FIRMWARE PICK (WIDE to show long filenames)
+# 4) FIRMWARE PICK (WIDE)
 ###############################################################################
 mkdir -p "$FIRMWARE_DIR"
 command -v restorecon >/dev/null 2>/dev/null && restorecon -R "$FIRMWARE_DIR" >/dev/null 2>&1
@@ -339,7 +544,6 @@ while :; do
           0 "Exit setup" \
         3>&1 1>&2 2>&3
     ) || { clear; rm -f "$tmp_lines"; exit 1; }
-
     case "$CH" in
       1) print_cockpit_link_and_wait; rm -f "$tmp_lines"; continue ;;
       2) rm -f "$tmp_lines"; continue ;;
@@ -423,8 +627,10 @@ export DISCOVERY_MODE="$MODE"
 export DISCOVERY_NETWORKS="$DISCOVERY_NETWORKS"
 export DISCOVERY_IPS="$DISCOVERY_IPS"
 export SSH_USERNAME SSH_PASSWORD SSH_TEST_IP
+export ENABLE_PASSWORD ENABLE_TEST_OK
 export MERAKI_API_KEY
 export DNS_PRIMARY DNS_SECONDARY
+export NTP_PRIMARY NTP_SECONDARY
 export HTTP_CLIENT_VLAN_ID HTTP_CLIENT_SOURCE_IFACE
 export FW_CAT9K_FILE FW_CAT9K_PATH FW_CAT9K_SIZE_BYTES FW_CAT9K_SIZE_H FW_CAT9K_VERSION
 export FW_CAT9K_LITE_FILE FW_CAT9K_LITE_PATH FW_CAT9K_LITE_SIZE_BYTES FW_CAT9K_LITE_SIZE_H FW_CAT9K_LITE_VERSION
@@ -437,9 +643,13 @@ export FW_CAT9K_LITE_FILE FW_CAT9K_LITE_PATH FW_CAT9K_LITE_SIZE_BYTES FW_CAT9K_L
   printf 'export SSH_USERNAME=%q\n' "$SSH_USERNAME"
   printf 'export SSH_PASSWORD=%q\n' "$SSH_PASSWORD"
   printf 'export SSH_TEST_IP=%q\n' "$SSH_TEST_IP"
+  printf 'export ENABLE_PASSWORD=%q\n' "$ENABLE_PASSWORD"
+  printf 'export ENABLE_TEST_OK=%q\n' "$ENABLE_TEST_OK"
   printf 'export MERAKI_API_KEY=%q\n' "$MERAKI_API_KEY"
   printf 'export DNS_PRIMARY=%q\n' "$DNS_PRIMARY"
   printf 'export DNS_SECONDARY=%q\n' "$DNS_SECONDARY"
+  printf 'export NTP_PRIMARY=%q\n' "$NTP_PRIMARY"
+  printf 'export NTP_SECONDARY=%q\n' "$NTP_SECONDARY"
   printf 'export HTTP_CLIENT_VLAN_ID=%q\n' "$HTTP_CLIENT_VLAN_ID"
   printf 'export HTTP_CLIENT_SOURCE_IFACE=%q\n' "$HTTP_CLIENT_SOURCE_IFACE"
   [ -n "$FW_CAT9K_FILE" ] && {
@@ -469,19 +679,25 @@ mask_last4() {
     printf "%0.s*" $(seq 1 $((n-4))); printf '%s' "$(printf '%s' "$s" | sed -n 's/.*\(....\)$/\1/p')"
   fi
 }
-PW_MASK="$(mask "$SSH_PASSWORD")"
-API_MASK="$(mask_last4 "$MERAKI_API_KEY")"
+PW_MASK="$(mask "$SSH_PASSWORD")"; API_MASK="$(mask_last4 "$MERAKI_API_KEY")"
 SVI_SUMMARY="$( printf '%s (%s)' "$HTTP_CLIENT_SOURCE_IFACE" "$HTTP_CLIENT_VLAN_ID" )"
+ENABLE_SUMMARY="$( [ "$ENABLE_TEST_OK" = "1" ] && echo 'provided (tested OK)' || ([ -n "$ENABLE_PASSWORD" ] && echo 'provided (test FAILED)') )"
+[ -z "$ENABLE_SUMMARY" ] && ENABLE_SUMMARY="not provided"
 
 summary="Saved: ${ENV_FILE}
 
 SSH Username: ${SSH_USERNAME}
 SSH Password: ${PW_MASK}
+Enable Password: ${ENABLE_SUMMARY}
 Meraki API Key: ${API_MASK}
 
-DNS fallback (won't overwrite existing; only used if switch cannot resolve):
-  Primary  : ${DNS_PRIMARY:-<none>}
-  Secondary: ${DNS_SECONDARY:-<none>}
+DNS (required; used as fallback if needed):
+  Primary  : ${DNS_PRIMARY}
+  Secondary: ${DNS_SECONDARY}
+
+NTP (at least one; used as fallback if needed):
+  Primary  : ${NTP_PRIMARY}
+  Secondary: ${NTP_SECONDARY:-<none>}
 
 HTTP client source-interface (required):
   ${SVI_SUMMARY}
@@ -501,5 +717,5 @@ Cat9k-Lite (9200):
 "
 fi
 
-dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "$summary" 22 "$W_WIDE"
+dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "$summary" 24 "$W_WIDE"
 clear
