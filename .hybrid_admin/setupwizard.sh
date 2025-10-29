@@ -44,36 +44,151 @@ ssh_login_ok() {
 #  enable
 #  <enable-password>
 #  show privilege     (must report "Current privilege level is 15")
-ssh_enable_ok() {
-  host="$1"; user="$2"; pass="$3"; enable_pass="$4"
-  [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$enable_pass" ] || return 1
+# Return numeric privilege level (e.g., 1 or 15). Echoes blank on failure.
+get_priv_level() {
+  host="$1"; user="$2"; pass="$3"
+  [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] || { echo ""; return 1; }
 
   OUT="$(
-    {
-      printf 'terminal length 0\n'
-      printf 'show privilege\n'
-      printf 'disable\n'
-      printf 'enable\n'
-      printf '%s\n' "$enable_pass"
-      printf 'show privilege\n'
-      printf 'exit\n'
-    } | sshpass -p "$pass" ssh \
-          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          -o ConnectTimeout=8 -o PreferredAuthentications=password,keyboard-interactive \
-          -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
-          -o NumberOfPasswordPrompts=1 -tt "$user@$host" 2>/dev/null
+    { printf 'terminal length 0\n'; printf 'show privilege\n'; printf 'exit\n'; } |
+    sshpass -p "$pass" ssh \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=8 -o PreferredAuthentications=password,keyboard-interactive \
+      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 -tt "$user@$host" 2>/dev/null
   )"
-  [ "${DEBUG:-0}" = "1" ] && printf '[ENABLEDBG] raw:\n%s\n' "$OUT" >>"$DEBUG_LOG"
-  printf '%s' "$OUT" | LC_ALL=C grep -Eiq 'Current privilege level is[[:space:]]+15'
+  [ "${DEBUG:-0}" = "1" ] && printf '[ENABLEDBG] get_priv_level raw:\n%s\n' "$OUT" >>"$DEBUG_LOG"
+
+  # Typical IOS line: "Current privilege level is 15"
+  printf '%s\n' "$OUT" | awk 'BEGIN{IGNORECASE=1} /Current privilege level is/ {print $NF; exit}'
 }
 
-# Returns 0 if the NTP server replies. Accepts hostname or IP.
-ntp_server_works() {
-  srv="$1"
-  [ -n "$srv" ] || return 1
-  out="$(timeout 6s chronyc -n ntpdate "$srv" 2>&1)"; rc=$?
-  [ "${DEBUG:-0}" = "1" ] && printf '[NTPDBG] srv=%s rc=%s out=%s\n' "$srv" "$rc" "$out" >>"$DEBUG_LOG"
-  [ $rc -eq 0 ]
+# Robust enable-password verification:
+# - Detects current level (handles "C9200>" vs "C9200#")
+# - If already 15 and a password is provided, do "disable -> enable -> <pass>" to actually test it
+# - If at user exec, do "enable -> <pass>" to escalate
+# - Confirms success by re-checking "show privilege"
+
+# Strict enable verifier using expect:
+# Return codes:
+#   0 = verified: device prompted for enable password, we sent it, now at priv15
+#   5 = not verifiable: device never asked for an enable password (already # and no prompt)
+#   6 = failed: wrong enable password (or access denied)
+#   3/4/7 = transport/timeout/parse issues
+
+
+ssh_enable_ok() {
+  host="$1"; user="$2"; pass="$3"; enable_pass="$4"
+  [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$enable_pass" ] || return 7
+
+  HOST="$host" USER="$user" PASS="$pass" ENPASS="$enable_pass" \
+  DEBUG_FLAG="${DEBUG:-0}" DEBUG_LOG_FILE="${DEBUG_LOG:-/tmp/cmds_discovery_prompt.log}" \
+  ENABLE_PROMPT_TIMEOUT="${ENABLE_PROMPT_TIMEOUT:-2}" ENABLE_VERIFY_TIMEOUT="${ENABLE_VERIFY_TIMEOUT:-4}" \
+  expect -f - <<'EXP'
+    # rc: 0=verified, 5=no prompt (unexpectedly slow), 6=bad pw,
+    # 3/4/7=transport/other
+    log_user 0
+    if {$env(DEBUG_FLAG) == "1"} {
+      catch {log_file -a $env(DEBUG_LOG_FILE)}
+    }
+
+    set host   $env(HOST)
+    set user   $env(USER)
+    set pass   $env(PASS)
+    set enpass $env(ENPASS)
+
+    # tight timeouts for snappy UX
+    set t_enable [expr {int($env(ENABLE_PROMPT_TIMEOUT))}]   ;# wait for Password: after 'enable'
+    set t_verify [expr {int($env(ENABLE_VERIFY_TIMEOUT))}]   ;# wait for show privilege result
+    set t_login 15                                          ;# ssh login phase
+
+    # prompt: match line ending in '>' or '#'
+    set prompt_re {[\r\n][^\r\n]*[>#] ?$}
+
+    # ---- SSH login (no sshpass; let expect feed credentials) ----
+    set timeout $t_login
+    # -o LogLevel=ERROR keeps "added to known hosts" junk out of the stream
+    spawn ssh \
+      -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 \
+      -o PreferredAuthentications=password,keyboard-interactive \
+      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      -tt $user@$host
+
+    # feed creds
+    while 1 {
+      expect \
+        -nocase -re {username:}   { send -- "$user\r" } \
+        -nocase -re {password:}   { send -- "$pass\r" } \
+        -re $prompt_re            { break } \
+        -re {denied|authentication failed|login invalid} { exit 3 } \
+        timeout                   { exit 3 } \
+        eof                       { exit 3 }
+    }
+
+    # sync & no paging
+    send -- "\r"; expect -re $prompt_re
+    send -- "terminal length 0\r"; expect -re $prompt_re
+
+    # check current privilege
+    set at15 0
+    send -- "show privilege\r"
+    expect {
+      -re {Current privilege level is[[:space:]]*15} { set at15 1 }
+      -re $prompt_re {}
+      timeout {}
+    }
+    expect -re $prompt_re
+
+    if {$at15} {
+      # drop out so we always force an enable test
+      send -- "disable\r"
+      expect -re $prompt_re
+    }
+
+    # ---- Enable escalation (fast path) ----
+    # try once; if no Password: quickly, retry once more
+    proc try_enable {t_enable prompt_re} {
+      send -- "enable\r"
+      set sawpw 0
+      set timeout $t_enable
+      while 1 {
+        expect \
+          -nocase -re {password:} { set sawpw 1; send -- "$::enpass\r"; exp_continue } \
+          -re $prompt_re          { return [list 1 $sawpw] } \
+          timeout                 { return [list 0 $sawpw] } \
+          eof                     { return [list -1 $sawpw] }
+      }
+    }
+
+    lassign [try_enable $t_enable $prompt_re] ok1 sawpw1
+    if {$ok1 == 0 && $sawpw1 == 0} {
+      # maybe the box missed our first 'enable' keystroke; try once more quickly
+      lassign [try_enable $t_enable $prompt_re] ok2 sawpw2
+      if {$ok2 == 0 && $sawpw2 == 0} {
+        # no Password: and no prompt change -> unexpectedly slow path
+        exit 5
+      }
+    } elseif {$ok1 < 0} {
+      exit 4
+    }
+
+    # If we never saw Password: but got a prompt immediately, it could be no enable
+    # secret configured (already privileged). Verify with short timeout.
+    set timeout $t_verify
+    send -- "show privilege\r"
+    expect {
+      -re {Current privilege level is[[:space:]]*15} { exit 0 }
+      -re {Current privilege level is[[:space:]]*[0-9]+} { exit 6 }
+      timeout { exit 4 }
+      eof     { exit 4 }
+    }
+EXP
+  rc=$?
+  [ "${DEBUG:-0}" = "1" ] && printf '[ENABLEDBG] expect rc=%s\n' "$rc" >>"$DEBUG_LOG"
+  return $rc
 }
 
 # human bytes
@@ -83,6 +198,9 @@ hbytes() {
 ${1:-0}
 EOF
 }
+
+
+
 # Extract IOS XE version from filename safely (e.g., cat9k_iosxe.17.15.03.SPA.bin -> 17.15.03)
 version_from_name() {
   b="$(basename -- "$1" 2>/dev/null || printf '%s' "$1")"
@@ -353,10 +471,10 @@ ENABLE_TEST_OK="0"
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Enable Password (optional)" \
       --insecure --passwordbox "If your device uses an enable password, enter it to verify we can reach privilege 15.\n\n(Leave blank and press OK to skip.)" 12 "$W_DEF"
-  rc=$?; [ $rc -ne 0 ] && { clear; exit 1; }   # treat Esc as cancel whole flow
+  rc=$?; [ $rc -ne 0 ] && { clear; exit 1; }
   ENABLE_PASSWORD="$(trim "${DOUT:-}")"
 
-  # Skip if empty
+  # Skip verification entirely if blank
   if [ -z "$ENABLE_PASSWORD" ]; then
     ENABLE_TEST_OK="0"
     break
@@ -364,33 +482,40 @@ while :; do
 
   dlg --backtitle "$BACKTITLE" --title "Testing Enable" \
       --infobox "Verifying enable password on ${SSH_TEST_IP}…" 6 "$W_DEF"
-  if ssh_enable_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD" "$ENABLE_PASSWORD"; then
+
+  ssh_enable_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD" "$ENABLE_PASSWORD"
+  rc=$?
+
+  if [ $rc -eq 0 ]; then
     ENABLE_TEST_OK="1"
     dlg --backtitle "$BACKTITLE" --title "Enable Test" --msgbox "Enable password verified (privilege 15 confirmed)." 7 "$W_DEF"
     break
   fi
 
+  reason="Enable password failed."
+  [ $rc -eq 5 ] && reason="Device did not prompt for an enable password (already at #); cannot verify."
+
   CH=$(
     dialog --no-shadow --backtitle "$BACKTITLE" --title "Enable Test Failed" --menu \
-"Could not escalate to privilege 15 using the provided enable password on ${SSH_TEST_IP}.
+"${reason}
 
 Choose:" 12 "$W_DEF" 6 \
       1 "Re-enter enable password" \
-      2 "Proceed without enable password" \
+      2 "Proceed without verification" \
       3>&1 1>&2 2>&3
   ) || CH=1
   case "$CH" in
     1) continue ;;
-    2) ENABLE_PASSWORD=""; ENABLE_TEST_OK="0"; break ;;
+    2) ENABLE_TEST_OK="0"; break ;;
     *) continue ;;
   esac
 done
-
 ###############################################################################
 # 3b) MERAKI API KEY (keep WIDE)
 ###############################################################################
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WIDE"
+  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WI
+DE"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
