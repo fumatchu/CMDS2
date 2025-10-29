@@ -28,6 +28,24 @@ set +H
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+# --- De-escape %q artifacts from the setup script ---
+__deq() {
+  # Remove CRs, then unescape a few %q-escaped chars we actually use.
+  local s="${1//$'\r'/}"
+  s="${s//\\!/!}"   # \! -> !
+  s="${s//\\;/;}"   # \; -> ;
+  s="${s//\\ / }"   # '\ ' -> ' '
+  s="${s//\\\\/\\}" # \\ -> \
+  printf '%s' "$s"
+}
+
+SSH_USERNAME="$(__deq "${SSH_USERNAME:-}")"
+SSH_PASSWORD="$(__deq "${SSH_PASSWORD:-}")"
+ENABLE_PASSWORD="$(__deq "${ENABLE_PASSWORD:-}")"
+MERAKI_API_KEY="$(__deq "${MERAKI_API_KEY:-}")"
+DISCOVERY_IPS="$(__deq "${DISCOVERY_IPS:-}")"
+DISCOVERY_NETWORKS="$(__deq "${DISCOVERY_NETWORKS:-}")"
+
 # ===== Config / defaults =====
 DISCOVERY_MODE="${DISCOVERY_MODE:-}"           # list|networks|scan|cidr|subnets|(auto)
 DISCOVERY_IPS="${DISCOVERY_IPS:-}"
@@ -37,6 +55,7 @@ DISCOVERY_INTERFACE="${DISCOVERY_INTERFACE:-}"
 SSH_USERNAME="${SSH_USERNAME:-admin}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-}"
+ENABLE_PASSWORD="${ENABLE_PASSWORD:-}"
 MAX_SSH_FANOUT="${MAX_SSH_FANOUT:-1}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-30}"
 DEBUG="${DISCOVERY_DEBUG:-0}"
@@ -177,72 +196,142 @@ plan_action_label(){  # UPGRADE/DOWNGRADE/SAME/UNKNOWN
 }
 
 # ===== SSH probe (with hard timeout) =====
+
+# ===== SSH probe (pure Bash; no expect) =====
 probe_host() {
   local ip="$1" log="$LOG_DIR/scan-$ip.log"
-  : > "$log"; ui_status "[${ip}] Probing via SSH…"; ui_status "[${ip}] SSH: connecting…"
+  : > "$log"
+  ui_status "[${ip}] Probing via SSH…"
+  ui_status "[${ip}] SSH: connecting…"
 
-  local -a SSH_OPTS=(
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-    -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
-    -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa
-    -o KexAlgorithms=+diffie-hellman-group14-sha1
-  )
+  # Build SSH command (key takes precedence; else password with sshpass)
   local -a SSH_CMD
   if [[ -n "$SSH_KEY_PATH" && -r "$SSH_KEY_PATH" ]]; then
-    SSH_CMD=(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -o BatchMode=yes "$SSH_USERNAME@$ip")
-  elif [[ -n "$SSH_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
-    SSH_CMD=(sshpass -p "$SSH_PASSWORD" ssh "${SSH_OPTS[@]}"
+    SSH_CMD=(ssh
+      -o LogLevel=ERROR
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
+      -o PreferredAuthentications=publickey,password,keyboard-interactive
+      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=yes
+      -o NumberOfPasswordPrompts=1
+      -i "$SSH_KEY_PATH" -tt "$SSH_USERNAME@$ip"
+    )
+  else
+    SSH_CMD=(sshpass -p "$SSH_PASSWORD" ssh
+      -o LogLevel=ERROR
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
       -o PreferredAuthentications=password,keyboard-interactive
       -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no
-      -o NumberOfPasswordPrompts=1 -o BatchMode=no "$SSH_USERNAME@$ip")
-  else
-    SSH_CMD=(ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o NumberOfPasswordPrompts=0 "$SSH_USERNAME@$ip")
+      -o NumberOfPasswordPrompts=1
+      -tt "$SSH_USERNAME@$ip"
+    )
   fi
-  { printf '[cmd] '; printf '%q ' "${SSH_CMD[@]}" | sed 's/sshpass -p [^ ]\+/sshpass -p ****/g'; echo; } >> "$log"
 
-  local cmdf out outn; cmdf="$(mktemp)"; out="$(mktemp)"; outn="$(mktemp)"
+  # Helper to run a scripted session with a hard timeout
+  _run_ssh_script() {
+    local timeout_secs="$1"; shift
+    # Stdin is a sequence of lines (already CRLF terminated by caller)
+    if command -v timeout >/dev/null 2>&1; then
+      timeout -k 5s "${timeout_secs}s" "${SSH_CMD[@]}"
+    else
+      "${SSH_CMD[@]}"
+    fi
+  }
+
+  local out_priv out facts outn
+  out_priv="$(mktemp)"
+  facts="$(mktemp)"
+  outn="$(mktemp)"
+
+  # -------- Pass 1: find current privilege level --------
   {
-    printf '\r\n\r\n'; sleep 0.40
-    printf 'terminal length 0\r\n';              sleep 0.35
-    printf 'terminal width 511\r\n';             sleep 0.35
-    printf 'show clock\r\n';                     sleep 0.45
-    printf 'show version\r\n';                   sleep 0.55
-    printf 'show running-config | include ^hostname\r\n'; sleep 0.45
-    printf 'show inventory\r\n';                 sleep 0.70
-    sleep 0.60
+    printf '\r\n\r\n'             # coax banners / "Press RETURN"
+    printf 'terminal length 0\r\n'
+    printf 'terminal width 511\r\n'
+    printf 'show privilege\r\n'
     printf 'exit\r\n'
-  } > "$cmdf"
+  } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$out_priv" 2>&1
 
-  local _pf_state; _pf_state="$(set -o | awk '/pipefail/{print $2}')"; set +o pipefail
-  if command -v timeout >/dev/null 2>&1; then
-    if ! cat "$cmdf" | timeout -k 5s "${SSH_TIMEOUT}s" "${SSH_CMD[@]}" -tt >"$out" 2>&1; then echo "[${ip}] SSH timeout or error after ${SSH_TIMEOUT}s" >> "$log"; fi
-  else
-    if ! cat "$cmdf" | "${SSH_CMD[@]}" -tt >"$out" 2>&1; then true; fi
+  # Normalize to LF; keep raw in the log too
+  tr -d '\r' < "$out_priv" | tee -a "$log" > "$outn"
+
+  local at15=0
+  if grep -Eq 'Current privilege level is[[:space:]]*15' "$outn"; then
+    at15=1
   fi
-  [[ "$_pf_state" == "on" ]] && set -o pipefail
-  rm -f "$cmdf"
 
-  tr -d '\r' < "$out" | tee -a "$log" > "$outn"
+  # -------- Pass 2: run fact commands (with/without enable) --------
+  : > "$outn"
+  if (( at15 == 1 )); then
+    ui_status "[${ip}] Privilege 15 detected; collecting facts…"
+    {
+      printf '\r\n\r\n'
+      printf 'terminal length 0\r\n'
+      printf 'terminal width 511\r\n'
+      printf 'show clock\r\n'
+      printf 'show version\r\n'
+      printf 'show running-config | include ^hostname\r\n'
+      printf 'show inventory\r\n'
+      printf 'exit\r\n'
+    } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
+  else
+    if [[ -n "${ENABLE_PASSWORD:-}" ]]; then
+      ui_status "[${ip}] Not privileged; attempting enable…"
+      {
+        printf '\r\n\r\n'
+        printf 'terminal length 0\r\n'
+        printf 'terminal width 511\r\n'
+        printf 'enable\r\n'
+        printf '%s\r\n' "$ENABLE_PASSWORD"
+        printf 'show privilege\r\n'
+        printf 'show clock\r\n'
+        printf 'show version\r\n'
+        printf 'show running-config | include ^hostname\r\n'
+        printf 'show inventory\r\n'
+        printf 'exit\r\n'
+      } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
+    else
+      ui_status "[${ip}] No enable secret; collecting what we can…"
+      {
+        printf '\r\n\r\n'
+        printf 'terminal length 0\r\n'
+        printf 'terminal width 511\r\n'
+        printf 'show clock\r\n'
+        printf 'show version\r\n'
+        printf 'show running-config | include ^hostname\r\n'
+        printf 'show inventory\r\n'
+        printf 'exit\r\n'
+      } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
+    fi
+  fi
 
+  tr -d '\r' < "$facts" | tee -a "$log" > "$outn"
+
+  # -------- Decide if login worked --------
   local login_ok=0
-  if grep -Eq 'Cisco IOS|IOS XE| uptime is |^[A-Za-z0-9_.:/-]+[>#] *$|[0-9]{2}:[0-9]{2}:[0-9]{2}' "$outn"; then login_ok=1; fi
+  if grep -Eq 'Cisco IOS|IOS XE| uptime is |^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$|Current privilege level is' "$outn"; then
+    login_ok=1
+  fi
   (( login_ok )) && ui_status "[${ip}] SSH: logged in and collected output."
 
+  # -------- Parse facts --------
   local hostname version pid sn
   hostname="$(awk '/^hostname[[:space:]]+/{print $2}' "$outn" | tail -n1)"
   [[ -z "$hostname" ]] && hostname="$(grep -E '^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$' "$outn" | tail -n1 | sed -E 's/[>#].*$//')"
   [[ -z "$hostname" ]] && hostname="$(grep -m1 -E ' uptime is ' "$outn" | awk '{print $1}')"
-  hostname="$(clean_field "$hostname")"
+  hostname="$(clean_field "${hostname:-}")"
 
   version="$(grep -m1 -E 'Cisco IOS XE Software, Version[[:space:]]+' "$outn" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
   [[ -z "$version" ]] && version="$(grep -m1 -E 'Cisco IOS Software|Version[[:space:]]+[0-9]' "$outn" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
-  version="$(clean_field "$version")"
+  version="$(clean_field "${version:-}")"
 
+  # PID/SN from inventory if available; otherwise leave blank
   pid="$(grep -m1 -E 'PID:[[:space:]]*[^,]+' "$outn" | sed -E 's/.*PID:[[:space:]]*([^,]+).*/\1/')"
   sn="$(grep -m1 -E 'SN:[[:space:]]*[A-Za-z0-9]+' "$outn" | sed -E 's/.*SN:[[:space:]]*([^,[:space:]]+).*/\1/')"
-  pid="$(clean_field "$pid")"; sn="$(clean_field "$sn")"
+  pid="$(clean_field "${pid:-}")"; sn="$(clean_field "${sn:-}")"
 
-  rm -f "$out" "$outn"
+  rm -f "$out_priv" "$facts" "$outn"
 
   if (( login_ok )); then
     jq -n --arg ip "$ip" --arg host "${hostname:-}" --arg ver "${version:-}" --arg pid "${pid:-}" --arg sn "${sn:-}" \
@@ -251,7 +340,6 @@ probe_host() {
     jq -n --arg ip "$ip" '{ip:$ip, ssh:true, login:false}'
   fi
 }
-
 # ===== Discovery =====
 resolve_targets() {
   local mode="${DISCOVERY_MODE,,}" targets=()
@@ -271,7 +359,8 @@ nmap_cmd_base() { local opts=(-n); [[ $(id -u) -ne 0 ]] && opts+=(--privileged);
 pass_a() { local probes=(-PE -PS22,80,443,830 -PA22,443); (( USE_IFACE )) && probes+=(-PR); local cmd=(nmap $(nmap_cmd_base) -sn "${probes[@]}" --max-retries 2 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
 pass_b() { local cmd=(nmap $(nmap_cmd_base) -sn -PE "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
 pass_c() { local cmd=(nmap $(nmap_cmd_base) -sn -Pn -PS22,80,443 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Status: Up/{print $2}' || true; }
-pass_fping() { command -v fping >/dev/null 2>/dev/null || return 0; local out=(); for t in "${TARGETS[@]}"; do if [[ "$t" =~ / ]]; then mapfile -t out < <(fping -a -q -g "$t" 2>/dev/null || true); else mapfile -t out < <(printf '%s\n' "$t" | fping -a -q 2>/dev/null || true); fi; done; printf '%s\n' "${out[@]}" | awk 'NF'; }
+pass_fping() { command -v fping >/dev/null 2>/dev/null || return 0; local out=(); for t in "${TARGETS[@]}"; do if [[ "$t" =~ / ]]; then mapfile -t out < <(fping -a -q -g "$t" 2>/dev/null || true); else mapfile -t out < <(printf '%s\n' "$t" | fping -a -q 2>/
+dev/null || true); fi; done; printf '%s\n' "${out[@]}" | awk 'NF'; }
 
 discover_targets() {
   ui_status "Discovering live hosts (pass 1/3)…"; ui_gauge 5 "Scanning (hybrid)…"
