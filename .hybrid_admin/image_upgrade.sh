@@ -110,13 +110,36 @@ build_ssh_arr(){
   fi
 }
 
-is_priv15_for_ip(){ local ip="$1" raw out ok=1; build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
-  { printf '\r\nterminal length 0\r\nterminal width 511\r\nshow privilege\r\nexit\r\n'; } \
-  | timeout -k 5s 25s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
-  tr -d '\r' < "$raw" > "$out"; grep -Eiq 'Current privilege level is[[:space:]]*15' "$out" && ok=0
-  rm -f "$raw" "$out"; return $ok; }
+# ---- Check privilege level (15 means we're already enabled) ----
+is_priv15_for_ip() {
+  local ip="$1" raw out ok=1
+  build_ssh_arr "$ip"
+  raw="$(mktemp)"; out="$(mktemp)"
+  {
+    printf '\r\n'
+    printf 'terminal length 0\r\n'
+    printf 'terminal width 511\r\n'
+    printf 'show privilege\r\n'
+    printf 'exit\r\n'
+  } | timeout -k 5s 25s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+  tr -d '\r' < "$raw" > "$out"
+  grep -Eiq 'Current privilege level is[[:space:]]*15' "$out" && ok=0
+  rm -f "$raw" "$out"
+  return $ok
+}
 
-emit_enable(){ printf 'enable\r\n'; sleep 0.2; [[ -n "${ENABLE_PASSWORD:-}" ]] && printf '%s\r\n' "$ENABLE_PASSWORD" || printf '\r\n'; printf 'show privilege\r\n'; }
+# ---- Elevate only when needed ----
+emit_enable(){
+  printf 'enable\r\n'
+  sleep 0.2
+  if [[ -n "${ENABLE_PASSWORD:-}" ]]; then
+    printf '%s\r\n' "$ENABLE_PASSWORD"
+  else
+    printf '\r\n'
+  fi
+  printf 'show privilege\r\n'
+  sleep 0.2
+}
 
 # ===== helpers =====
 get_plan_field(){ local ip="$1" key="$2"; [[ -n "$UPGRADE_SELECTED_JSON" && -s "$UPGRADE_SELECTED_JSON" ]] || return 1; jq -r --arg ip "$ip" --arg k "$key" '.[] | select(.ip==$ip) | .[$k] // empty' "$UPGRADE_SELECTED_JSON"; }
@@ -130,12 +153,14 @@ flash_size_from(){ flash_bytes_from_capture "$@"; }
 shortver_from_string(){ awk 'match($0,/[0-9]+\.[0-9]+\.[0-9]+/){print substr($0,RSTART,RLENGTH)}'; }
 
 installed_short_version_for_ip(){
-  local ip="$1" raw norm v=""
+  local ip="$1" raw norm v="" need_en=0
   build_ssh_arr "$ip"; raw="$(mktemp)"; norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    if ! is_priv15_for_ip "$ip"; then emit_enable; fi
-    printf 'show install summary\r\nexit\r\n'
+    (( need_en )) && emit_enable
+    printf 'show install summary\r\n'
+    printf 'exit\r\n'
   } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
   tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
   v="$(awk 'BEGIN{IGNORECASE=1}/^IMG[[:space:]]+C[[:space:]]+/{print $NF; exit}' "$norm")"
@@ -158,7 +183,7 @@ skip_if_same_version_for_ip(){
   log "[${ip}] VERSION: target ${target_short}; installed ${inst_short:-unknown} — proceed"; return 1
 }
 
-# ===== PRECHECK (now elevates) =====
+# ===== PRECHECK (gated enable) =====
 precheck_for_ip(){
   local ip="$1" raw out rc=0 need_en=0
   log "[${ip}] CONNECT…"; build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
@@ -166,7 +191,7 @@ precheck_for_ip(){
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
-    printf 'show version\r\n'; sleep 0.3
+    printf 'show version\r\n';         sleep 0.3
     printf 'show install summary\r\n'; sleep 0.3
     printf 'exit\r\n'
   } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
@@ -190,20 +215,19 @@ precheck_for_ip(){
   echo "$hostname" > "$RUN_DIR/host.$ip"; echo "$mode" > "$RUN_DIR/mode.$ip"; echo "$confreg" > "$RUN_DIR/confreg.$ip"; echo "$precheck" > "$RUN_DIR/precheck.$ip"
   rm -f "$raw" "$out"; [[ "$precheck" == "ok" ]]
 }
-# ===== TFTP backup (elevates) =====
+
+# ===== TFTP backup (gated enable) =====
 backup_for_ip(){
   local ip="$1" hn ts url raw rc=0 need_en=0
   hn="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"; [[ -n "$hn" ]] || hn="sw-${ip//./-}"
   ts="$(date -u +%Y%m%d-%H%M)"; url="${TFTP_BASE}/${hn}-${ts}.cfg"
   log "[${ip}] BACKUP -> ${url}"
-  build_ssh_arr "$ip"; is_priv15_for_ip "$ip" || need_en=1
-  raw="$(mktemp)"
+  build_ssh_arr "$ip"; raw="$(mktemp)"; is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'copy running-config %s\r\n' "$url"
-    printf '\r\n'; sleep 0.2   # accept defaults; no extra 'y'
-    printf '\r\n'
+    printf '\r\n'; sleep 0.2; printf '\r\n'
     printf 'exit\r\n'
   } | timeout -k 8s 180s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
   tr -d '\r' < "$raw" >> "$RUN_DIR/devlogs/${ip}.session.log"
@@ -213,46 +237,90 @@ backup_for_ip(){
   log "[${ip}] BACKUP FAILED"; echo "$ip,$hn,backup,failed," >> "$ACTIONS_CSV"; mv -f "$raw" "$RUN_DIR/${ip}.backup.out"; return 1
 }
 
-# ===== Clean inactive (elevates; no 'y' drip) =====
+# ===== Clean inactive (gated enable; stream & wait; no /dev/null; auto-confirm y/n) =====
 clean_inactive_for_ip(){
-  local ip="$1" host raw norm rc=0 need_en=0
+  local ip="$1" host need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   log "[${ip}] CLEAN: install remove inactive"
   build_ssh_arr "$ip"; is_priv15_for_ip "$ip" || need_en=1
-  raw="$(mktemp)"; norm="$(mktemp)"
-  {
+
+  local raw norm state fifo FEED_PID="" WATCH_PID="" RESP_PID="" SSH_PID="" rc=0
+  raw="$(mktemp)"; norm="$(mktemp)"; state="$(mktemp)"
+  fifo="$(mktemp -u)"; mkfifo "$fifo"
+
+  # SSH session consuming FIFO
+  timeout -k 15s "${INSTALL_REMOVE_TIMEOUT_SEC:-1200}" \
+    "${SSH_CMD[@]}" <"$fifo" >"$raw" 2>&1 & SSH_PID=$!
+
+  # Feeder: send command + keepalive until state is set
+  (
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'install remove inactive\r\n'
-    printf '\r\n'
+    # keep the session alive while we wait for the operation to finish
+    while [[ ! -s "$state" ]] && kill -0 "$SSH_PID" 2>/dev/null; do
+      sleep 2
+      printf '\r\n'
+    done
     printf 'exit\r\n'
-  } | timeout -k 15s 900s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
-  tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
+  ) >"$fifo" & FEED_PID=$!
 
-  if grep -qiE '(^|[^A-Z])(%?Error|Permission denied|Unknown host|timed out)' "$norm"; then
-    log "[${ip}] CLEAN: FAILED"; echo "$ip,${host},clean_inactive,failed," >> "$ACTIONS_CSV"; mv -f "$norm" "$RUN_DIR/${ip}.clean.fail.out"; rm -f "$raw"; return 1
-  fi
-  if grep -qi 'cannot start new install operation, some operation is already running' "$norm"; then
-    log "[${ip}] CLEAN: busy — will proceed"; echo "$ip,${host},clean_inactive,ok,busy" >> "$ACTIONS_CSV"; rm -f "$raw" "$norm"; return 0
-  fi
-  log "[${ip}] CLEAN: OK"; echo "$ip,${host},clean_inactive,ok," >> "$ACTIONS_CSV"; rm -f "$raw" "$norm"; return 0
+  # Prompt responder: watches output and answers y when asked
+  (
+    tail -n +1 -f "$raw" | stdbuf -o0 tr -d '\r' | awk 'BEGIN{IGNORECASE=1}
+      /Do you want to remove the above files\?[[:space:]]*\[y\/n\]/ {print "Y"; fflush();}
+      /Remove[[:space:]].*\?[[:space:]]*\[y\/n\]/                   {print "Y"; fflush();}
+      /Proceed[[:space:]]*with[[:space:]]*removal\?[[:space:]]*\(y\/n\)/ {print "Y"; fflush();}
+    ' | while read -r _; do
+         printf 'y\r\n' >"$fifo"
+       done
+  ) & RESP_PID=$!
+
+  # Watcher: parse milestones to set a final verdict
+  (
+    tail -n +1 -f "$raw" \
+      | stdbuf -o0 tr -d '\r' \
+      | awk 'BEGIN{IGNORECASE=1}
+             /SUCCESS:[[:space:]]*install_remove/           {print "OK";   fflush(); exit}
+             /Finished[[:space:]]+Post_Remove_Cleanup/      {print "OK";   fflush(); exit}
+             /No extra package|Nothing to clean/            {print "OK";   fflush(); exit}
+             /cannot start new install operation/           {print "BUSY"; fflush(); exit}
+             /(%%?Error|Permission denied|timed out|FAILED)/{print "FAIL"; fflush(); exit}'
+  ) >"$state" & WATCH_PID=$!
+
+  wait "$SSH_PID" 2>/dev/null || rc=$?
+  kill "$FEED_PID" "$WATCH_PID" "$RESP_PID" 2>/dev/null || true
+  wait "$FEED_PID" 2>/dev/null || true
+  wait "$WATCH_PID" 2>/dev/null || true
+  wait "$RESP_PID" 2>/dev/null || true
+
+  tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$raw"
+  local verdict=""; [[ -s "$state" ]] && verdict="$(cat "$state" 2>/dev/null)"; rm -f "$state"
+
+  case "$verdict" in
+    OK)   log "[${ip}] CLEAN: OK";   echo "$ip,${host},clean_inactive,ok,"    >> "$ACTIONS_CSV"; rm -f "$norm"; return 0 ;;
+    BUSY) log "[${ip}] CLEAN: busy — another install op is/was running; proceeding"
+          echo "$ip,${host},clean_inactive,ok,busy" >> "$ACTIONS_CSV"; rm -f "$norm"; return 0 ;;
+    *)    log "[${ip}] CLEAN: FAILED (see devlog)"; echo "$ip,${host},clean_inactive,failed," >> "$ACTIONS_CSV"
+          mv -f "$norm" "$RUN_DIR/${ip}.clean.fail.out"; return 1 ;;
+  esac
 }
 
-# ===== HTTP fetch (always elevates now) =====
+# ===== HTTP fetch (gated enable everywhere) =====
 http_fetch_image_for_ip(){
   local ip="$1" host file size url base
-  local pre_raw pre_norm existing_bytes="" rc=0
+  local pre_raw pre_norm existing_bytes="" rc=0 need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
   if [[ -z "$file" ]]; then log "[${ip}] HTTP: no target image defined."; echo "$ip,${host},http_copy,skipped,no_image" >> "$ACTIONS_CSV"; return 1; fi
   base="$(basename -- "$file")"; url="${FIRMWARE_HTTP_BASE%/}/${base}"
 
   # Check existing
-  build_ssh_arr "$ip"
-  pre_raw="$(mktemp)"; pre_norm="$(mktemp)"
+  build_ssh_arr "$ip"; pre_raw="$(mktemp)"; pre_norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    if ! is_priv15_for_ip "$ip"; then emit_enable; fi
+    (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\n' "$base"
     printf 'exit\r\n'
   } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$pre_raw" 2>&1 || true
@@ -268,13 +336,11 @@ http_fetch_image_for_ip(){
   (
     {
       printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-      if ! is_priv15_for_ip "$ip"; then emit_enable; fi
-      # If you need a source-interface, set HTTP_CLIENT_SOURCE_IFACE in env
+      (( need_en )) && emit_enable
       if [[ -n "${HTTP_CLIENT_SOURCE_IFACE:-}" ]]; then
         printf 'configure terminal\r\nip http client source-interface %s\r\nend\r\n' "$HTTP_CLIENT_SOURCE_IFACE"
       fi
       printf 'copy %s flash:%s\r\n' "$url" "$base"
-      # confirmations: accept defaults/overwrite with bare Enter(s)
       printf '\r\n'; sleep 0.5; printf '\r\n'
     } | timeout -k 30s 7200s "${COPY_SSH[@]}"
   ) >"$copy_raw" 2>&1 & COPY_PID=$!
@@ -287,7 +353,7 @@ http_fetch_image_for_ip(){
       local p_raw p_norm; p_raw="$(mktemp)"; p_norm="$(mktemp)"
       {
         printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-        if ! is_priv15_for_ip "$ip"; then emit_enable; fi
+        (( need_en )) && emit_enable
         printf 'dir flash: | include %s\r\nexit\r\n' "$base"
       } | timeout -k 5s 30s "${POLL_SSH[@]}" >"$p_raw" 2>&1 || true
       tr -d '\r' < "$p_raw" > "$p_norm"; cur="$(flash_size_from "$p_norm" "$base")"; rm -f "$p_raw" "$p_norm"
@@ -306,10 +372,11 @@ http_fetch_image_for_ip(){
   tr -d '\r' < "$copy_raw" > "$copy_norm"; cat "$copy_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
 
   # Final verify
-  local post_raw post_norm post_bytes=""; build_ssh_arr "$ip"; post_raw="$(mktemp)"; post_norm="$(mktemp)"
+  local post_raw post_norm post_bytes=""; build_ssh_arr "$ip"; need_en=0; post_raw="$(mktemp)"; post_norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    if ! is_priv15_for_ip "$ip"; then emit_enable; fi
+    (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
   } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$post_raw" 2>&1 || true
   tr -d '\r' < "$post_raw" > "$post_norm"; post_bytes="$(flash_size_from "$post_norm" "$base")"; rm -f "$post_raw" "$post_norm"
@@ -322,8 +389,10 @@ http_fetch_image_for_ip(){
   log "[${ip}] HTTP: FAILED"; echo "$ip,${host},http_copy,failed," >> "$ACTIONS_CSV"; mv -f "$copy_norm" "$RUN_DIR/${ip}.http_copy.out"; rm -f "$copy_raw"; return 1
 }
 
+# ===== write memory (gated enable) =====
 write_memory_for_ip(){
-  local ip="$1" raw norm need_en=0; build_ssh_arr "$ip"; is_priv15_for_ip "$ip" || need_en=1
+  local ip="$1" raw norm need_en=0
+  build_ssh_arr "$ip"; is_priv15_for_ip "$ip" || need_en=1
   log "[${ip}] WR: write memory…"; raw="$(mktemp)"; norm="$(mktemp)"
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
@@ -336,17 +405,20 @@ write_memory_for_ip(){
   log "[${ip}] WR: ambiguous — proceeding"; mv -f "$norm" "$RUN_DIR/${ip}.write_memory.out"; rm -f "$raw"; return 1
 }
 
+# ===== INSTALL (gated enable before checks and command) =====
 install_activate_image_for_ip(){
-  local ip="$1" host file size base need_en=0; host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
+  local ip="$1" host file size base need_en=0
+  host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
   if [[ -z "$file" ]]; then log "[${ip}] INSTALL: no image defined — SKIP"; echo "$ip,${host},install,skipped,no_image" >> "$ACTIONS_CSV"; return 2; fi
   base="$(basename -- "$file")"
 
   # Ensure present
   build_ssh_arr "$ip"; local chk_raw chk_norm have=""; chk_raw="$(mktemp)"; chk_norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    if ! is_priv15_for_ip "$ip"; then emit_enable; fi
+    (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
   } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>&1 || true
   tr -d '\r' < "$chk_raw" > "$chk_norm"; have="$(flash_size_from "$chk_norm" "$base")"; rm -f "$chk_raw" "$chk_norm"
@@ -356,19 +428,28 @@ install_activate_image_for_ip(){
   write_memory_for_ip "$ip" || true
   is_priv15_for_ip "$ip" || need_en=1
 
-  local cmd="install add file bootflash:${base} activate commit prompt-level none"
-  log "[${ip}] INSTALL: add+activate+commit (bootflash:${base})"; printf '%s\n' "$cmd" > "$RUN_DIR/cmds/${ip}.install.cmd"
+  local cmd="install add file flash:${base} activate commit prompt-level none"
+  log "[${ip}] INSTALL: add+activate+commit (flash:${base})"; printf '%s\n' "$cmd" > "$RUN_DIR/cmds/${ip}.install.cmd"
 
-  local inst_raw inst_norm state_file fifo FEED_PID="" STREAM_PID="" rc=0; inst_raw="$(mktemp)"; inst_norm="$(mktemp)"; state_file="$(mktemp)"
+  local inst_raw inst_norm state_file fifo FEED_PID="" STREAM_PID="" rc=0
+  inst_raw="$(mktemp)"; inst_norm="$(mktemp)"; state_file="$(mktemp)"
   fifo="$(mktemp -u)"; mkfifo "$fifo"; build_ssh_arr "$ip"; local INST_SSH=( "${SSH_CMD[@]}" )
+
+  # 1) Start SSH consuming FIFO
   timeout -k 10s "${INSTALL_STREAM_MAX_SECS:-14400}" "${INST_SSH[@]}" <"$fifo" >"$inst_raw" 2>&1 & local INST_PID=$!
+
+  # 2) Feed commands + keepalive
   (
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf '%s\r\n' "$cmd"
-    while [[ ! -s "$state_file" ]] && kill -0 "$INST_PID" 2>/dev/null; do sleep "${INSTALL_KEEPALIVE_GAP_SEC:-5}"; printf '\r\n'; done
-  ) >"$fifo" 2>/dev/null & FEED_PID=$!
+    while [[ ! -s "$state_file" ]] && kill -0 "$INST_PID" 2>/dev/null; do
+      sleep "${INSTALL_KEEPALIVE_GAP_SEC:-5}"
+      printf '\r\n'
+    done
+  ) >"$fifo" & FEED_PID=$!
 
+  # 3) Stream milestones
   (
     tail -n +1 -f "$inst_raw" 2>/dev/null | stdbuf -o0 tr -d '\r' | {
       seen_act=0; seen_commit=0
@@ -389,27 +470,42 @@ install_activate_image_for_ip(){
     }
   ) & STREAM_PID=$!
 
-  wait "$INST_PID" 2>/dev/null || rc=$?; kill "$FEED_PID" 2>/dev/null || true; kill "$STREAM_PID" 2>/dev/null || true
-  rm -f "$fifo" 2>/dev/null || true; wait "$FEED_PID" 2>/dev/null || true; wait "$STREAM_PID" 2>/dev/null || true
+  # 4) Wait / cleanup
+  wait "$INST_PID" 2>/dev/null || rc=$?
+  kill "$FEED_PID" 2>/dev/null || true
+  kill "$STREAM_PID" 2>/dev/null || true
+  rm -f "$fifo" 2>/dev/null || true
+  wait "$FEED_PID" 2>/dev/null || true
+  wait "$STREAM_PID" 2>/dev/null || true
+
   tr -d '\r' < "$inst_raw" > "$inst_norm"; cat "$inst_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$inst_raw"
 
   local state=""; [[ -s "$state_file" ]] && state="$(cat "$state_file" 2>/dev/null || true)"; rm -f "$state_file"
-  if [[ "$state" == "success" ]]; then log "[${ip}] INSTALL: complete"; echo "$ip,${host},install,ok,success" >> "$ACTIONS_CSV"; rm -f "$inst_norm"; return 0; fi
-  if [[ "$state" == "failed" ]];  then log "[${ip}] INSTALL: failed (see devlogs)"; echo "$ip,${host},install,failed," >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"; return 1; fi
-  if [[ "$state" == "busy" ]];    then log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."; echo "$ip,${host},install,skipped,busy" >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"; return 3; fi
+  if [[ "$state" == "success" ]]; then
+    log "[${ip}] INSTALL: complete"; echo "$ip,${host},install,ok,success" >> "$ACTIONS_CSV"; rm -f "$inst_norm"; return 0
+  fi
+  if [[ "$state" == "failed" ]];  then
+    log "[${ip}] INSTALL: failed (see devlogs)"; echo "$ip,${host},install,failed," >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"; return 1
+  fi
+  if [[ "$state" == "busy" ]];    then
+    log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."; echo "$ip,${host},install,skipped,busy" >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"; return 3
+  fi
 
   # fallback verify
-  local sum_raw sum_norm; build_ssh_arr "$ip"; sum_raw="$(mktemp)"; sum_norm="$(mktemp)"
+  local sum_raw sum_norm; build_ssh_arr "$ip"; need_en=0; sum_raw="$(mktemp)"; sum_norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    if ! is_priv15_for_ip "$ip"; then emit_enable; fi
+    (( need_en )) && emit_enable
     printf 'show install summary\r\nexit\r\n'
   } | timeout -k 5s 120s "${SSH_CMD[@]}" >"$sum_raw" 2>&1 || true
   tr -d '\r' < "$sum_raw" > "$sum_norm"; cat "$sum_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$sum_raw"
   if grep -qiE 'Commit:[[:space:]]+Passed|Status:[[:space:]]+Committed|SUCCESS:[[:space:]]*install_add_activate_commit' "$sum_norm"; then
-    log "[${ip}] INSTALL: verified SUCCESS via summary"; echo "$ip,${host},install,ok,verified" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0; fi
+    log "[${ip}] INSTALL: verified SUCCESS via summary"; echo "$ip,${host},install,ok,verified" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0
+  fi
   if grep -qiE 'Operation in progress|in[- ]progress' "$sum_norm"; then
-    log "[${ip}] INSTALL: still in progress (device busy)"; echo "$ip,${host},install,ok,in_progress" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0; fi
+    log "[${ip}] INSTALL: still in progress (device busy)"; echo "$ip,${host},install,ok,in_progress" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0
+  fi
   log "[${ip}] INSTALL: uncertain/failed (no success markers)"; echo "$ip,${host},install,failed,uncertain" >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.uncertain.out"; rm -f "$sum_norm"; return 1
 }
 
