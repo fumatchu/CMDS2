@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# upgrade_iosxe_safe.sh — serial, dialog-safe.
+# upgrade_iosxe_safe.sh — parallel, dialog-safe.
 # Steps: PRECHECK → TFTP backup → install remove inactive → HTTP image fetch to flash → INSTALL.
+# Parallelization: up to MAX_CONCURRENCY (default 5) devices at once.
 
 set -uo pipefail
 
@@ -79,19 +80,39 @@ STATUS_FILE="$RUN_DIR/ui.status"; : > "$STATUS_FILE"
 SUMMARY_CSV="$RUN_DIR/summary.csv"; echo "ip,hostname,mode,confreg,precheck,result" > "$SUMMARY_CSV"
 ACTIONS_CSV="$RUN_DIR/actions.csv"; echo "ip,hostname,action,result,detail" > "$ACTIONS_CSV"
 
+# ----- CSV helpers with simple file locks -----
+add_action(){ # $1: line
+  { flock -x 200; echo "$1" >> "$ACTIONS_CSV"; } 200>"$ACTIONS_CSV.lock"
+}
+add_summary(){ # $1: line
+  { flock -x 201; echo "$1" >> "$SUMMARY_CSV"; } 201>"$SUMMARY_CSV.lock"
+}
+
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 PROG_PIPE=""; PROG_FD=""; DIALOG_PID=""
 UI_EXIT_HOLD_SEC="${UI_EXIT_HOLD_SEC:-4}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-5}"
+SPLAY_MS="${SPLAY_MS:-150}"   # tiny stagger between spawns to avoid thundering herd
+
+MAIN_PID=$$  # guard UI teardown to only main process
 
 ui_calc(){ local L=24 C=80; read -r L C < <(stty size 2>/dev/null || echo "24 80"); ((L<18))&&L=18; ((C<80))&&C=80;
   TAIL_H=$((L-8)); ((TAIL_H<10))&&TAIL_H=10; TAIL_W=$((C-4)); ((TAIL_W<70))&&TAIL_W=70; GAUGE_H=6; GAUGE_W=$TAIL_W; GAUGE_ROW=$((TAIL_H+2)); GAUGE_COL=2; }
 log(){ printf '%(%H:%M:%S)T %s\n' -1 "$1" >> "$STATUS_FILE"; (( DIALOG )) || echo "$1"; }
-gauge(){ local p="${1:-0}" m="${2:-Working…}"; if (( DIALOG )) && [[ -n "$PROG_FD" ]] && [[ -e "/proc/$$/fd/$PROG_FD" ]]; then printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD" 2>>"$RUN_ERR" || true; else echo "[progress] $p%% - $m"; fi; }
+gauge(){ local p="${1:-0}" m="${2:-Working…}"; if (( DIALOG )) && [[ -n "$PROG_FD" ]] && [[ -e "/proc/$MAIN_PID/fd/$PROG_FD" ]]; then printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD" 2>>"$RUN_ERR" || true; else echo "[progress] $p%% - $m"; fi; }
 ui_start(){ if (( ! DIALOG )); then echo "[info] Plain UI."; return; fi; ui_calc; PROG_PIPE="$(mktemp -u)"; mkfifo "$PROG_PIPE"; exec {PROG_FD}<>"$PROG_PIPE"
   ( dialog --no-shadow --begin 1 2 --title "Activity (Run: $RUN_ID)" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
            --and-widget --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE" ) & DIALOG_PID=$!
   sleep 0.15; printf 'XXX\n1\nStarting…\nXXX\n' >&"$PROG_FD" 2>>"$RUN_ERR" || { exec {PROG_FD}>&-; rm -f "$PROG_PIPE"; kill "$DIALOG_PID" 2>/dev/null||true; DIALOG=0; } }
-ui_stop(){ if (( DIALOG )); then printf 'XXX\n100\nDone.\nXXX\n' >&"$PROG_FD" 2>/dev/null || true; exec {PROG_FD}>&- 2>/dev/null || true; rm -f "$PROG_PIPE" 2>/dev/null || true; kill "$DIALOG_PID" 2>/dev/null || true; fi; }
+ui_stop(){ # only main should tear down UI
+  [[ $$ -ne $MAIN_PID ]] && return
+  if (( DIALOG )); then
+    printf 'XXX\n100\nDone.\nXXX\n' >&"$PROG_FD" 2>/dev/null || true
+    exec {PROG_FD}>&- 2>/dev/null || true
+    rm -f "$PROG_PIPE" 2>/dev/null || true
+    kill "$DIALOG_PID" 2>/dev/null || true
+  fi
+}
 ui_hold_end(){ (( DIALOG )) && (( UI_EXIT_HOLD_SEC>0 )) && { gauge 100 "Done. Closing in ${UI_EXIT_HOLD_SEC}s…"; sleep "$UI_EXIT_HOLD_SEC"; }; }
 trap 'ui_stop' EXIT
 
@@ -178,11 +199,11 @@ skip_if_same_version_for_ip(){
   inst_short="$(installed_short_version_for_ip "$ip")"
   if [[ -n "$inst_short" && "$inst_short" == "$target_short" ]]; then
     log "[${ip}] VERSION: ${inst_short} already committed/active — SKIP copy/install"
-    echo "$ip,${host},version_check,skip,same(${inst_short})" >> "$ACTIONS_CSV"; return 0
+    add_action "$ip,${host},version_check,skip,same(${inst_short})"
+    return 0
   fi
   log "[${ip}] VERSION: target ${target_short}; installed ${inst_short:-unknown} — proceed"; return 1
 }
-
 # ===== PRECHECK (gated enable) =====
 precheck_for_ip(){
   local ip="$1" raw out rc=0 need_en=0
@@ -232,9 +253,11 @@ backup_for_ip(){
   } | timeout -k 8s 180s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
   tr -d '\r' < "$raw" >> "$RUN_DIR/devlogs/${ip}.session.log"
   if grep -qiE 'bytes copied|Copy complete|[Ss]uccess' "$raw"; then
-    log "[${ip}] BACKUP OK"; echo "$ip,$hn,backup,ok," >> "$ACTIONS_CSV"; rm -f "$raw"; return 0
+    log "[${ip}] BACKUP OK"; add_action "$ip,$hn,backup,ok,"
+    rm -f "$raw"; return 0
   fi
-  log "[${ip}] BACKUP FAILED"; echo "$ip,$hn,backup,failed," >> "$ACTIONS_CSV"; mv -f "$raw" "$RUN_DIR/${ip}.backup.out"; return 1
+  log "[${ip}] BACKUP FAILED"; add_action "$ip,$hn,backup,failed,"
+  mv -f "$raw" "$RUN_DIR/${ip}.backup.out"; return 1
 }
 
 # ===== Clean inactive (gated enable; stream & wait; no /dev/null; auto-confirm y/n) =====
@@ -257,7 +280,6 @@ clean_inactive_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'install remove inactive\r\n'
-    # keep the session alive while we wait for the operation to finish
     while [[ ! -s "$state" ]] && kill -0 "$SSH_PID" 2>/dev/null; do
       sleep 2
       printf '\r\n'
@@ -298,10 +320,10 @@ clean_inactive_for_ip(){
   local verdict=""; [[ -s "$state" ]] && verdict="$(cat "$state" 2>/dev/null)"; rm -f "$state"
 
   case "$verdict" in
-    OK)   log "[${ip}] CLEAN: OK";   echo "$ip,${host},clean_inactive,ok,"    >> "$ACTIONS_CSV"; rm -f "$norm"; return 0 ;;
+    OK)   log "[${ip}] CLEAN: OK";   add_action "$ip,${host},clean_inactive,ok,";      rm -f "$norm"; return 0 ;;
     BUSY) log "[${ip}] CLEAN: busy — another install op is/was running; proceeding"
-          echo "$ip,${host},clean_inactive,ok,busy" >> "$ACTIONS_CSV"; rm -f "$norm"; return 0 ;;
-    *)    log "[${ip}] CLEAN: FAILED (see devlog)"; echo "$ip,${host},clean_inactive,failed," >> "$ACTIONS_CSV"
+          add_action "$ip,${host},clean_inactive,ok,busy"; rm -f "$norm"; return 0 ;;
+    *)    log "[${ip}] CLEAN: FAILED (see devlog)"; add_action "$ip,${host},clean_inactive,failed,"
           mv -f "$norm" "$RUN_DIR/${ip}.clean.fail.out"; return 1 ;;
   esac
 }
@@ -312,7 +334,7 @@ http_fetch_image_for_ip(){
   local pre_raw pre_norm existing_bytes="" rc=0 need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
-  if [[ -z "$file" ]]; then log "[${ip}] HTTP: no target image defined."; echo "$ip,${host},http_copy,skipped,no_image" >> "$ACTIONS_CSV"; return 1; fi
+  if [[ -z "$file" ]]; then log "[${ip}] HTTP: no target image defined."; add_action "$ip,${host},http_copy,skipped,no_image"; return 1; fi
   base="$(basename -- "$file")"; url="${FIRMWARE_HTTP_BASE%/}/${base}"
 
   # Check existing
@@ -327,7 +349,7 @@ http_fetch_image_for_ip(){
   tr -d '\r' < "$pre_raw" > "$pre_norm"
   existing_bytes="$(flash_size_from "$pre_norm" "$base")"; rm -f "$pre_raw" "$pre_norm"
   if [[ -n "$size" && -n "$existing_bytes" && "$existing_bytes" == "$size" && "${HTTP_FORCE_COPY:-0}" != "1" ]]; then
-    log "[${ip}] HTTP: file exists — SKIP (bytes=${existing_bytes})"; echo "$ip,${host},http_copy,ok,already_present(${existing_bytes})" >> "$ACTIONS_CSV"; return 0
+    log "[${ip}] HTTP: file exists — SKIP (bytes=${existing_bytes})"; add_action "$ip,${host},http_copy,ok,already_present(${existing_bytes})"; return 0
   fi
 
   log "[${ip}] HTTP: copying ${url} -> flash:${base}"
@@ -382,11 +404,15 @@ http_fetch_image_for_ip(){
   tr -d '\r' < "$post_raw" > "$post_norm"; post_bytes="$(flash_size_from "$post_norm" "$base")"; rm -f "$post_raw" "$post_norm"
 
   if grep -qiE '(bytes copied|copied in [0-9.]+ sec|Copy complete|copied successfully|\[OK -[[:space:]]*[0-9]+[[:space:]]*bytes\])' "$copy_norm" || [[ -n "$post_bytes" ]]; then
-    [[ -n "$post_bytes" ]] && { log "[${ip}] HTTP: OK (bytes=${post_bytes})"; echo "$ip,${host},http_copy,ok,bytes=${post_bytes}" >> "$ACTIONS_CSV"; } \
-                            || { log "[${ip}] HTTP: OK"; echo "$ip,${host},http_copy,ok," >> "$ACTIONS_CSV"; }
+    if [[ -n "$post_bytes" ]]; then
+      log "[${ip}] HTTP: OK (bytes=${post_bytes})"; add_action "$ip,${host},http_copy,ok,bytes=${post_bytes}"
+    else
+      log "[${ip}] HTTP: OK"; add_action "$ip,${host},http_copy,ok,"
+    fi
     rm -f "$copy_raw" "$copy_norm"; return 0
   fi
-  log "[${ip}] HTTP: FAILED"; echo "$ip,${host},http_copy,failed," >> "$ACTIONS_CSV"; mv -f "$copy_norm" "$RUN_DIR/${ip}.http_copy.out"; rm -f "$copy_raw"; return 1
+  log "[${ip}] HTTP: FAILED"; add_action "$ip,${host},http_copy,failed,"
+  mv -f "$copy_norm" "$RUN_DIR/${ip}.http_copy.out"; rm -f "$copy_raw"; return 1
 }
 
 # ===== write memory (gated enable) =====
@@ -410,7 +436,7 @@ install_activate_image_for_ip(){
   local ip="$1" host file size base need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
-  if [[ -z "$file" ]]; then log "[${ip}] INSTALL: no image defined — SKIP"; echo "$ip,${host},install,skipped,no_image" >> "$ACTIONS_CSV"; return 2; fi
+  if [[ -z "$file" ]]; then log "[${ip}] INSTALL: no image defined — SKIP"; add_action "$ip,${host},install,skipped,no_image"; return 2; fi
   base="$(basename -- "$file")"
 
   # Ensure present
@@ -422,8 +448,8 @@ install_activate_image_for_ip(){
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
   } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>&1 || true
   tr -d '\r' < "$chk_raw" > "$chk_norm"; have="$(flash_size_from "$chk_norm" "$base")"; rm -f "$chk_raw" "$chk_norm"
-  if [[ -z "$have" ]]; then log "[${ip}] INSTALL: image not found on flash — SKIP"; echo "$ip,${host},install,skipped,missing_image" >> "$ACTIONS_CSV"; return 2; fi
-  if [[ -n "$size" && "$size" != "$have" ]]; then log "[${ip}] INSTALL: image size mismatch (have=${have}, want=${size}) — SKIP"; echo "$ip,${host},install,skipped,size_mismatch" >> "$ACTIONS_CSV"; return 2; fi
+  if [[ -z "$have" ]]; then log "[${ip}] INSTALL: image not found on flash — SKIP"; add_action "$ip,${host},install,skipped,missing_image"; return 2; fi
+  if [[ -n "$size" && "$size" != "$have" ]]; then log "[${ip}] INSTALL: image size mismatch (have=${have}, want=${size}) — SKIP"; add_action "$ip,${host},install,skipped,size_mismatch"; return 2; fi
 
   write_memory_for_ip "$ip" || true
   is_priv15_for_ip "$ip" || need_en=1
@@ -447,7 +473,7 @@ install_activate_image_for_ip(){
       sleep "${INSTALL_KEEPALIVE_GAP_SEC:-5}"
       printf '\r\n'
     done
-  ) >"$fifo" & FEED_PID=$!
+  ) >"$fifo" & local FEED_PID2=$!
 
   # 3) Stream milestones
   (
@@ -472,23 +498,23 @@ install_activate_image_for_ip(){
 
   # 4) Wait / cleanup
   wait "$INST_PID" 2>/dev/null || rc=$?
-  kill "$FEED_PID" 2>/dev/null || true
+  kill "$FEED_PID2" 2>/dev/null || true
   kill "$STREAM_PID" 2>/dev/null || true
   rm -f "$fifo" 2>/dev/null || true
-  wait "$FEED_PID" 2>/dev/null || true
+  wait "$FEED_PID2" 2>/dev/null || true
   wait "$STREAM_PID" 2>/dev/null || true
 
   tr -d '\r' < "$inst_raw" > "$inst_norm"; cat "$inst_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$inst_raw"
 
   local state=""; [[ -s "$state_file" ]] && state="$(cat "$state_file" 2>/dev/null || true)"; rm -f "$state_file"
   if [[ "$state" == "success" ]]; then
-    log "[${ip}] INSTALL: complete"; echo "$ip,${host},install,ok,success" >> "$ACTIONS_CSV"; rm -f "$inst_norm"; return 0
+    log "[${ip}] INSTALL: complete"; add_action "$ip,${host},install,ok,success"; rm -f "$inst_norm"; return 0
   fi
   if [[ "$state" == "failed" ]];  then
-    log "[${ip}] INSTALL: failed (see devlogs)"; echo "$ip,${host},install,failed," >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"; return 1
+    log "[${ip}] INSTALL: failed (see devlogs)"; add_action "$ip,${host},install,failed,"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"; return 1
   fi
   if [[ "$state" == "busy" ]];    then
-    log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."; echo "$ip,${host},install,skipped,busy" >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"; return 3
+    log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."; add_action "$ip,${host},install,skipped,busy"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"; return 3
   fi
 
   # fallback verify
@@ -501,33 +527,26 @@ install_activate_image_for_ip(){
   } | timeout -k 5s 120s "${SSH_CMD[@]}" >"$sum_raw" 2>&1 || true
   tr -d '\r' < "$sum_raw" > "$sum_norm"; cat "$sum_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$sum_raw"
   if grep -qiE 'Commit:[[:space:]]+Passed|Status:[[:space:]]+Committed|SUCCESS:[[:space:]]*install_add_activate_commit' "$sum_norm"; then
-    log "[${ip}] INSTALL: verified SUCCESS via summary"; echo "$ip,${host},install,ok,verified" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0
+    log "[${ip}] INSTALL: verified SUCCESS via summary"; add_action "$ip,${host},install,ok,verified"; rm -f "$sum_norm" "$inst_norm"; return 0
   fi
   if grep -qiE 'Operation in progress|in[- ]progress' "$sum_norm"; then
-    log "[${ip}] INSTALL: still in progress (device busy)"; echo "$ip,${host},install,ok,in_progress" >> "$ACTIONS_CSV"; rm -f "$sum_norm" "$inst_norm"; return 0
+    log "[${ip}] INSTALL: still in progress (device busy)"; add_action "$ip,${host},install,ok,in_progress"; rm -f "$sum_norm" "$inst_norm"; return 0
   fi
-  log "[${ip}] INSTALL: uncertain/failed (no success markers)"; echo "$ip,${host},install,failed,uncertain" >> "$ACTIONS_CSV"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.uncertain.out"; rm -f "$sum_norm"; return 1
+  log "[${ip}] INSTALL: uncertain/failed (no success markers)"; add_action "$ip,${host},install,failed,uncertain"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.uncertain.out"; rm -f "$sum_norm"; return 1
 }
 
-# ===== main =====
-ui_start
-log "Run ID: $RUN_ID"; log "Run dir: $RUN_DIR"
-log "User: ${SSH_USERNAME} (from env)"; log "Server TFTP: ${SERVER_IP}/hybrid"
-log "Targets: ${TARGETS[*]}"; gauge 1 "Starting…"
-
-WORK_DONE=0
-for ip in "${TARGETS[@]}"; do
-  result="skipped"
-
+# ===== per-IP pipeline (to run in parallel) =====
+process_ip(){
+  local ip="$1"
+  local result="skipped"
   if precheck_for_ip "$ip"; then
     if backup_for_ip "$ip"; then
       clean_inactive_for_ip "$ip" || true
-
       if skip_if_same_version_for_ip "$ip"; then
         result="skipped(same_version)"
       else
         if http_fetch_image_for_ip "$ip"; then
-          rc_install=0; install_activate_image_for_ip "$ip" || rc_install=$?
+          local rc_install=0; install_activate_image_for_ip "$ip" || rc_install=$?
           case "$rc_install" in
             0) result="ok" ;;
             2) result="skipped(install)" ;;
@@ -545,15 +564,49 @@ for ip in "${TARGETS[@]}"; do
     result="skipped"
   fi
 
+  local hn mode confreg precheck
   hn="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   mode="$(cat "$RUN_DIR/mode.$ip" 2>/dev/null || true)"
   confreg="$(cat "$RUN_DIR/confreg.$ip" 2>/dev/null || true)"
   precheck="$(cat "$RUN_DIR/precheck.$ip" 2>/dev/null || true)"
-  echo "$ip,${hn},${mode},${confreg},${precheck},${result}" >> "$SUMMARY_CSV"
+  add_summary "$ip,${hn},${mode},${confreg},${precheck},${result}"
+}
 
-  WORK_DONE=$((WORK_DONE + 1))
-  pct=$(( 100 * WORK_DONE / TOTAL ))
-  gauge "$pct" "Processed $WORK_DONE / $TOTAL"
+# ===== main (parallel) =====
+ui_start
+log "Run ID: $RUN_ID"; log "Run dir: $RUN_DIR"
+log "User: ${SSH_USERNAME} (from env)"; log "Server TFTP: ${SERVER_IP}/hybrid"
+log "Targets: ${TARGETS[*]}"; gauge 1 "Starting… (up to ${MAX_CONCURRENCY} in parallel)"
+
+# Launch up to MAX_CONCURRENCY at once; update gauge as jobs finish
+ACTIVE=0
+DONE=0
+
+# tiny splay helper
+rand_ms(){ awk -v m="${SPLAY_MS}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}' ;}
+
+for ip in "${TARGETS[@]}"; do
+  # start job
+  ( process_ip "$ip" ) &
+  ((ACTIVE++))
+  # soft-start splay
+  sleep "$(rand_ms)"
+  # throttle
+  if (( ACTIVE >= MAX_CONCURRENCY )); then
+    if wait -n; then :; fi
+    ((DONE++))
+    pct=$(( 100 * DONE / TOTAL ))
+    gauge "$pct" "Completed $DONE / $TOTAL"
+    ((ACTIVE--))
+  fi
+done
+
+# wait remaining
+while (( DONE < TOTAL )); do
+  if wait -n; then :; fi
+  ((DONE++))
+  pct=$(( 100 * DONE / TOTAL ))
+  gauge "$pct" "Completed $DONE / $TOTAL"
 done
 
 log "Summary: $SUMMARY_CSV"
