@@ -514,8 +514,7 @@ done
 # 3b) MERAKI API KEY (keep WIDE)
 ###############################################################################
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WI
-DE"
+  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WIDE"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
