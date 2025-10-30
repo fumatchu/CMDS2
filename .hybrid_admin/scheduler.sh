@@ -58,6 +58,11 @@ Return to the main menu and complete those steps before scheduling." 16 78
   clear; exit 1
 fi
 
+# ---------- base-10 safe helpers (avoid octal pitfalls like 08/09) ----------
+to10() { printf '%d' "$((10#${1:-0}))"; }
+pad2() { printf '%02d' "$((10#${1:-0}))"; }
+pad4() { printf '%04d' "$((10#${1:-0}))"; }
+
 # --------------- optional note ---------------
 NOTE=""
 dlg --title "Optional note" --inputbox \
@@ -74,7 +79,8 @@ IFS='/' read -r A B C <<<"$cal_raw"
 if [[ -z "$A" || -z "$B" || -z "$C" ]]; then
   dlg --title "Error" --msgbox "Could not parse date from dialog: '$cal_raw'" 8 70; clear; exit 1
 fi
-if [[ "$A" -gt 12 ]] 2>/dev/null; then
+# dialog --calendar can be DD/MM/YYYY or MM/DD/YYYY depending on locale
+if [[ "$(to10 "$A")" -gt 12 ]]; then
   DD="$A"; MM="$B"; YYYY="$C"
 else
   MM="$A"; DD="$B"; YYYY="$C"
@@ -93,12 +99,11 @@ else
   SS="00"
 fi
 
-pad2(){ printf "%02d" "$1"; }
-pad4(){ printf "%04d" "$1"; }
-
+# Coerce to base-10 and zero-pad safely
 YYYY="$(pad4 "$YYYY")"; MM="$(pad2 "$MM")"; DD="$(pad2 "$DD")"
 HH="$(pad2 "$HH")"; MIN="$(pad2 "$MIN")"; SS="$(pad2 "$SS")"
 
+# Validate the assembled timestamp (local time)
 if ! date -d "${YYYY}-${MM}-${DD} ${HH}:${MIN}:${SS}" >/dev/null 2>&1; then
   dlg --title "Error" --msgbox "Invalid date/time selected." 8 50; clear; exit 1
 fi
