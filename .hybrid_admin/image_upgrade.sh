@@ -168,10 +168,11 @@ trap 'ui_stop' EXIT
 
 # ===== Adaptive concurrency: ping each target; if any avg RTT > threshold → use HIGH latency limit =====
 avg_rtt_ms_for_ip(){
-  # returns AVG RTT in ms (float) from 10 pings, or empty if unknown
+  # returns AVG RTT in ms (float) from 5 pings, or empty if unknown
   local ip="$1" avg=""
-  # -n numeric, -c 10 pings, -W 1s per reply
-  avg="$(ping -n -c 10 -W 1 "$ip" 2>/dev/null | awk -F'/' '/rtt min\/avg\/max\/mdev/ {print $5}')"
+  # -n numeric, -c 5 pings, -i 0.2s interval, -w 8s overall deadline
+  avg="$(ping -n -c 5 -i 0.2 -w 8 "$ip" 2>/dev/null | \
+         awk -F'/' '/rtt min\/avg\/max\/mdev/ {print $5}')"
   [[ -n "$avg" ]] && printf '%s\n' "$avg" || echo ""
 }
 
@@ -179,14 +180,13 @@ assess_latency_and_set_concurrency(){
   [[ "$AUTO_ADJUST_CONCURRENCY" == "1" ]] || { log "Auto-concurrency: disabled. Using MAX_CONCURRENCY=${MAX_CONCURRENCY}"; return; }
 
   local threshold="$LATENCY_RTT_MS_THRESHOLD" any_high=0
-  log "Latency check: threshold ${threshold}ms; probing each target (10 pings)…"
+  log "Latency check: threshold ${threshold}ms; probing each target (5 pings)…"
   for ip in "${TARGETS[@]}"; do
     local avg; avg="$(avg_rtt_ms_for_ip "$ip")"
     if [[ -z "$avg" ]]; then
       log "[${ip}] latency: no rtt (treating as HIGH)"
       any_high=1
     else
-      # float compare in awk
       if awk -v a="$avg" -v t="$threshold" 'BEGIN{exit (a>t)?0:1}'; then
         log "[${ip}] latency: avg=${avg} ms (HIGH)"
         any_high=1
@@ -204,7 +204,6 @@ assess_latency_and_set_concurrency(){
     log "Auto-concurrency: all within threshold → using MAX_CONCURRENCY=${MAX_CONCURRENCY}"
   fi
 }
-
 # ===== SSH builder =====
 build_ssh_arr(){
   local ip="$1"
