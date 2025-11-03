@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # upgrade_iosxe_safe.sh — parallel, dialog-safe.
 # Steps: PRECHECK → TFTP backup → install remove inactive → HTTP image fetch to flash → INSTALL.
-# Parallelization: up to MAX_CONCURRENCY (default 5) devices at once.
+# Parallelization: auto-adjusted by latency (default 5; drop to 3 if any target avg RTT > 10ms).
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 cd "$SCRIPT_DIR"
 
+BACKTITLE="IOS-XE Image Updater"
+
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need awk; need jq; need ssh; need timeout
+need awk; need jq; need ssh; need timeout; need ping; need flock
 command -v sshpass >/dev/null 2>&1 || true
+command -v dialog  >/dev/null 2>&1 || true
 
 BASE_ENV="$SCRIPT_DIR/meraki_discovery.env"
 SEL_ENV="${1:-$SCRIPT_DIR/selected_upgrade.env}"
 
 err_box(){
   if command -v dialog >/dev/null 2>&1; then
-    dialog --no-shadow --title "Error" --msgbox "$1" 8 80
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Error" --msgbox "$1" 8 80
     clear
   else
     echo "ERROR: $1" >&2
@@ -25,7 +28,7 @@ err_box(){
 }
 
 [[ -f "$BASE_ENV" ]] || { err_box "meraki_discovery.env not found. Run the Setup Wizard first."; exit 1; }
-[[ -f "$SEL_ENV"  ]]  || { err_box "selected_upgrade.env not found. Run Discovery & Selection first."; exit 1; }
+[[ -f "$SEL_ENV"  ]] || { err_box "selected_upgrade.env not found. Run Discovery & Selection first."; exit 1; }
 
 # Avoid history expansion on !
 set +H
@@ -88,23 +91,70 @@ add_summary(){ # $1: line
   { flock -x 201; echo "$1" >> "$SUMMARY_CSV"; } 201>"$SUMMARY_CSV.lock"
 }
 
+# ===== Dialog UI (top/left margins so backtitle bar is visible) =====
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 PROG_PIPE=""; PROG_FD=""; DIALOG_PID=""
 UI_EXIT_HOLD_SEC="${UI_EXIT_HOLD_SEC:-4}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-5}"
+# Auto-concurrency defaults; can be overridden via env
+LOW_LATENCY_CONCURRENCY="${LOW_LATENCY_CONCURRENCY:-5}"
+HIGH_LATENCY_CONCURRENCY="${HIGH_LATENCY_CONCURRENCY:-3}"
+LATENCY_RTT_MS_THRESHOLD="${LATENCY_RTT_MS_THRESHOLD:-10}"
+AUTO_ADJUST_CONCURRENCY="${AUTO_ADJUST_CONCURRENCY:-1}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-$LOW_LATENCY_CONCURRENCY}"
 SPLAY_MS="${SPLAY_MS:-150}"   # tiny stagger between spawns to avoid thundering herd
 
 MAIN_PID=$$  # guard UI teardown to only main process
 
-ui_calc(){ local L=24 C=80; read -r L C < <(stty size 2>/dev/null || echo "24 80"); ((L<18))&&L=18; ((C<80))&&C=80;
-  TAIL_H=$((L-8)); ((TAIL_H<10))&&TAIL_H=10; TAIL_W=$((C-4)); ((TAIL_W<70))&&TAIL_W=70; GAUGE_H=6; GAUGE_W=$TAIL_W; GAUGE_ROW=$((TAIL_H+2)); GAUGE_COL=2; }
+ui_calc(){
+  local L=24 C=80
+  read -r L C < <(stty size 2>/dev/null || echo "24 80")
+
+  ((L<18))&&L=18
+  ((C<80))&&C=80
+
+  TOP_MARGIN=${UI_TOP_MARGIN:-2}
+  LEFT_MARGIN=${UI_LEFT_MARGIN:-2}
+
+  GAUGE_H=6
+
+  # Make room for both widgets + a spacer line
+  TAIL_H=$(( L - TOP_MARGIN - GAUGE_H - 3 ))
+  ((TAIL_H<10)) && TAIL_H=10
+
+  TAIL_W=$(( C - LEFT_MARGIN - 2 ))
+  ((TAIL_W<70)) && TAIL_W=70
+
+  GAUGE_ROW=$(( TOP_MARGIN + TAIL_H + 1 ))
+  GAUGE_COL=$LEFT_MARGIN
+}
 log(){ printf '%(%H:%M:%S)T %s\n' -1 "$1" >> "$STATUS_FILE"; (( DIALOG )) || echo "$1"; }
-gauge(){ local p="${1:-0}" m="${2:-Working…}"; if (( DIALOG )) && [[ -n "$PROG_FD" ]] && [[ -e "/proc/$MAIN_PID/fd/$PROG_FD" ]]; then printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD" 2>>"$RUN_ERR" || true; else echo "[progress] $p%% - $m"; fi; }
-ui_start(){ if (( ! DIALOG )); then echo "[info] Plain UI."; return; fi; ui_calc; PROG_PIPE="$(mktemp -u)"; mkfifo "$PROG_PIPE"; exec {PROG_FD}<>"$PROG_PIPE"
-  ( dialog --no-shadow --begin 1 2 --title "Activity (Run: $RUN_ID)" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
-           --and-widget --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE" ) & DIALOG_PID=$!
-  sleep 0.15; printf 'XXX\n1\nStarting…\nXXX\n' >&"$PROG_FD" 2>>"$RUN_ERR" || { exec {PROG_FD}>&-; rm -f "$PROG_PIPE"; kill "$DIALOG_PID" 2>/dev/null||true; DIALOG=0; } }
-ui_stop(){ # only main should tear down UI
+gauge(){
+  local p="${1:-0}" m="${2:-Working…}"
+  if (( DIALOG )) && [[ -n "$PROG_FD" ]] && [[ -e "/proc/$MAIN_PID/fd/$PROG_FD" ]]; then
+    printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD" 2>>"$RUN_ERR" || true
+  else
+    echo "[progress] $p%% - $m"
+  fi
+}
+
+ui_start(){
+  if (( ! DIALOG )); then echo "[info] Plain UI."; return; fi
+  ui_calc
+  PROG_PIPE="$(mktemp -u)"; mkfifo "$PROG_PIPE"; exec {PROG_FD}<>"$PROG_PIPE"
+  (
+    dialog --no-shadow --backtitle "$BACKTITLE" \
+      --begin "$TOP_MARGIN" "$LEFT_MARGIN" \
+      --title "Activity (Run: $RUN_ID)" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
+      --and-widget --begin "$GAUGE_ROW" "$GAUGE_COL" \
+      --title "Overall Progress" --gauge "Starting…" "$GAUGE_H" "$TAIL_W" 0 < "$PROG_PIPE"
+  ) & DIALOG_PID=$!
+
+  sleep 0.15
+  printf 'XXX\n1\nStarting…\nXXX\n' >&"$PROG_FD" 2>>"$RUN_ERR" || {
+    exec {PROG_FD}>&-; rm -f "$PROG_PIPE"; kill "$DIALOG_PID" 2>/dev/null || true; DIALOG=0;
+  }
+}
+ui_stop(){
   [[ $$ -ne $MAIN_PID ]] && return
   if (( DIALOG )); then
     printf 'XXX\n100\nDone.\nXXX\n' >&"$PROG_FD" 2>/dev/null || true
@@ -115,6 +165,45 @@ ui_stop(){ # only main should tear down UI
 }
 ui_hold_end(){ (( DIALOG )) && (( UI_EXIT_HOLD_SEC>0 )) && { gauge 100 "Done. Closing in ${UI_EXIT_HOLD_SEC}s…"; sleep "$UI_EXIT_HOLD_SEC"; }; }
 trap 'ui_stop' EXIT
+
+# ===== Adaptive concurrency: ping each target; if any avg RTT > threshold → use HIGH latency limit =====
+avg_rtt_ms_for_ip(){
+  # returns AVG RTT in ms (float) from 10 pings, or empty if unknown
+  local ip="$1" avg=""
+  # -n numeric, -c 10 pings, -W 1s per reply
+  avg="$(ping -n -c 10 -W 1 "$ip" 2>/dev/null | awk -F'/' '/rtt min\/avg\/max\/mdev/ {print $5}')"
+  [[ -n "$avg" ]] && printf '%s\n' "$avg" || echo ""
+}
+
+assess_latency_and_set_concurrency(){
+  [[ "$AUTO_ADJUST_CONCURRENCY" == "1" ]] || { log "Auto-concurrency: disabled. Using MAX_CONCURRENCY=${MAX_CONCURRENCY}"; return; }
+
+  local threshold="$LATENCY_RTT_MS_THRESHOLD" any_high=0
+  log "Latency check: threshold ${threshold}ms; probing each target (10 pings)…"
+  for ip in "${TARGETS[@]}"; do
+    local avg; avg="$(avg_rtt_ms_for_ip "$ip")"
+    if [[ -z "$avg" ]]; then
+      log "[${ip}] latency: no rtt (treating as HIGH)"
+      any_high=1
+    else
+      # float compare in awk
+      if awk -v a="$avg" -v t="$threshold" 'BEGIN{exit (a>t)?0:1}'; then
+        log "[${ip}] latency: avg=${avg} ms (HIGH)"
+        any_high=1
+      else
+        log "[${ip}] latency: avg=${avg} ms"
+      fi
+    fi
+  done
+
+  if (( any_high )); then
+    MAX_CONCURRENCY="$HIGH_LATENCY_CONCURRENCY"
+    log "Auto-concurrency: high latency detected → using MAX_CONCURRENCY=${MAX_CONCURRENCY}"
+  else
+    MAX_CONCURRENCY="$LOW_LATENCY_CONCURRENCY"
+    log "Auto-concurrency: all within threshold → using MAX_CONCURRENCY=${MAX_CONCURRENCY}"
+  fi
+}
 
 # ===== SSH builder =====
 build_ssh_arr(){
@@ -162,12 +251,67 @@ emit_enable(){
   sleep 0.2
 }
 
+# ====== model / family helpers ======
+_extract_model_from_showver() {
+  awk '
+    BEGIN{IGNORECASE=1}
+    $0 ~ /^[[:space:]]*Model[[:space:]]*number[[:space:]]*:[[:space:]]*/ {print $NF; exit}
+    $0 ~ /^[[:space:]]*Model[[:space:]]*Name[[:space:]]*:[[:space:]]*/   {print $NF; exit}
+    $0 ~ /^[[:space:]]*cisco[[:space:]]+C[0-9]+/                        {for(i=1;i<=NF;i++) if($i ~ /^C[0-9]+/) {print $i; exit}}
+  ' | sed -E 's/[^A-Za-z0-9-].*$//'
+}
+_model_to_img_family() {
+  case "${1^^}" in
+    C9200* ) echo "LITE" ;;
+    *      ) echo "UNIVERSAL" ;;
+  esac
+}
+_file_to_img_family() {
+  local b
+  b="$(basename -- "$1" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  if   [[ "$b" =~ ^cat9k_lite_iosxe.*\.bin$ ]]; then echo "LITE"
+  elif [[ "$b" =~ ^cat9k_iosxe.*\.bin$       ]]; then echo "UNIVERSAL"
+  else echo "UNKNOWN"
+  fi
+}
+
 # ===== helpers =====
 get_plan_field(){ local ip="$1" key="$2"; [[ -n "$UPGRADE_SELECTED_JSON" && -s "$UPGRADE_SELECTED_JSON" ]] || return 1; jq -r --arg ip "$ip" --arg k "$key" '.[] | select(.ip==$ip) | .[$k] // empty' "$UPGRADE_SELECTED_JSON"; }
-resolve_image_for_ip(){ local ip="$1" file="" size=""; if [[ -s "${UPGRADE_SELECTED_JSON:-}" ]]; then file="$(get_plan_field "$ip" "target_file")"; size="$(get_plan_field "$ip" "target_size_bytes")"; fi
-  if [[ -z "$file" ]]; then [[ -n "${FW_CAT9K_LITE_FILE:-}" ]] && { file="$FW_CAT9K_LITE_FILE"; size="${FW_CAT9K_LITE_SIZE_BYTES:-}"; }
-                         [[ -z "$file" && -n "${FW_CAT9K_FILE:-}" ]] && { file="$FW_CAT9K_FILE"; size="${FW_CAT9K_SIZE_BYTES:-}"; }
-  fi; echo "${file}|${size}"; }
+
+# Choose image matching device family (unless JSON explicitly set file)
+resolve_image_for_ip(){
+  local ip="$1" file="" size=""
+
+  if [[ -s "${UPGRADE_SELECTED_JSON:-}" ]]; then
+    file="$(get_plan_field "$ip" "target_file")"
+    size="$(get_plan_field "$ip" "target_size_bytes")"
+    if [[ -n "$file" ]]; then echo "${file}|${size}"; return; fi
+  fi
+
+  local fam="UNIVERSAL"
+  [[ -f "$RUN_DIR/imgfam.$ip" ]] && fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
+
+  if [[ "$fam" == "LITE" ]]; then
+    if [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
+      echo "${FW_CAT9K_LITE_FILE}|${FW_CAT9K_LITE_SIZE_BYTES:-}"; return
+    fi
+    if [[ -n "${FW_CAT9K_FILE:-}" ]]; then
+      log "[${ip}] WARN: LITE image not provided; falling back to UNIVERSAL."
+      echo "${FW_CAT9K_FILE}|${FW_CAT9K_SIZE_BYTES:-}"; return
+    fi
+  else
+    if [[ -n "${FW_CAT9K_FILE:-}" ]]; then
+      echo "${FW_CAT9K_FILE}|${FW_CAT9K_SIZE_BYTES:-}"; return
+    fi
+    if [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
+      log "[${ip}] WARN: UNIVERSAL image not provided; falling back to LITE."
+      echo "${FW_CAT9K_LITE_FILE}|${FW_CAT9K_LITE_SIZE_BYTES:-}"; return
+    fi
+  fi
+
+  echo "|"
+}
+
 fmt_bytes(){ awk -v b="${1:-0}" 'BEGIN{ if(b<1024)printf("%d B",b); else if(b<1048576)printf("%.1f KB",b/1024); else if(b<1073741824)printf("%.1f MB",b/1048576); else printf("%.2f GB",b/1073741824);}'; }
 flash_bytes_from_capture(){ local outfile="$1" base="$2"; awk -v f="$base" 'BEGIN{mx=-1;seen=0} index($0,f){seen=1;for(i=1;i<=NF;i++) if($i~/^[0-9]+$/){n=$i+0;if(n>mx)mx=n}} END{if(seen&&mx>=0)print mx}' "$outfile"; }
 flash_size_from(){ flash_bytes_from_capture "$@"; }
@@ -204,7 +348,8 @@ skip_if_same_version_for_ip(){
   fi
   log "[${ip}] VERSION: target ${target_short}; installed ${inst_short:-unknown} — proceed"; return 1
 }
-# ===== PRECHECK (gated enable) =====
+
+# ===== PRECHECK (INSTALL mode only; confreg NOT gating) =====
 precheck_for_ip(){
   local ip="$1" raw out rc=0 need_en=0
   log "[${ip}] CONNECT…"; build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
@@ -218,23 +363,41 @@ precheck_for_ip(){
   } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
   tr -d '\r' < "$raw" > "$out"; cat "$out" >> "$RUN_DIR/devlogs/${ip}.session.log"
 
-  local hostname mode confreg
+  local hostname mode confreg model imgfam
   hostname="$(awk '/^hostname[[:space:]]+/{print $2}' "$out" | tail -n1)"
   [[ -z "$hostname" ]] && hostname="$(grep -E '^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$' "$out" | tail -n1 | sed -E 's/[>#].*$//')"
   [[ -z "$hostname" ]] && hostname="$(awk '/ uptime is /{print $1; exit}' "$out")"
+
+  # INSTALL/BUNDLE mode
   mode="$(awk -F: 'BEGIN{IGNORECASE=1}/Running[[:space:]]+mode/{gsub(/^[ \t]+/,"",$2);print toupper($2);exit}' "$out")"
-  [[ -z "$mode" ]] && mode="$(awk 'BEGIN{hdr=0}
+  [[ -z "$mode" ]] && mode="$(awk 'BEGIN{IGNORECASE=1;hdr=0}
     /^[[:space:]]*Switch[[:space:]]+Ports[[:space:]]+Model[[:space:]]+SW[[:space:]]+Version[[:space:]]+SW[[:space:]]+Image[[:space:]]+Mode/{hdr=1;next}
     hdr==1 && /^[[:space:]]*([*]|[0-9])/{m=toupper($NF);print m;exit}' "$out")"
   [[ -z "$mode" ]] && mode="$(grep -Eo '(INSTALL|BUNDLE)' "$out" | head -n1 | tr '[:lower:]' '[:upper:]')"
+
+  # Confreg (best-effort capture; NEVER gates success)
   confreg="$(grep -i 'Configuration register is' "$out" | tail -n1 | awk '{print $NF}' | tr 'A-Z' 'a-z' | tr -d '.,;')"
 
+  # model + image family
+  model="$(_extract_model_from_showver < "$out")"
+  imgfam="$(_model_to_img_family "$model")"
+  echo "$model"  > "$RUN_DIR/model.$ip"
+  echo "$imgfam" > "$RUN_DIR/imgfam.$ip"
+
   local precheck="ok"; [[ "$mode" == "INSTALL" ]] || precheck="fail:mode"
-  [[ "$confreg" == "0x102" ]] || precheck="${precheck}${precheck:++}confreg"
-  [[ "$precheck" == "ok" ]] && log "[${ip}] PRECHECK OK (mode=${mode:-?}, confreg=${confreg:-?})" \
-                             || log "[${ip}] PRECHECK FAIL (mode=${mode:-?}, confreg=${confreg:-?}) => ${precheck}"
-  echo "$hostname" > "$RUN_DIR/host.$ip"; echo "$mode" > "$RUN_DIR/mode.$ip"; echo "$confreg" > "$RUN_DIR/confreg.$ip"; echo "$precheck" > "$RUN_DIR/precheck.$ip"
-  rm -f "$raw" "$out"; [[ "$precheck" == "ok" ]]
+
+  if [[ "$precheck" == "ok" ]]; then
+    log "[${ip}] PRECHECK OK (mode=${mode:-?}, model=${model:-?}, family=${imgfam}, confreg=${confreg:-n/a})"
+  else
+    log "[${ip}] PRECHECK FAIL (mode=${mode:-?}, model=${model:-?}, family=${imgfam}) => ${precheck}"
+  fi
+
+  echo "$hostname" > "$RUN_DIR/host.$ip"
+  echo "$mode"     > "$RUN_DIR/mode.$ip"
+  echo "$confreg"  > "$RUN_DIR/confreg.$ip"
+  echo "$precheck" > "$RUN_DIR/precheck.$ip"
+  rm -f "$raw" "$out"
+  [[ "$precheck" == "ok" ]]
 }
 
 # ===== TFTP backup (gated enable) =====
@@ -260,7 +423,7 @@ backup_for_ip(){
   mv -f "$raw" "$RUN_DIR/${ip}.backup.out"; return 1
 }
 
-# ===== Clean inactive (gated enable; stream & wait; no /dev/null; auto-confirm y/n) =====
+# ===== Clean inactive (gated enable; stream & wait; auto-confirm y/n) =====
 clean_inactive_for_ip(){
   local ip="$1" host need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
@@ -271,11 +434,9 @@ clean_inactive_for_ip(){
   raw="$(mktemp)"; norm="$(mktemp)"; state="$(mktemp)"
   fifo="$(mktemp -u)"; mkfifo "$fifo"
 
-  # SSH session consuming FIFO
   timeout -k 15s "${INSTALL_REMOVE_TIMEOUT_SEC:-1200}" \
     "${SSH_CMD[@]}" <"$fifo" >"$raw" 2>&1 & SSH_PID=$!
 
-  # Feeder: send command + keepalive until state is set
   (
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
@@ -287,7 +448,6 @@ clean_inactive_for_ip(){
     printf 'exit\r\n'
   ) >"$fifo" & FEED_PID=$!
 
-  # Prompt responder: watches output and answers y when asked
   (
     tail -n +1 -f "$raw" | stdbuf -o0 tr -d '\r' | awk 'BEGIN{IGNORECASE=1}
       /Do you want to remove the above files\?[[:space:]]*\[y\/n\]/ {print "Y"; fflush();}
@@ -298,7 +458,6 @@ clean_inactive_for_ip(){
        done
   ) & RESP_PID=$!
 
-  # Watcher: parse milestones to set a final verdict
   (
     tail -n +1 -f "$raw" \
       | stdbuf -o0 tr -d '\r' \
@@ -336,6 +495,16 @@ http_fetch_image_for_ip(){
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
   if [[ -z "$file" ]]; then log "[${ip}] HTTP: no target image defined."; add_action "$ip,${host},http_copy,skipped,no_image"; return 1; fi
   base="$(basename -- "$file")"; url="${FIRMWARE_HTTP_BASE%/}/${base}"
+
+  # Guard: image family must match device family
+  local fam filefam
+  fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
+  filefam="$(_file_to_img_family "$base")"
+  if [[ "$filefam" != "UNKNOWN" && "$filefam" != "$fam" ]]; then
+    log "[${ip}] HTTP_COPY: SKIP — image family mismatch (device ${fam}, file ${filefam})"
+    add_action "$ip,${host},http_copy,skipped,family_mismatch(${fam}!=${filefam})"
+    return 2
+  fi
 
   # Check existing
   build_ssh_arr "$ip"; pre_raw="$(mktemp)"; pre_norm="$(mktemp)"
@@ -439,6 +608,16 @@ install_activate_image_for_ip(){
   if [[ -z "$file" ]]; then log "[${ip}] INSTALL: no image defined — SKIP"; add_action "$ip,${host},install,skipped,no_image"; return 2; fi
   base="$(basename -- "$file")"
 
+  # Guard: verify image family matches device family
+  local fam filefam
+  fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
+  filefam="$(_file_to_img_family "$base")"
+  if [[ "$filefam" != "UNKNOWN" && "$filefam" != "$fam" ]]; then
+    log "[${ip}] INSTALL: SKIP — image family mismatch (device ${fam}, file ${filefam})"
+    add_action "$ip,${host},install,skipped,family_mismatch(${fam}!=${filefam})"
+    return 2
+  fi
+
   # Ensure present
   build_ssh_arr "$ip"; local chk_raw chk_norm have=""; chk_raw="$(mktemp)"; chk_norm="$(mktemp)"
   is_priv15_for_ip "$ip" || need_en=1
@@ -461,10 +640,8 @@ install_activate_image_for_ip(){
   inst_raw="$(mktemp)"; inst_norm="$(mktemp)"; state_file="$(mktemp)"
   fifo="$(mktemp -u)"; mkfifo "$fifo"; build_ssh_arr "$ip"; local INST_SSH=( "${SSH_CMD[@]}" )
 
-  # 1) Start SSH consuming FIFO
   timeout -k 10s "${INSTALL_STREAM_MAX_SECS:-14400}" "${INST_SSH[@]}" <"$fifo" >"$inst_raw" 2>&1 & local INST_PID=$!
 
-  # 2) Feed commands + keepalive
   (
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
@@ -475,7 +652,6 @@ install_activate_image_for_ip(){
     done
   ) >"$fifo" & local FEED_PID2=$!
 
-  # 3) Stream milestones
   (
     tail -n +1 -f "$inst_raw" 2>/dev/null | stdbuf -o0 tr -d '\r' | {
       seen_act=0; seen_commit=0
@@ -496,7 +672,6 @@ install_activate_image_for_ip(){
     }
   ) & STREAM_PID=$!
 
-  # 4) Wait / cleanup
   wait "$INST_PID" 2>/dev/null || rc=$?
   kill "$FEED_PID2" 2>/dev/null || true
   kill "$STREAM_PID" 2>/dev/null || true
@@ -524,7 +699,7 @@ install_activate_image_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'show install summary\r\nexit\r\n'
-  } | timeout -k 5s 120s "${SSH_CMD[@]}" >"$sum_raw" 2>&1 || true
+  } | timeout -k 5s 120s "${SSH_CMD[@]}" >"$sum_raw" 2>/dev/null || true
   tr -d '\r' < "$sum_raw" > "$sum_norm"; cat "$sum_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$sum_raw"
   if grep -qiE 'Commit:[[:space:]]+Passed|Status:[[:space:]]+Committed|SUCCESS:[[:space:]]*install_add_activate_commit' "$sum_norm"; then
     log "[${ip}] INSTALL: verified SUCCESS via summary"; add_action "$ip,${host},install,ok,verified"; rm -f "$sum_norm" "$inst_norm"; return 0
@@ -576,22 +751,19 @@ process_ip(){
 ui_start
 log "Run ID: $RUN_ID"; log "Run dir: $RUN_DIR"
 log "User: ${SSH_USERNAME} (from env)"; log "Server TFTP: ${SERVER_IP}/hybrid"
-log "Targets: ${TARGETS[*]}"; gauge 1 "Starting… (up to ${MAX_CONCURRENCY} in parallel)"
+log "Targets: ${TARGETS[*]}"
+assess_latency_and_set_concurrency
+gauge 1 "Starting… (up to ${MAX_CONCURRENCY} in parallel)"
 
 # Launch up to MAX_CONCURRENCY at once; update gauge as jobs finish
 ACTIVE=0
 DONE=0
-
-# tiny splay helper
 rand_ms(){ awk -v m="${SPLAY_MS}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}' ;}
 
 for ip in "${TARGETS[@]}"; do
-  # start job
   ( process_ip "$ip" ) &
   ((ACTIVE++))
-  # soft-start splay
   sleep "$(rand_ms)"
-  # throttle
   if (( ACTIVE >= MAX_CONCURRENCY )); then
     if wait -n; then :; fi
     ((DONE++))
@@ -601,7 +773,6 @@ for ip in "${TARGETS[@]}"; do
   fi
 done
 
-# wait remaining
 while (( DONE < TOTAL )); do
   if wait -n; then :; fi
   ((DONE++))
@@ -610,6 +781,10 @@ while (( DONE < TOTAL )); do
 done
 
 log "Summary: $SUMMARY_CSV"
-(( DIALOG )) && [[ "${SHOW_RUN_SUMMARY:-0}" == "1" ]] && dialog --no-shadow --title "Run complete" --msgbox "Summary CSV:\n$SUMMARY_CSV\n\nRun dir:\n$RUN_DIR" 11 72
+if (( DIALOG )) && [[ "${SHOW_RUN_SUMMARY:-0}" == "1" ]]; then
+  dialog --no-shadow --backtitle "$BACKTITLE" --title "Run complete" \
+         --msgbox "Summary CSV:\n$SUMMARY_CSV\n\nRun dir:\n$RUN_DIR" 11 72
+  clear
+fi
 ui_hold_end
 ui_stop
