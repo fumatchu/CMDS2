@@ -68,7 +68,7 @@ TFTP_BASE="tftp://${SERVER_IP}/hybrid"
 FIRMWARE_HTTP_BASE="${FIRMWARE_HTTP_BASE:-http://${SERVER_IP}/images}"
 
 RUN_ID="run-$(date -u +%Y%m%d%H%M%S)"
-RUN_ROOT="$SCRIPT_DIR/runs"; mkdir -p "$RUN_ROOT"
+RUN_ROOT="${RUN_ROOT:-$SCRIPT_DIR/runs}"; mkdir -p "$RUN_ROOT"
 RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs" "$RUN_DIR/cmds"
 RUN_ERR="$RUN_DIR/run.err"; : > "$RUN_ERR"
 STATUS_FILE="$RUN_DIR/ui.status"; : > "$STATUS_FILE"
