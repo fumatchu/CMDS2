@@ -1,7 +1,8 @@
 #Installing
-#Install Rocky Minimal
-#Make sure you specify the domain name you want to use for AD.
-#After the GUI install: 
-#(Just copy and paste the following line on the Rocky terminal or remote SSH terminal- remote suggested)
+#Install Rocky Minimal 10 in your favorite supported hypervisor
+https://download.rockylinux.org/pub/rocky/10/isos/aarch64/Rocky-10.0-aarch64-minimal.iso
+#After the Server OS GUI install:
+#SSH into the server and do the following:
+#(Just copy and paste the following line on remote SSH termina
 
 dnf -y install wget && cd /root &&  bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
