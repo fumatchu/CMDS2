@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# meraki_hybrid_preflight.sh — Pre-flight + DNS/NTP/AAA fixes (dialog + parallel)
+# meraki_hybrid_preflight.sh — Pre-flight + DNS/NTP/AAA/IP Routing fixes (dialog + parallel)
 # Flow:
-#   preflight: select source -> select switches -> probe in parallel -> CSV summary
-#   fix-dns : read latest.csv -> fix DNS (name-server + ip domain lookup) -> verify resolution
-#   fix-ntp : ensure NTP servers; wait 5s; verify sync if possible
-#   fix-aaa : ensure Meraki-required AAA lines (new-model, login default local, authorization exec default local)
+#   preflight   : select source -> select switches -> probe in parallel -> CSV summary
+#   fix-dns     : read latest.csv -> fix DNS (name-server + ip domain lookup) -> verify resolution
+#   fix-ntp     : ensure NTP servers; wait 5s; verify sync if possible
+#   fix-aaa     : ensure Meraki-required AAA lines (new-model, login default local, authorization exec default local)
+#   fix-routing : ensure ip routing + default route (dhcp or static) + ping 8.8.8.8
 #
 # Exports after preflight:
 #   PRE_FLIGHT_RUN_ID, PRE_FLIGHT_RUN_DIR, PRE_FLIGHT_SUMMARY
@@ -12,11 +13,12 @@
 #
 # Usage:
 #   ./script                # same as "all"
-#   ./script all            # run preflight, then DNS+NTP+AAA fixes for switches that need it
+#   ./script all            # run preflight, then DNS+NTP+AAA+Routing fixes for switches that need it
 #   ./script preflight      # just preflight
 #   ./script fix-dns        # just DNS fixes (reads runs/preflight/latest.csv)
 #   ./script fix-ntp        # just NTP fixes (reads runs/preflight/latest.csv)
 #   ./script fix-aaa        # just AAA fixes (reads runs/preflight/latest.csv)
+#   ./script fix-routing    # just IP routing / default route fixes (reads runs/preflight/latest.csv)
 
 set -uo pipefail
 
@@ -48,6 +50,101 @@ append_csv(){
   } 9>>"$csv"
 }
 
+# ---------- IOS-XE minimum version check ----------
+MIN_IOS_VERSION="17.15.03"
+
+ios_meets_min(){
+  # returns 0 if $1 >= MIN_IOS_VERSION, else 1
+  local v_raw="${1:-}"
+  [[ -z "$v_raw" ]] && return 1
+
+  local v nv
+  v="${v_raw%% *}"
+  v="${v//,/}"
+  nv="$(sed 's/[^0-9.].*$//' <<<"$v")"
+  [[ -z "$nv" ]] && return 1
+
+  local a b c ma mb mc
+  local IFS='.'
+  read -r a b c  <<<"$nv"
+  read -r ma mb mc <<<"$MIN_IOS_VERSION"
+
+  a=${a:-0};  b=${b:-0};  c=${c:-0}
+  ma=${ma:-0}; mb=${mb:-0}; mc=${mc:-0}
+
+  if   (( a > ma )); then return 0
+  elif (( a < ma )); then return 1
+  fi
+  if   (( b > mb )); then return 0
+  elif (( b < mb )); then return 1
+  fi
+  if   (( c >= mc )); then return 0
+  else                    return 1
+  fi
+}
+
+enforce_min_ios_or_abort(){
+  # $1 = path to preflight summary CSV (PRE_FLIGHT_SUMMARY)
+  local sum="$1"
+  local CHECK_ROOT="$SCRIPT_DIR/runs/ioscheck"
+  mkdir -p "$CHECK_ROOT"
+
+  local RUN_ID="ioschk-$(date -u +%Y%m%d%H%M%S)"
+  local LOG="$CHECK_ROOT/$RUN_ID.csv"
+  ln -sfn "$LOG" "$CHECK_ROOT/latest.csv"
+
+  echo "ip,hostname,ios_ver,meets_min_${MIN_IOS_VERSION}" > "$LOG"
+
+  local bad=0
+  local -a BAD_LINES=()
+
+  local first=1
+  local ip host ios_ver rest
+  while IFS=, read -r ip host ios_ver rest; do
+    if (( first )); then
+      first=0
+      continue
+    fi
+    [[ -z "$ip" ]] && continue
+
+    ios_ver="${ios_ver:-unknown}"
+
+    if ios_meets_min "$ios_ver"; then
+      echo "$ip,$host,$ios_ver,yes" >> "$LOG"
+    else
+      echo "$ip,$host,$ios_ver,no" >> "$LOG"
+      ((bad++))
+      BAD_LINES+=( "$(printf '%-16s %-25s %s' "$ip" "${host:-<none>}" "${ios_ver:-<unknown>}")" )
+    fi
+  done < "$sum"
+
+  if (( bad > 0 )); then
+    local tmp
+    tmp="$(mktemp)"
+    {
+      echo "The following switches do NOT meet the minimum IOS-XE version ${MIN_IOS_VERSION}:"
+      echo
+      printf "%-16s %-25s %s\n" "IP" "Hostname" "IOS Version"
+      printf "%-16s %-25s %s\n" "----------------" "------------------------" "-----------"
+      for line in "${BAD_LINES[@]}"; do
+        echo "$line"
+      done
+      echo
+      echo "No DNS/NTP/AAA/IP routing changes were made."
+      echo
+      echo "A detailed CSV log has been saved to:"
+      echo "  $LOG"
+    } > "$tmp"
+
+    dlg --title "IOS-XE Minimum Version Check FAILED" --textbox "$tmp" 20 90
+    rm -f "$tmp"
+    clear
+    return 1
+  fi
+
+  return 0
+}
+
 # ---------- dialog helpers ----------
 BACKTITLE="${BACKTITLE:-Meraki Migration Toolkit}"
 DOPTS=(--no-shadow --backtitle "$BACKTITLE")
@@ -58,18 +155,15 @@ dlg(){ local t; t="$(mktemp)"; dialog "${DOPTS[@]}" "$@" 2>"$t"; local rc=$?; DO
 # ---------- UI (tailbox + gauge) ----------
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 STATUS_FILE=""; GAUGE_PIPE=""; GAUGE_FD=""; DPID=""; MAIN=$$
-# (dup var kept from your original)
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 STATUS_FILE=""; GAUGE_PIPE=""; GAUGE_FD=""; DPID=""; MAIN=$$
 
-# Leave room for the backtitle and the underline by adding padding
 ui_calc(){
   local L=24 C=80
   read -r L C < <(stty size 2>/dev/null || echo "24 80")
   ((L<20)) && L=20
   ((C<80)) && C=80
 
-  # paddings
   local TOP_PAD=2
   local BOT_PAD=2
   local SIDE_PAD=2
@@ -291,26 +385,33 @@ meraki_preflight(){
   fi
   [[ -n "$SSH_USERNAME" ]] || { dlg --title "Missing" --msgbox "SSH_USERNAME is empty in meraki_discovery.env" 7 60; clear; trap - EXIT; return 1; }
 
-  # choose source
+  # determine source automatically – prefer selected over discovery
+  local SRC=""
   local have_disc="" have_sel_json="" have_sel_ips=""
-  [[ -s "$DISC_JSON" ]] && have_disc=1
+
+  # selected_upgrade.json
   [[ -s "$SEL_JSON" && "$(jq 'length' "$SEL_JSON" 2>/dev/null || echo 0)" -gt 0 ]] && have_sel_json=1
-  if [[ -f "$SEL_ENV" ]]; then source "$SEL_ENV"; UPGRADE_SELECTED_IPS="$(__deq "${UPGRADE_SELECTED_IPS-}")"; [[ -n "$UPGRADE_SELECTED_IPS" ]] && have_sel_ips=1; fi
-  if [[ -z "$have_disc" && -z "$have_sel_json" && -z "$have_sel_ips" ]]; then
-    dlg --title "Nothing to pick" --msgbox "No discovery_results.json or selected upgrade list found.\nRun Discovery or the IOS-XE upgrader first." 10 70
-    clear; trap - EXIT; return 1
+
+  # selected_upgrade.env (UPGRADE_SELECTED_IPS)
+  if [[ -f "$SEL_ENV" ]]; then
+    source "$SEL_ENV"
+    UPGRADE_SELECTED_IPS="$(__deq "${UPGRADE_SELECTED_IPS-}")"
+    [[ -n "$UPGRADE_SELECTED_IPS" ]] && have_sel_ips=1
   fi
 
-  local RADIO_ITEMS=()
-  [[ -n "$have_disc"     ]] && RADIO_ITEMS+=( "disc" "Use discovery_results.json" "on" )  || RADIO_ITEMS+=( "disc" "Use discovery_results.json" "off" )
-  [[ -n "$have_sel_json" ]] && RADIO_ITEMS+=( "seljson" "Use selected_upgrade.json" "off" )
-  [[ -n "$have_sel_ips"  ]] && RADIO_ITEMS+=( "selips"  "Use selected_upgrade.env (UPGRADE_SELECTED_IPS)" "off" )
+  # discovery_results.json as a fallback
+  [[ -s "$DISC_JSON" ]] && have_disc=1
 
-  set_backtitle "PreFlight — Choose the source to Query (Discovery / IOS-XE Upgrade)"
-  dlg --title "Source of devices" --radiolist "Pick where to load the switch list from:" 15 78 3 "${RADIO_ITEMS[@]}"
-  [[ $? -eq 0 ]] || { clear; trap - EXIT; return 1; }
-  local SRC="$DOUT"
-  set_backtitle "Meraki Preflight"
+  if [[ -n "$have_sel_json" ]]; then
+    SRC="seljson"
+  elif [[ -n "$have_sel_ips" ]]; then
+    SRC="selips"
+  elif [[ -n "$have_disc" ]]; then
+    SRC="disc"
+  else
+    dlg --title "Nothing to pick" --msgbox "No selected_upgrade.json, selected_upgrade.env, or discovery_results.json found.\nRun the IOS-XE upgrader or Discovery first." 10 75
+    clear; trap - EXIT; return 1
+  fi
 
   # checklist
   declare -a IPS HOSTS PIDS VERS SER
@@ -331,6 +432,7 @@ meraki_preflight(){
     HOSTS=(); PIDS=(); VERS=(); SER=()
     for _ in "${IPS[@]}"; do HOSTS+=(""); PIDS+=(""); VERS+=(""); SER+=(""); done
   fi
+
   (( ${#IPS[@]} > 0 )) || { dlg --title "No devices" --msgbox "The chosen source has zero devices." 7 60; clear; trap - EXIT; return 1; }
 
   local CHK=()
@@ -522,6 +624,14 @@ meraki_fix_dns(){
   if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
   [[ -z "${SUM:-}" || ! -f "$SUM" ]] && { dlg --title "No Preflight Summary" --msgbox "Could not find runs/preflight/latest.csv.\nRun preflight first." 9 70; clear; trap - EXIT; return 1; }
 
+  # IOS-XE minimum version check (unless already done in 'all' pipeline)
+  if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
+    if ! enforce_min_ios_or_abort "$SUM"; then
+      trap - EXIT
+      return 1
+    fi
+  fi
+
   # targets needing DNS or domain-lookup change
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($6!="yes" || $10=="disabled") print $1 }' "$SUM")
   if (( ${#TARGETS[@]} == 0 )); then
@@ -675,6 +785,14 @@ meraki_fix_ntp(){
     dialog --no-shadow --backtitle "Meraki NTP Updater" \
            --msgbox "Could not find runs/preflight/latest.csv.\nRun preflight first." 9 70
     clear; trap - EXIT; return 1; }
+
+  # IOS-XE minimum version check (unless already done in 'all' pipeline)
+  if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
+    if ! enforce_min_ios_or_abort "$SUM"; then
+      trap - EXIT
+      return 1
+    fi
+  fi
 
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($7!="yes") print $1 }' "$SUM")
   if (( ${#TARGETS[@]} == 0 )); then
@@ -830,6 +948,14 @@ meraki_fix_aaa(){
   if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
   [[ -z "${SUM:-}" || ! -f "$SUM" ]] && { dialog --no-shadow --infobox "No preflight summary found.\nRun preflight first." 6 60; sleep 2; clear; trap - EXIT; return 1; }
 
+  # IOS-XE minimum version check (unless already done in 'all' pipeline)
+  if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
+    if ! enforce_min_ios_or_abort "$SUM"; then
+      trap - EXIT
+      return 1
+    fi
+  fi
+
   # targets: any with aaa_new_model_missing OR aaa_login_missing OR aaa_exec_missing in notes (col 13)
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if (index($13,"aaa_new_model_missing;")>0 || index($13,"aaa_login_missing;")>0 || index($13,"aaa_exec_missing;")>0) print $1 }' "$SUM")
 
@@ -844,7 +970,7 @@ meraki_fix_aaa(){
   ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
 
   AAAFIX_CSV="$RUN_DIR/aaafix.csv"
-  echo "ip,changed_aaa,new_model,auth_login_default_local,authz_exec_default_local,notes" > "$AAAFIX_CSV"
+  echo "ip,changed_aaa,new_model,auth_login_default_local,authz_exec_default_local,notes" > "$AAFIX_CSV"
 
   dialog --no-shadow --infobox "Enforcing Meraki AAA settings where needed…\nPlease wait." 6 60
   sleep 2
@@ -884,28 +1010,340 @@ meraki_fix_aaa(){
 }
 
 # =====================================================================
+# IP ROUTING / DEFAULT ROUTE FIX
+# =====================================================================
+fix_ipr_one(){
+  set +e
+  local ip="$1"
+  local need_en=0 raw out
+  local changed="no"
+  local mgmt_mode="static"
+  local mgmt_method=""
+  local gw=""
+  local iprt_before="unknown" iprt_after="unknown"
+  local defrt_before="no" defrt_after="no"
+  local ping_ok="no"
+  local notes=""
+  local route_dhcp_present="no" route_static_present="no"
+
+  build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
+
+  log "[${ip}] CONNECT… (ip routing/default route)"
+  is_priv15_for_ip "$ip" || need_en=1
+
+  {
+    printf '\r\nterminal length 0\r\nterminal width 511\r\n'
+    (( need_en )) && emit_enable
+    printf 'show running-config | include ^ip routing\r\n'
+    printf 'show running-config | include ^no ip routing\r\n'
+    printf 'show running-config | include ^ip default-gateway\r\n'
+    printf 'show running-config | include ^ip route 0.0.0.0 0.0.0.0\r\n'
+    printf 'show ip route | include 0.0.0.0/0\r\n'
+    printf 'show ip interface brief\r\n'
+    printf 'exit\r\n'
+  } | timeout -k 10s 150s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+
+  tr -d '\r' < "$raw" > "$out"; mkdir -p "$RUN_DIR/devlogs"
+  cat "$out" >> "$RUN_DIR/devlogs/${ip}.iprfix.log"; : > "$raw"
+
+  # ip routing state (before)
+  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then
+    iprt_before="off"
+  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then
+    iprt_before="on"
+  else
+    iprt_before="unknown"
+  fi
+
+  # Determine mgmt method from "show ip interface brief" output
+  mgmt_method="$(awk -v ip="$ip" '
+    /^Interface[[:space:]]+IP-Address[[:space:]]+OK\?[[:space:]]+Method/ {hdr=1; next}
+    hdr && $2==ip {print $4; exit}
+  ' "$out")"
+
+  if [[ "$mgmt_method" =~ ^[Dd][Hh][Cc][Pp]$ ]]; then
+    mgmt_mode="dhcp"
+  else
+    mgmt_mode="static"
+  fi
+
+  # default route presence from running-config
+  if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+dhcp(\s|$)' "$out"; then
+    route_dhcp_present="yes"
+    defrt_before="yes"
+  fi
+
+  if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+([0-9]+\.){3}[0-9]+(\s|$)' "$out"; then
+    route_static_present="yes"
+    defrt_before="yes"
+    [[ -z "$gw" ]] && gw="$(awk '
+      /^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $5; exit}
+    ' "$out")"
+  fi
+
+  # if no static route yet, try ip default-gateway
+  if [[ "$defrt_before" != "yes" || -z "$gw" ]]; then
+    local gw_tmp
+    gw_tmp="$(awk '
+      /^ip default-gateway[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $3; exit}
+    ' "$out")"
+    if [[ -n "$gw_tmp" ]]; then
+      gw="$gw_tmp"
+      [[ "$defrt_before" != "yes" ]] && defrt_before="legacy"
+    fi
+  fi
+
+  # if still no gw, try from ip route table
+  if [[ -z "$gw" ]]; then
+    gw="$(awk '
+      /0\.0\.0\.0\/0/ {
+        for (i=1; i<=NF; i++) {
+          if ($i=="via") {print $(i+1); exit}
+        }
+      }
+    ' "$out")"
+    [[ -n "$gw" && "$defrt_before" != "yes" ]] && defrt_before="yes"
+  fi
+
+  log "[${ip}] BEFORE: IPRT=${iprt_before} MGMT_MODE=${mgmt_mode} METHOD=${mgmt_method:-<unknown>} GW=${gw:-<none>} ROUTE_DHCP=${route_dhcp_present} ROUTE_STATIC=${route_static_present} DEFRT=${defrt_before}"
+
+  # decide what to configure
+  local do_iprt=0 do_route_dhcp=0 do_route_static=0
+
+  [[ "$iprt_before" != "on" ]] && do_iprt=1
+
+  if [[ "$mgmt_mode" == "dhcp" ]]; then
+    [[ "$route_dhcp_present" != "yes" ]] && do_route_dhcp=1
+  else
+    if [[ -z "$gw" ]]; then
+      notes+="no_gateway_detected_cannot_build_static_default;"
+    else
+      [[ "$route_static_present" != "yes" ]] && do_route_static=1
+    fi
+  fi
+
+  if (( do_iprt || do_route_dhcp || do_route_static )); then
+    changed="yes"
+    {
+      printf '\r\n'
+      (( need_en )) && emit_enable
+      printf 'configure terminal\r\n'
+      if (( do_route_dhcp )); then
+        printf 'ip route 0.0.0.0 0.0.0.0 dhcp\r\n'
+      fi
+      if (( do_route_static )); then
+        printf 'ip route 0.0.0.0 0.0.0.0 %s\r\n' "$gw"
+      fi
+      if (( do_iprt )); then
+        printf 'ip routing\r\n'
+      fi
+      printf 'end\r\n'
+      printf 'write memory\r\n'
+      printf 'exit\r\n'
+    } | timeout -k 20s 200s "${SSH_CMD[@]}" >>"$raw" 2>&1 || true
+    tr -d '\r' < "$raw" >> "$RUN_DIR/devlogs/${ip}.iprfix.log"; : > "$raw"
+  else
+    log "[${ip}] No ip routing/default-route changes needed."
+  fi
+
+  # verify + ping 8.8.8.8
+  {
+    printf '\r\n'
+    (( need_en )) && emit_enable
+    printf 'show running-config | include ^ip routing\r\n'
+    printf 'show running-config | include ^no ip routing\r\n'
+    printf 'show running-config | include ^ip route 0.0.0.0 0.0.0.0\r\n'
+    printf 'show ip route | include 0.0.0.0/0\r\n'
+    printf 'ping 8.8.8.8 repeat 3 timeout 2\r\n'
+    printf 'exit\r\n'
+  } | timeout -k 20s 200s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+
+  tr -d '\r' < "$raw" > "$out"; cat "$out" >> "$RUN_DIR/devlogs/${ip}.iprfix.log"
+
+  # ip routing state (after)
+  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then
+    iprt_after="off"
+  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then
+    iprt_after="on"
+  else
+    iprt_after="unknown"
+  fi
+
+  # default route present (after)
+  if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+(dhcp|([0-9]+\.){3}[0-9]+)' "$out" || \
+     awk '/0\.0\.0\.0\/0/ {found=1} END{exit !found}' "$out"
+  then
+    defrt_after="yes"
+  else
+    defrt_after="no"
+  fi
+
+  # ping 8.8.8.8 result
+  if grep -Eiq 'Success +rate +is +([1-9][0-9]*|[0-9]*[1-9]) +percent' "$out" || grep -q '!' "$out"; then
+    ping_ok="yes"
+  else
+    ping_ok="no"
+    notes+="ping_8.8.8.8_failed;"
+  fi
+
+  log "[${ip}] AFTER: IPRT=${iprt_after} DEFRT=${defrt_after} PING=${ping_ok} ${notes:+NOTES=}${notes}"
+  append_csv "$IPRFIX_CSV" "${ip},${mgmt_mode},${changed},${iprt_after},${defrt_after},${ping_ok},${notes}"
+
+  sleep 0.3
+  rm -f "$raw" "$out"
+}
+
+meraki_fix_ip_routing(){
+  trap 'ui_stop' EXIT
+
+  # env
+  [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
+  SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
+  SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
+  ENABLE_PASSWORD="$(__deq "${ENABLE_PASSWORD-}")"
+
+  # latest preflight summary
+  local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
+  local LATEST_ENV="$PRE_ROOT/latest.env"
+  local SUM=""
+
+  if [[ -f "$LATEST_ENV" ]]; then
+    source "$LATEST_ENV"
+    SUM="${PRE_FLIGHT_SUMMARY:-}"
+  fi
+
+  if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
+    dialog --no-shadow --backtitle "$BACKTITLE" \
+           --msgbox "Could not find runs/preflight/latest.csv.\nRun preflight first." 9 70
+    clear; trap - EXIT; return 1
+  fi
+
+  # IOS-XE minimum version check (unless already done in 'all' pipeline)
+  if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
+    if ! enforce_min_ios_or_abort "$SUM"; then
+      trap - EXIT
+      return 1
+    fi
+  fi
+
+  # TARGETS: any device where ip_routing != "yes" OR default_route != "yes"
+  # CSV columns: ip,hostname,ios_ver,install_mode,meraki_mode,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,tunnel,ready,notes
+  mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($8!="yes" || $9!="yes") print $1 }' "$SUM")
+
+  if (( ${#TARGETS[@]} == 0 )); then
+    dialog --no-shadow --backtitle "$BACKTITLE" \
+           --infobox "All switches already have ip routing enabled and a default route.\nNothing to do." 7 75
+    sleep 2
+    clear; trap - EXIT; return 0
+  fi
+
+  # run directory
+  RUN_ID="ipr-$(date -u +%Y%m%d%H%M%S)"
+  RUN_ROOT="$SCRIPT_DIR/runs/iprfix"; mkdir -p "$RUN_ROOT"
+  RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
+  ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
+
+  # CSV for results
+  IPRFIX_CSV="$RUN_DIR/iprfix.csv"
+  echo "ip,mgmt_mode,changed_config,ip_routing_enabled,default_route_present,ping_8_8_8_8_ok,notes" > "$IPRFIX_CSV"
+
+  dialog --no-shadow --backtitle "$BACKTITLE" \
+         --infobox "Ensuring ip routing + default route where needed...\nPlease wait." 7 75
+  sleep 2
+
+  UI_TITLE="IP Routing Fix"
+  set_backtitle "Meraki IP Routing Updater"
+  ui_start
+  log "IP Routing Fix Run: $RUN_ID"
+  log "Run dir: $RUN_DIR"
+  log "Targets needing ip routing/default route: ${TARGETS[*]}"
+
+  local MAX_CONCURRENCY="${MAX_CONCURRENCY:-5}"
+  local ACTIVE=0 DONE=0 TOTAL=${#TARGETS[@]}
+
+  rand_ms(){ awk -v m="${SPLAY_MS:-150}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}'; }
+
+  for ip in "${TARGETS[@]}"; do
+    ( fix_ipr_one "$ip" ) &
+    ((ACTIVE++))
+    sleep "$(rand_ms)"
+    if (( ACTIVE >= MAX_CONCURRENCY )); then
+      if wait -n; then :; fi
+      ((DONE++))
+      local pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "Routing fixed on $DONE / $TOTAL"
+      ((ACTIVE--))
+    fi
+  done
+
+  while (( DONE < TOTAL )); do
+    if wait -n; then :; fi
+    ((DONE++))
+    local pct=$(( 100 * DONE / TOTAL ))
+    gauge "$pct" "Routing fixed on $DONE / $TOTAL"
+  done
+
+  gauge 100 "Done"
+  ui_stop
+  sleep 0.5
+  dialog --no-shadow --backtitle "$BACKTITLE" \
+         --infobox "ip routing + default route ensured where needed.\nSee iprfix.csv for details." 7 80
+  sleep 2
+  clear
+  trap - EXIT
+  return 0
+}
+
+# =====================================================================
 # PIPELINE
 # =====================================================================
 meraki_all(){
+  # full pipeline: preflight -> IOS check once -> DNS -> NTP -> AAA -> routing
   meraki_preflight || return $?
-  meraki_fix_dns || true
-  meraki_fix_ntp || true
-  meraki_fix_aaa || true
+
+  local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
+  local LATEST_ENV="$PRE_ROOT/latest.env"
+  local SUM=""
+
+  if [[ -f "$LATEST_ENV" ]]; then
+    source "$LATEST_ENV"
+    SUM="${PRE_FLIGHT_SUMMARY:-}"
+  fi
+
+  if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
+    echo "Preflight summary missing after preflight. Aborting." >&2
+    return 1
+  fi
+
+  # Run IOS-XE check ONCE for the 'all' pipeline
+  if ! enforce_min_ios_or_abort "$SUM"; then
+    return 1
+  fi
+
+  # Tell per-fix functions to skip their own IOS checks
+  SKIP_IOS_CHECK=1
+
+  meraki_fix_dns        || return $?
+  meraki_fix_ntp        || true
+  meraki_fix_aaa        || true
+  meraki_fix_ip_routing || true
 }
 
 # =====================================================================
 # Entry
 # =====================================================================
 case "${1:-all}" in
-  preflight) UI_TITLE="Preflight";   meraki_preflight ;;
-  fix-dns)   UI_TITLE="DNS Fix";     meraki_fix_dns ;;
-  fix-ntp)   UI_TITLE="NTP Fix";     meraki_fix_ntp ;;
-  fix-aaa)   UI_TITLE="AAA Fix";     meraki_fix_aaa ;;
-  all|"")    UI_TITLE="Preflight";   meraki_preflight \
-             && UI_TITLE="DNS Fix";  meraki_fix_dns \
-             && UI_TITLE="NTP Fix";  meraki_fix_ntp \
-             && UI_TITLE="AAA Fix";  meraki_fix_aaa ;;
-  *)         echo "Loaded functions: meraki_preflight, meraki_fix_dns, meraki_fix_ntp, meraki_fix_aaa"
-             echo "Usage: $0 {preflight|fix-dns|fix-ntp|fix-aaa|all}"
-             exit 1 ;;
+  preflight)   UI_TITLE="Preflight";        meraki_preflight ;;
+  fix-dns)     UI_TITLE="DNS Fix";          meraki_fix_dns ;;
+  fix-ntp)     UI_TITLE="NTP Fix";          meraki_fix_ntp ;;
+  fix-aaa)     UI_TITLE="AAA Fix";          meraki_fix_aaa ;;
+  fix-routing) UI_TITLE="IP Routing Fix";   meraki_fix_ip_routing ;;
+  all|"")
+    UI_TITLE="Preflight / All Fixes"
+    meraki_all
+    ;;
+  *)
+    echo "Loaded functions: meraki_preflight, meraki_fix_dns, meraki_fix_ntp, meraki_fix_aaa, meraki_fix_ip_routing, meraki_all"
+    echo "Usage: $0 {preflight|fix-dns|fix-ntp|fix-aaa|fix-routing|all}"
+    exit 1 ;;
 esac
