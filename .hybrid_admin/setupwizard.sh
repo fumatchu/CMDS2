@@ -651,22 +651,29 @@ build_sorted_menu_file() {
     ver="$(version_from_name "$nm")"
     printf '%s|%s\n' "$ver" "$nm" >>"$tmp"
   done <"$infile"
+  # Version sort ascending
   sort -t'|' -k1,1V -k2,2 "$tmp" | awk -F'|' '{print $2"\n-"}'
   rm -f "$tmp"
 }
 
 resolve_meta() {
   name="$1"; infile="$2"
-  while IFS='|' read -r _mt _sz _nm; do [ "$_nm" = "$name" ] && { printf '%s|%s\n' "$_sz" "$FIRMWARE_DIR/$_nm"; return; }; done <"$infile"
+  while IFS='|' read -r _mt _sz _nm; do
+    [ "$_nm" = "$name" ] && { printf '%s|%s\n' "$_sz" "$FIRMWARE_DIR/$_nm"; return; }
+  done <"$infile"
   printf '|\n'
 }
 
+# Selected firmware + metadata
 FW_CAT9K_FILE=""; FW_CAT9K_LITE_FILE=""
+FW_CAT9K_PATH=""; FW_CAT9K_SIZE_BYTES=""; FW_CAT9K_SIZE_H=""; FW_CAT9K_VERSION=""
+FW_CAT9K_LITE_PATH=""; FW_CAT9K_LITE_SIZE_BYTES=""; FW_CAT9K_LITE_SIZE_H=""; FW_CAT9K_LITE_VERSION=""
 
 # Loop here so Cockpit upload / rescan stays in the firmware step
 while :; do
   tmp_lines="$(mktemp)"
   list_files | sort -nr >"$tmp_lines"
+
   U_FILE="$(mktemp)"; build_sorted_menu_file universal "$tmp_lines" >"$U_FILE"
   L_FILE="$(mktemp)"; build_sorted_menu_file lite      "$tmp_lines" >"$L_FILE"
   U_ARGS="$(tr '\n' ' ' <"$U_FILE")"
@@ -685,12 +692,15 @@ while :; do
     esac
   fi
 
+  # Cat9k (universal) menu
   if [ -s "$U_FILE" ]; then
     # shellcheck disable=SC2086
     dlg --clear --backtitle "$BACKTITLE" --title "Select Firmware — Cat9k (universal)" \
         --menu "Choose a Cat9k (9300/9400/9500/9600) image (sorted by version asc):" 22 "$W_WIDE" 16 $U_ARGS
     [ $? -eq 0 ] && FW_CAT9K_FILE="${DOUT:-}"
   fi
+
+  # Cat9k-Lite (9200) menu
   if [ -s "$L_FILE" ]; then
     # shellcheck disable=SC2086
     dlg --clear --backtitle "$BACKTITLE" --title "Select Firmware — Cat9k-Lite (9200)" \
@@ -713,27 +723,27 @@ while :; do
     rm -f "$G_TMP"
   fi
 
+  # ---- Compute metadata *before* deleting tmp_lines ----
+  if [ -n "$FW_CAT9K_FILE" ]; then
+    out="$(resolve_meta "$FW_CAT9K_FILE" "$tmp_lines")"
+    FW_CAT9K_SIZE_BYTES="$(printf '%s' "$out" | cut -d'|' -f1)"
+    FW_CAT9K_PATH="$(printf '%s' "$out" | cut -d'|' -f2)"
+    FW_CAT9K_SIZE_H="$(hbytes "${FW_CAT9K_SIZE_BYTES:-0}")"
+    FW_CAT9K_VERSION="$(version_from_name "$FW_CAT9K_FILE")"
+  fi
+
+  if [ -n "$FW_CAT9K_LITE_FILE" ]; then
+    out="$(resolve_meta "$FW_CAT9K_LITE_FILE" "$tmp_lines")"
+    FW_CAT9K_LITE_SIZE_BYTES="$(printf '%s' "$out" | cut -d'|' -f1)"
+    FW_CAT9K_LITE_PATH="$(printf '%s' "$out" | cut -d'|' -f2)"
+    FW_CAT9K_LITE_SIZE_H="$(hbytes "${FW_CAT9K_LITE_SIZE_BYTES:-0}")"
+    FW_CAT9K_LITE_VERSION="$(version_from_name "$FW_CAT9K_LITE_FILE")"
+  fi
+  # ------------------------------------------------------
+
   rm -f "$tmp_lines" "$U_FILE" "$L_FILE"
   break
 done
-
-FW_CAT9K_PATH=""; FW_CAT9K_SIZE_BYTES=""; FW_CAT9K_SIZE_H=""; FW_CAT9K_VERSION=""
-FW_CAT9K_LITE_PATH=""; FW_CAT9K_LITE_SIZE_BYTES=""; FW_CAT9K_LITE_SIZE_H=""; FW_CAT9K_LITE_VERSION=""
-if [ -n "$FW_CAT9K_FILE" ]; then
-  out="$(resolve_meta "$FW_CAT9K_FILE" "$tmp_lines")"
-  FW_CAT9K_SIZE_BYTES="$(printf '%s' "$out" | cut -d'|' -f1)"
-  FW_CAT9K_PATH="$(printf '%s' "$out" | cut -d'|' -f2)"
-  FW_CAT9K_SIZE_H="$(hbytes "${FW_CAT9K_SIZE_BYTES:-0}")"
-  FW_CAT9K_VERSION="$(version_from_name "$FW_CAT9K_FILE")"
-fi
-if [ -n "$FW_CAT9K_LITE_FILE" ]; then
-  out="$(resolve_meta "$FW_CAT9K_LITE_FILE" "$tmp_lines")"
-  FW_CAT9K_LITE_SIZE_BYTES="$(printf '%s' "$out" | cut -d'|' -f1)"
-  FW_CAT9K_LITE_PATH="$(printf '%s' "$out" | cut -d'|' -f2)"
-  FW_CAT9K_LITE_SIZE_H="$(hbytes "${FW_CAT9K_LITE_SIZE_BYTES:-0}")"
-  FW_CAT9K_LITE_VERSION="$(version_from_name "$FW_CAT9K_LITE_FILE")"
-fi
-
 ###############################################################################
 # 4a) Hybrid minimum IOS XE requirement
 ###############################################################################
