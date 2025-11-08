@@ -34,6 +34,7 @@ DISC_ENV="$SCRIPT_DIR/meraki_discovery.env"
 SEL_ENV="$SCRIPT_DIR/selected_upgrade.env"
 DISC_JSON="$SCRIPT_DIR/discovery_results.json"
 SEL_JSON="$SCRIPT_DIR/selected_upgrade.json"
+DISC_CSV="$SCRIPT_DIR/discovery_results.csv"
 
 # ---------- tiny utils ----------
 __deq(){ local s="${1-}"; s="${s//\\!/!}"; s="${s//\\;/;}"; s="${s//\\ / }"; s="${s//\\\\/\\}"; printf '%s' "$s"; }
@@ -428,17 +429,81 @@ meraki_preflight(){
     mapfile -t VERS  < <(jq -r '.[].installed_version // ""' "$SEL_JSON" 2>/dev/null)
     mapfile -t SER   < <(jq -r '.[].serial // ""' "$SEL_JSON" 2>/dev/null)
   else
+    # SRC = "selips" — only have UPGRADE_SELECTED_IPS. Enrich from
+    # discovery_results.json (preferred) or discovery_results.csv (fallback).
     read -r -a IPS <<<"${UPGRADE_SELECTED_IPS:-}"
+
     HOSTS=(); PIDS=(); VERS=(); SER=()
-    for _ in "${IPS[@]}"; do HOSTS+=(""); PIDS+=(""); VERS+=(""); SER+=(""); done
+
+    if [[ -s "$DISC_JSON" ]]; then
+      # Build maps: ip -> hostname/version/pid/serial from discovery_results.json
+      declare -A HMAP VMAP PMAP SMAP
+      while IFS=$'\t' read -r ip h v p s; do
+        HMAP["$ip"]="$h"
+        VMAP["$ip"]="$v"
+        PMAP["$ip"]="$p"
+        SMAP["$ip"]="$s"
+      done < <(jq -r '.[] | [.ip,
+                               (.hostname // ""),
+                               (.version  // ""),
+                               (.pid      // ""),
+                               (.serial   // "")] | @tsv' "$DISC_JSON")
+
+      for ip in "${IPS[@]}"; do
+        HOSTS+=( "${HMAP[$ip]:-}" )
+        VERS+=(  "${VMAP[$ip]:-}" )
+        PIDS+=(  "${PMAP[$ip]:-}" )
+        SER+=(   "${SMAP[$ip]:-}" )
+      done
+
+    elif [[ -s "$DISC_CSV" ]]; then
+      # Fallback: build maps from discovery_results.csv
+      declare -A HMAP VMAP PMAP SMAP
+      local ip ssh login hostname version pid serial
+      local first=1
+      while IFS=, read -r ip ssh login hostname version pid serial; do
+        if (( first )); then
+          first=0
+          continue
+        fi
+        # strip surrounding quotes if present
+        ip="${ip%\"}"; ip="${ip#\"}"
+        hostname="${hostname%\"}"; hostname="${hostname#\"}"
+        version="${version%\"}";  version="${version#\"}"
+        pid="${pid%\"}";          pid="${pid#\"}"
+        serial="${serial%\"}";    serial="${serial#\"}"
+
+        HMAP["$ip"]="$hostname"
+        VMAP["$ip"]="$version"
+        PMAP["$ip"]="$pid"
+        SMAP["$ip"]="$serial"
+      done < "$DISC_CSV"
+
+      for ip in "${IPS[@]}"; do
+        HOSTS+=( "${HMAP[$ip]:-}" )
+        VERS+=(  "${VMAP[$ip]:-}" )
+        PIDS+=(  "${PMAP[$ip]:-}" )
+        SER+=(   "${SMAP[$ip]:-}" )
+      done
+
+    else
+      # No discovery metadata available; keep descriptions minimal.
+      for _ in "${IPS[@]}"; do
+        HOSTS+=("")
+        PIDS+=("")
+        VERS+=("")
+        SER+=("")
+      done
+    fi
   fi
 
   (( ${#IPS[@]} > 0 )) || { dlg --title "No devices" --msgbox "The chosen source has zero devices." 7 60; clear; trap - EXIT; return 1; }
 
   local CHK=()
   for i in "${!IPS[@]}"; do
-    local ip="${IPS[$i]}" h="${HOSTS[$i]}" v="${VERS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
-    local desc; desc="$(trim "${h:-$ip}  ${v:+v$v }${p:+($p) }${s:+SN:$s}")"
+    local ip="${IPS[$i]}" h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
+    # NOTE: version intentionally *not* shown here to avoid stale info.
+    local desc; desc="$(trim "${h:-$ip}  ${p:+($p) }${s:+SN:$s}")"
     CHK+=( "$ip" "$desc" "on" )
   done
 
@@ -506,7 +571,6 @@ meraki_preflight(){
   echo "Summary CSV:   $SUMMARY_CSV"
   trap - EXIT
 }
-
 # =====================================================================
 # DNS FIX
 # =====================================================================
