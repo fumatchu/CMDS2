@@ -123,6 +123,10 @@ _validate_fd_open() {
 validate_ui_start() {
   _validate_calc_layout
 
+  # Optional override of the dialog title:
+  #   validate_ui_start "Meraki Cloud Monitoring onboarding"
+  local title="${1:-Connectivity & IOS-XE validation}"
+
   # If the caller already set VALIDATE_STATUS_FILE (e.g. runs/migration/.../ui.status),
   # reuse it; otherwise, fall back to a temporary file.
   if [[ -z "${VALIDATE_STATUS_FILE:-}" ]]; then
@@ -136,7 +140,7 @@ validate_ui_start() {
     exec {VALIDATE_FD}<>"$VALIDATE_PIPE"
     (
       dialog --no-shadow \
-             --begin 1 2 --title "Connectivity & IOS-XE validation" \
+             --begin 1 2 --title "$title" \
              --tailboxbg "$VALIDATE_STATUS_FILE" "$VALIDATE_TAIL_H" "$VALIDATE_TAIL_W" \
              --and-widget \
              --begin "$VALIDATE_GAUGE_ROW" "$VALIDATE_GAUGE_COL" \
@@ -186,12 +190,13 @@ validate_ui_stop() {
   VALIDATE_DIALOG_PID=""
 }
 
+
 # ------------------------------------------------------------
-# 1) Connectivity + IOS-XE + config validation with logging
-#    (parallel: up to 10 switches at a time)
+# 1) Connectivity + IOS-XE + config + Meraki compatibility
+#    validation with logging (parallel: up to 10 switches)
 # ------------------------------------------------------------
 validate_switches_before_migration() {
-  local BACKTITLE_V="Catalyst validation – ping, IOS-XE & basic config"
+  local BACKTITLE_V="Catalyst validation – ping, IOS-XE, config & Meraki compatibility"
 
   local DISC_ENV="$SCRIPT_DIR/meraki_discovery.env"
   local SEL_JSON="$SCRIPT_DIR/selected_upgrade.json"
@@ -361,7 +366,7 @@ validate_switches_before_migration() {
   mkdir -p "$RUN_DIR/devlogs"
 
   local SUMMARY_CSV="$RUN_DIR/summary.csv"
-  echo "ip,hostname,ios_ver,ping_ok,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,aaa_new_model,aaa_login_default_local,aaa_exec_default_local,ping_google,ready,notes" > "$SUMMARY_CSV"
+  echo "ip,hostname,ios_ver,ping_ok,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,aaa_new_model,aaa_login_default_local,aaa_exec_default_local,ping_google,meraki_compat,ready,notes" > "$SUMMARY_CSV"
 
   # expose "latest" like preflight does
   local LATEST_ENV="$RUN_ROOT/latest.env"
@@ -383,7 +388,7 @@ validate_switches_before_migration() {
   # ---------- split-screen UI like discovery ----------
   validate_ui_start
   validate_ui_status "Minimum IOS-XE required: ${MIN_IOS}"
-  validate_ui_status "Also checking DNS, NTP, ip routing, AAA, and ping to google.com…"
+  validate_ui_status "Also checking DNS, NTP, ip routing, AAA, ping to google.com, and Meraki compatibility…"
 
   local total=${#IPS[@]}
 
@@ -406,6 +411,7 @@ validate_switches_before_migration() {
     local defrt="n/a"
     local aaa_nm="n/a" aaa_login="n/a" aaa_exec="n/a"
     local ping_google="n/a"
+    local meraki_compat="n/a"
 
     local -a reasons=()
 
@@ -448,6 +454,7 @@ validate_switches_before_migration() {
         printf 'show running-config | include ^aaa new-model\r\n'
         printf 'show running-config | include ^aaa authentication login default\r\n'
         printf 'show running-config | include ^aaa authorization exec default\r\n'
+        printf 'show meraki compatibility\r\n'
         printf 'ping google.com repeat 2 timeout 2\r\n'
         printf 'exit\r\n'
       } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
@@ -539,6 +546,22 @@ validate_switches_before_migration() {
         reasons+=( "aaa_exec_default_local_missing" )
       fi
 
+      # Meraki compatibility
+      meraki_compat="no"
+      if grep -qi "Invalid input detected" "$ssh_log"; then
+        reasons+=( "meraki_cmd_unsupported" )
+        validate_ui_status "[$ip] 'show meraki compatibility' not supported on this platform."
+      elif grep -q "Meraki Cloud Monitoring: Compatible" "$ssh_log"; then
+        meraki_compat="yes"
+        validate_ui_status "[$ip] Meraki Cloud Monitoring compatibility: OK."
+      elif grep -q "Meraki Cloud Monitoring: Not Compatible" "$ssh_log"; then
+        reasons+=( "meraki_not_compatible" )
+        validate_ui_status "[$ip] Meraki Cloud Monitoring compatibility: NOT COMPATIBLE."
+      else
+        reasons+=( "meraki_compat_unclear" )
+        validate_ui_status "[$ip] Meraki compatibility output unclear – treating as NOT compatible."
+      fi
+
       # ping google.com
       ping_google="no"
       if awk '
@@ -563,6 +586,7 @@ validate_switches_before_migration() {
     if [[ "$defrt" != "yes" ]]; then ready="no"; fi
     if [[ "$aaa_nm" != "yes" || "$aaa_login" != "yes" || "$aaa_exec" != "yes" ]]; then ready="no"; fi
     if [[ "$ping_google" != "yes" ]]; then ready="no"; fi
+    if [[ "$meraki_compat" != "yes" ]]; then ready="no"; fi
 
     local notes=""
     if ((${#reasons[@]})); then
@@ -577,11 +601,11 @@ validate_switches_before_migration() {
 
     # per-switch CSV line (we'll stitch them into summary.csv later)
     local csv_file="$RUN_DIR/devlogs/summary_${ip//./_}.line"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
       "$ip" "$host" "${ios:-}" "$ping_ok" \
       "$dns_ok" "$ntp_ok" "$iprt" "$defrt" "$domlkp" \
       "$aaa_nm" "$aaa_login" "$aaa_exec" \
-      "$ping_google" \
+      "$ping_google" "$meraki_compat" \
       "$ready" "$notes" >"$csv_file"
   }
 
@@ -619,16 +643,16 @@ validate_switches_before_migration() {
     [[ -f "$line_file" ]] && cat "$line_file" >>"$SUMMARY_CSV"
   done
 
-  validate_ui_gauge 100 "Connectivity, IOS-XE & config checks complete."
+  validate_ui_gauge 100 "Connectivity, IOS-XE, config & Meraki compatibility checks complete."
   validate_ui_stop   # close split-screen before showing summary dialogs
 
   # ---------- build validated_ips.json + summary text ----------
-  local -a OK_IPS BAD_PING_IPS BAD_VER_IPS BAD_CFG_IPS
+  local -a OK_IPS BAD_PING_IPS BAD_VER_IPS BAD_CFG_IPS BAD_MERAKI_IPS
 
   local summary="$RUN_DIR/validation_summary.txt"
   {
-    echo "Connectivity, IOS-XE & basic config validation"
-    echo "=============================================="
+    echo "Connectivity, IOS-XE, config & Meraki compatibility validation"
+    echo "================================================================"
     echo
     echo "Discovery env:  $DISC_ENV"
     echo "Min IOS-XE required:  $MIN_IOS"
@@ -637,15 +661,15 @@ validate_switches_before_migration() {
     echo
     echo "Checked switches:"
     echo
-    printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s\n" \
-      "IP" "Hostname" "IOS-XE" "Ping" "DNS" "NTP" "IP-Route" "Def-Route" "DomLkup" "AAA(nm/login/exec)" "g.com"
-    printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s\n" \
-      "----------------" "----------------------" "---------" "-----" "--------" "--------" "---------" "-----------" "----------" "------------------"
+    printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s %-7s\n" \
+      "IP" "Hostname" "IOS-XE" "Ping" "DNS" "NTP" "IP-Route" "Def-Route" "DomLkup" "AAA(nm/login/exec)" "g.com" "Meraki"
+    printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s %-7s\n" \
+      "----------------" "----------------------" "---------" "-----" "--------" "--------" "---------" "-----------" "----------" "------------------" "------" "-------"
 
     local first=1
-    local ip hostname ios_ver ping_ok dns_ok ntp_ok iprt defrt domlkp aaa_nm aaa_login aaa_exec ping_google ready notes
+    local ip hostname ios_ver ping_ok dns_ok ntp_ok iprt defrt domlkp aaa_nm aaa_login aaa_exec ping_google meraki_compat ready notes
 
-    while IFS=, read -r ip hostname ios_ver ping_ok dns_ok ntp_ok iprt defrt domlkp aaa_nm aaa_login aaa_exec ping_google ready notes; do
+    while IFS=, read -r ip hostname ios_ver ping_ok dns_ok ntp_ok iprt defrt domlkp aaa_nm aaa_login aaa_exec ping_google meraki_compat ready notes; do
       if (( first )); then first=0; continue; fi  # skip header
 
       # strip possible quotes on some fields
@@ -654,7 +678,7 @@ validate_switches_before_migration() {
       ios_ver="${ios_ver%\"}";   ios_ver="${ios_ver#\"}"
       notes="${notes%\"}";       notes="${notes#\"}"
 
-      printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s\n" \
+      printf "%-16s %-22s %-10s %-5s %-8s %-8s %-9s %-11s %-10s %-18s %-6s %-7s\n" \
         "$ip" \
         "${hostname:-<unknown>}" \
         "${ios_ver:-<none>}" \
@@ -665,7 +689,8 @@ validate_switches_before_migration() {
         "$defrt" \
         "$domlkp" \
         "${aaa_nm},${aaa_login},${aaa_exec}" \
-        "$([[ $ping_google == "yes" ]] && echo "yes" || echo "no")"
+        "$([[ $ping_google == "yes" ]] && echo "yes" || echo "no")" \
+        "$([[ $meraki_compat == "yes" ]] && echo "yes" || echo "no")"
 
       # categorize for final lists
       if [[ "$ping_ok" != "yes" ]]; then
@@ -674,7 +699,10 @@ validate_switches_before_migration() {
       if [[ "$notes" == *version_too_low* || "$notes" == *ios_not_detected* ]]; then
         BAD_VER_IPS+=( "$ip (running ${ios_ver:-<none>})" )
       fi
-      if [[ "$ready" != "yes" && "$ping_ok" == "yes" && "$notes" != *version_too_low* && "$notes" != *ios_not_detected* ]]; then
+      if [[ "$meraki_compat" != "yes" ]]; then
+        BAD_MERAKI_IPS+=( "$ip" )
+      fi
+      if [[ "$ready" != "yes" && "$ping_ok" == "yes" && "$notes" != *version_too_low* && "$notes" != *ios_not_detected* && "$notes" != *meraki_* ]]; then
         BAD_CFG_IPS+=( "$ip (${notes:-config_failed})" )
       fi
       if [[ "$ready" == "yes" ]]; then
@@ -700,8 +728,16 @@ validate_switches_before_migration() {
       echo
     fi
 
+    if ((${#BAD_MERAKI_IPS[@]})); then
+      echo "Switches that are NOT Meraki Cloud Monitoring compatible:"
+      for ip in "${BAD_MERAKI_IPS[@]}"; do
+        echo "  - $ip"
+      done
+      echo
+    fi
+
     if ((${#BAD_CFG_IPS[@]})); then
-      echo "Switches that FAILED DNS/NTP/AAA/ip-routing/ping checks:"
+      echo "Switches that FAILED DNS/NTP/AAA/ip-routing/ping checks (but are Meraki-compatible):"
       for line in "${BAD_CFG_IPS[@]}"; do
         echo "  - $line"
       done
@@ -709,7 +745,7 @@ validate_switches_before_migration() {
     fi
 
     if ((${#OK_IPS[@]})); then
-      echo "Switches that PASSED ALL checks (ping, IOS-XE, DNS/NTP/AAA/ip routing, ping google.com):"
+      echo "Switches that PASSED ALL checks (ping, IOS-XE, DNS/NTP/AAA/ip routing, ping google.com, Meraki compatibility):"
       for ip in "${OK_IPS[@]}"; do
         echo "  - $ip"
       done
@@ -739,15 +775,15 @@ validate_switches_before_migration() {
       --textbox "$summary" 24 100 || true
 
   local rc=0
-  if ((${#BAD_PING_IPS[@]} || ${#BAD_VER_IPS[@]} || ${#BAD_CFG_IPS[@]})); then
+  if ((${#BAD_PING_IPS[@]} || ${#BAD_VER_IPS[@]} || ${#BAD_CFG_IPS[@]} || ${#BAD_MERAKI_IPS[@]})); then
     dlg --backtitle "$BACKTITLE_V" \
         --title "Validation failed" \
-        --msgbox "Some switches failed ping, IOS-XE minimum version, or required config checks.\n\nReview the summary and correct issues before migration.\n\nOnly switches in the PASSED list will be eligible for Meraki mapping." 13 90
+        --msgbox "Some switches failed ping, IOS-XE minimum version, Meraki compatibility,\n\nor required config checks (DNS/NTP/AAA/ip-routing/ping).\n\nReview the summary and correct issues before migration.\n\nOnly switches in the PASSED list will be eligible for Meraki mapping." 15 90
     rc=1
   else
     dlg --backtitle "$BACKTITLE_V" \
         --title "Validation OK" \
-        --msgbox "All selected switches are reachable, meet the minimum IOS-XE version (${MIN_IOS}),\n\nand have DNS, NTP, ip routing, AAA, and successful ping to google.com.\n\nYou can safely continue with migration." 14 90
+        --msgbox "All selected switches are reachable, meet the minimum IOS-XE version (${MIN_IOS}),\n\nhave DNS, NTP, ip routing, AAA, successful ping to google.com,\n\nand are Meraki Cloud Monitoring compatible.\n\nYou can safely continue with migration." 16 90
   fi
 
   return "$rc"
@@ -1488,12 +1524,1162 @@ USAGE
   [[ -n "$TMPDIR" && -d "$TMPDIR" ]] && rm -rf "$TMPDIR"
 }
 
+
+
+
+
+meraki_firewall_info_helper() {
+  (
+    set -Euo pipefail
+
+    # ------------------------------------------------------------
+    # Standalone Meraki "Firewall info" helper (embedded)
+    # ------------------------------------------------------------
+
+    SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+
+    # ----- tiny dependency checker -----
+    for _cmd in curl jq; do
+      if ! command -v "$_cmd" >/dev/null 2>&1; then
+        echo "Missing dependency: $_cmd" >&2
+        exit 1
+      fi
+    done
+
+    # ----- minimal dialog wrapper -----
+    : "${DIALOG:=dialog}"
+    DIALOG_HAS_STDOUT=1
+    if ! command -v "$DIALOG" >/dev/null 2>&1; then
+      DIALOG=""
+    else
+      if ! "$DIALOG" --help 2>&1 | grep -q -- '--stdout'; then
+        DIALOG_HAS_STDOUT=0
+      fi
+    fi
+
+        BACKTITLE_F="Meraki upstream firewall requirements"
+
+    dlg_msgbox() {
+      local text="$1" h="${2:-10}" w="${3:-80}"
+      if [[ -n "$DIALOG" ]]; then
+        if (( DIALOG_HAS_STDOUT )); then
+          "$DIALOG" --no-shadow \
+            --backtitle "$BACKTITLE_F" \
+            --ok-label "Continue" --exit-label "Continue" \
+            --msgbox "$text" "$h" "$w"
+        else
+          "$DIALOG" --no-shadow \
+            --backtitle "$BACKTITLE_F" \
+            --ok-label "Continue" --exit-label "Continue" \
+            --msgbox "$text" "$h" "$w" 2>/dev/null
+        fi
+      else
+        printf '%s\n' "$text"
+      fi
+    }
+
+    trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"${1-}"; }
+
+    BACKTITLE_F="Meraki upstream firewall requirements"
+
+    # ------------------------------------------------------------
+    # Find env with MERAKI_API_KEY
+    #   - If you pass a path: ./firewall /path/to/env
+    #   - Otherwise we search for something containing MERAKI_API_KEY
+    # ------------------------------------------------------------
+    ENV_FILE=""
+    if [[ $# -gt 0 && "$1" != "-h" && "$1" != "--help" ]]; then
+      ENV_FILE="$1"
+    else
+      base_dir="$SCRIPT_DIR"
+      CANDIDATES=(
+        "$base_dir/meraki_discovery.env"
+        "$base_dir/meraki.env"
+        "$base_dir/.env"
+        "$base_dir/ENV"
+      )
+      while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$base_dir/*.env" 2>/dev/null || true)
+
+      for f in "${CANDIDATES[@]}"; do
+        [[ -f "$f" && -r "$f" ]] || continue
+        if grep -Eq '(^|\s)(export\s+)?MERAKI_API_KEY=' "$f"; then
+          ENV_FILE="$f"
+          break
+        fi
+      done
+    fi
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+      cat <<USAGE
+Usage: ./firewall [optional:/path/to/envfile]
+
+This script will:
+  1) Load MERAKI_API_KEY from the given env (or auto-detected one).
+  2) Determine the Meraki Organization ID from:
+       - MERAKI_ORG_ID (if already set), or
+       - meraki_switch_network_map.env, or
+       - meraki_switch_network_map.json (first networkId → /networks/{id}).
+  3) Call /organizations/{orgId} to learn the Dashboard URL / shard.
+  4) Build the "Firewall info" page URL for that org.
+  5) Write firewall_info.txt under runs/migration (latest run if present),
+     then:
+       - show a dialog explaining what it found and where it wrote it,
+       - drop back to CLI with a clickable URL and wait for ENTER.
+USAGE
+      exit 0
+    fi
+
+    if [[ -z "$ENV_FILE" ]]; then
+      dlg_msgbox "Could not find an ENV-like file with MERAKI_API_KEY in:\n  $SCRIPT_DIR\n\nPass a path as argument or create meraki_discovery.env / meraki.env." 13 80
+      exit 1
+    fi
+
+    # ------------------------------------------------------------
+    # Load API key
+    # ------------------------------------------------------------
+    set +H  # no history expansion on !
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    : "${MERAKI_API_KEY:?MERAKI_API_KEY is not set in $ENV_FILE}"
+
+    MERAKI_API_KEY="$(printf '%s' "$MERAKI_API_KEY" | tr -d '\r' | awk '{$1=$1;print}')"
+
+    # ------------------------------------------------------------
+    # Determine ORG ID
+    #   1) MERAKI_ORG_ID already in env?
+    #   2) meraki_switch_network_map.env
+    #   3) meraki_switch_network_map.json (first networkId -> /networks/{id})
+    # ------------------------------------------------------------
+    ORG_ID="${MERAKI_ORG_ID:-}"
+
+    MAP_ENV="$SCRIPT_DIR/meraki_switch_network_map.env"
+    MAP_JSON="$SCRIPT_DIR/meraki_switch_network_map.json"
+
+    if [[ -z "$ORG_ID" && -f "$MAP_ENV" ]]; then
+      # shellcheck disable=SC1090
+      source "$MAP_ENV"
+      ORG_ID="${MERAKI_ORG_ID:-$ORG_ID}"
+    fi
+
+    API_BASE="https://api.meraki.com/api/v1"
+
+    TMPDIR="$(mktemp -d)"
+    trap '[[ -d "$TMPDIR" ]] && rm -rf "$TMPDIR"' EXIT
+
+    _meraki_call() {
+      local method="$1" url="$2"
+      local hdr="$TMPDIR/hdr" body="$TMPDIR/body" code mode
+
+      for mode in bearer x-cisco; do
+        if [[ "$mode" == "bearer" ]]; then
+          code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer $MERAKI_API_KEY" \
+            -X "$method" "$url")"
+        else
+          code="$(curl -sS -D "$hdr" -o "$body" -w '%{http_code}' \
+            -H "Accept: application/json" \
+            -H "X-Cisco-Meraki-API-Key: $MERAKI_API_KEY" \
+            -X "$method" "$url")"
+        fi
+
+        if [[ "$code" == "429" ]]; then
+          local wait
+          wait="$(awk '/^Retry-After:/ {print $2}' "$hdr" | tr -d '\r')"
+          [[ -z "$wait" ]] && wait=1
+          sleep "$wait"
+          continue
+        fi
+
+        if [[ "$code" =~ ^20[01]$ ]]; then
+          cat "$body"
+          return 0
+        fi
+      done
+
+      echo "Meraki API error ($code) for $url" >&2
+      return 1
+    }
+
+    if [[ -z "$ORG_ID" && -s "$MAP_JSON" ]]; then
+      first_net="$(jq -r '.[0].networkId // empty' "$MAP_JSON")"
+      if [[ -n "$first_net" ]]; then
+        net_json="$(_meraki_call GET "$API_BASE/networks/$first_net")" || {
+          dlg_msgbox "Failed to query Meraki network ${first_net} to infer orgId." 10 80
+          exit 1
+        }
+        ORG_ID="$(jq -r '.organizationId // empty' <<<"$net_json")"
+      fi
+    fi
+
+    if [[ -z "$ORG_ID" ]]; then
+      dlg_msgbox "Could not determine MERAKI_ORG_ID.\n\nExpected one of:\n  - MERAKI_ORG_ID already set in your env\n  - $MAP_ENV (from switch mapping)\n  - $MAP_JSON with at least one mapped network" 14 80
+      exit 1
+    fi
+
+    # ------------------------------------------------------------
+    # Fetch organization and build Firewall info URL
+    # ------------------------------------------------------------
+    org_json="$(_meraki_call GET "$API_BASE/organizations/$ORG_ID")" || {
+      dlg_msgbox "Failed to fetch organization ${ORG_ID} from Meraki API." 10 80
+      exit 1
+    }
+
+    ORG_NAME="$(jq -r '.name // ""' <<<"$org_json")"
+    ORG_URL="$(jq -r '.url  // ""' <<<"$org_json")"
+
+    base_url="https://dashboard.meraki.com"
+    if [[ "$ORG_URL" =~ ^https?://[^/]+ ]]; then
+      base_url="${BASH_REMATCH[0]}"
+    fi
+    host="${base_url#*://}"
+
+    FWINFO_URL="${base_url}/manage/support/firewall_configuration"
+
+    # ------------------------------------------------------------
+    # Decide where to write firewall_info.txt
+    #   Prefer: runs/migration/latest.env → MIGRATION_RUN_DIR
+    # ------------------------------------------------------------
+    RUN_ROOT="$SCRIPT_DIR/runs/migration"
+    mkdir -p "$RUN_ROOT"
+
+    FW_OUT=""
+    if [[ -f "$RUN_ROOT/latest.env" ]]; then
+      # shellcheck disable=SC1090
+      source "$RUN_ROOT/latest.env" || true
+      if [[ -n "${MIGRATION_RUN_DIR:-}" ]]; then
+        FW_OUT="$MIGRATION_RUN_DIR/firewall_info.txt"
+      fi
+    fi
+
+    if [[ -z "$FW_OUT" ]]; then
+      FW_OUT="$RUN_ROOT/firewall_info-$(date -u +%Y%m%d%H%M%S).txt"
+    fi
+
+    cat >"$FW_OUT" <<EOF
+Meraki upstream firewall information
+====================================
+
+Organization:  ${ORG_NAME:-<unknown>} (${ORG_ID})
+Dashboard URL: ${ORG_URL:-<unknown>}
+Shard host:    ${host}
+
+Firewall info page for this org:
+  ${FWINFO_URL}
+
+How to view it:
+  1. Open a browser and log into the Meraki Dashboard.
+  2. Go to:  Help → Firewall info
+     (or paste the URL above into your browser once logged in.)
+
+NOTE:
+  The full, authoritative list of IP ranges and ports is ONLY on
+  the Dashboard "Firewall info" page. The public API does not
+  expose that table directly.
+EOF
+
+    # ------------------------------------------------------------
+    # Dialog explanation (nice UX), then drop back to CLI
+    # ------------------------------------------------------------
+    MSG=$'Meraki upstream firewall requirements for switches\n\n'"Organization:  ${ORG_NAME:-<unknown>} (${ORG_ID})"\
+$'\n\nWhat this step did:\n'\
+$'  • Determined your Meraki Dashboard organization and shard\n'\
+$'  • Built the URL of the “Firewall info” page for this org\n'\
+$'  • Saved a helper text file with those details:\n\n'"  $FW_OUT"\
+$'\n\nHow the traffic flows:\n'\
+$'  • All Meraki cloud communication from switches is OUTBOUND\n'\
+$'    from your network toward the Meraki cloud.\n'\
+$'  • On a normal stateful firewall, return traffic for those\n'\
+$'    outbound sessions is automatically allowed.\n'\
+$'  • You do NOT need inbound pinholes, port forwards, or static\n'\
+$'    inbound rules for Meraki switch cloud management.\n'\
+$'\nFor Meraki switches (MS and Cloud-Monitored Catalyst), make sure\n'\
+$'your firewall allows outbound (egress) traffic from the switch\n'\
+$'management VLANs/subnets to the Internet on at least:\n'\
+$'\n'\
+$'  • UDP 7351 and UDP 9350–9381 (outbound)\n'\
+$'      - Primary Meraki cloud control channels and VPN registry\n'\
+$'\n'\
+$'  • TCP 443 (outbound)\n'\
+$'      - Dashboard/API communication and Cloud Monitoring for\n'\
+$'        Catalyst switches\n'\
+$'\n'\
+$'  • UDP 123 (outbound)\n'\
+$'      - NTP time synchronization to Internet time servers\n'\
+$'\n'\
+$'  • DNS (UDP/TCP 53, outbound)\n'\
+$'      - Name resolution for Meraki cloud FQDNs\n'\
+$'\nDepending on your configuration and the Dashboard “Firewall info”\n'\
+$'CSV for your org, you may also see additional switch-related\n'\
+$'entries, for example:\n'\
+$'\n'\
+$'  • Outbound TCP/UDP ports from switches to on-prem services\n'\
+$'    such as RADIUS, syslog, SNMP managers, or other tools.\n'\
+$'\nThe full, authoritative list of IP ranges and ports — including\n'\
+$'any extra switch-specific rows for your shard/region — is only\n'\
+$'shown on the Dashboard “Firewall info” page.\n'\
+$'\nAfter you press Continue, this script will return to the terminal\n'\
+$'and show a clickable URL for that page so you can compare the\n'\
+$'Dashboard firewall requirements with your own firewall policy.\n'
+
+    dlg_msgbox "$MSG" 55 96
+
+    # ------------------------------------------------------------
+    # CLI: show clickable URL and pause until user is ready
+    # ------------------------------------------------------------
+    clear
+    echo
+    echo "===================================================="
+    echo " Meraki Firewall Requirements – Dashboard Link"
+    echo "===================================================="
+    echo
+    echo "Organization:  ${ORG_NAME:-<unknown>} (${ORG_ID})"
+    echo "Dashboard URL: ${ORG_URL:-<unknown>}"
+    echo
+    echo "Firewall info page for this organization:"
+    echo "  ${FWINFO_URL}"
+    echo
+    echo "Open that URL in your browser (most terminals let you"
+    echo "Ctrl+Click or Cmd+Click the link above)."
+    echo
+    read -r -p "Press ENTER after you've reviewed the Dashboard firewall info to continue... " _
+    echo
+  )
+  return $?
+}
+
+
+
 # ------------------------------------------------------------
-# Wrapper: run validation, then Meraki network mapping
+# 3) Enable & verify "service meraki connect" on switches
+#    (parallel: up to 10 at a time, with 3x 15s retries)
 # ------------------------------------------------------------
-run_validate_and_map() {
-  # Run validation in a relaxed subshell so any strict options (-e/-u/pipefail)
-  # can't kill the whole script before we get to the mapping step.
+onboard_meraki_connect_switches() {
+  local BACKTITLE_C="Meraki Cloud Monitoring – enable & verify connectivity"
+
+  # Relax strict mode inside this function so a failing jq/SSH parse
+  # does not kill the whole script.
+  set +e
+  set +u
+  set +o pipefail
+
+  local DISC_ENV="$SCRIPT_DIR/meraki_discovery.env"
+  local VALIDATED_JSON="$SCRIPT_DIR/validated_ips.json"
+  local VAL_ENV="$SCRIPT_DIR/validated_switches.env"
+  local DISC_JSON="$SCRIPT_DIR/discovery_results.json"
+  local DISC_CSV="$SCRIPT_DIR/discovery_results.csv"
+  local MAP_JSON="$SCRIPT_DIR/meraki_switch_network_map.json"
+
+  need ping || return 1
+  need ssh  || return 1
+  need jq   || return 1
+
+  # ---------- SSH creds ----------
+  if [[ -f "$DISC_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$DISC_ENV"
+  fi
+  local SSH_USER="${SSH_USERNAME:-}"
+  local SSH_PASS="${SSH_PASSWORD:-}"
+
+  if [[ -z "$SSH_USER" ]]; then
+    dlg --backtitle "$BACKTITLE_C" \
+        --title "Missing SSH username" \
+        --msgbox "SSH_USERNAME is not set in meraki_discovery.env.\n\nCannot onboard switches." 10 70
+    return 1
+  fi
+
+  # ---------- load validated IPs ----------
+  local -a IPS=()
+
+  if [[ -f "$VAL_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$VAL_ENV"
+    if [[ -n "${VALIDATED_SWITCH_IPS:-}" ]]; then
+      read -r -a IPS <<<"$VALIDATED_SWITCH_IPS"
+    fi
+  fi
+
+  if (( ${#IPS[@]} == 0 )) && [[ -s "$VALIDATED_JSON" ]]; then
+    mapfile -t IPS < <(jq -r '.[].ip' "$VALIDATED_JSON" 2>/dev/null)
+  fi
+
+  if (( ${#IPS[@]} == 0 )); then
+    dlg --backtitle "$BACKTITLE_C" \
+        --title "No validated switches" \
+        --msgbox "No validated switch list found.\n\nRun the connectivity/IOS-XE validation step first." 11 80
+    return 1
+  fi
+
+  # ---------- optional: map IP -> hostname from discovery ----------
+  local -a HOSTS=()
+  if [[ -s "$DISC_JSON" ]]; then
+    declare -A HMAP
+    while IFS=$'\t' read -r ip h; do
+      HMAP["$ip"]="$h"
+    done < <(jq -r '.[] | "\(.ip)\t\(.hostname // "")"' "$DISC_JSON")
+
+    for ip in "${IPS[@]}"; do
+      HOSTS+=( "${HMAP[$ip]:-}" )
+    done
+  elif [[ -s "$DISC_CSV" ]]; then
+    declare -A HMAP
+    local ip ssh login hostname version pid serial
+    local first=1
+    while IFS=, read -r ip ssh login hostname version pid serial; do
+      if (( first )); then first=0; continue; fi
+      ip="${ip%\"}"; ip="${ip#\"}"
+      hostname="${hostname%\"}"; hostname="${hostname#\"}"
+      HMAP["$ip"]="$hostname"
+    done < "$DISC_CSV"
+    for ip in "${IPS[@]}"; do
+      HOSTS+=( "${HMAP[$ip]:-}" )
+    done
+  else
+    for _ in "${IPS[@]}"; do HOSTS+=(""); done
+  fi
+
+  # ---------- checklist: which validated switches to onboard ----------
+  local -a items=()
+  for i in "${!IPS[@]}"; do
+    local ip="${IPS[$i]}"
+    local h="${HOSTS[$i]:-<unknown>}"
+    local label
+    printf -v label "%-15s %-32s" "$ip" "$h"
+    items+=( "$ip" "$label" "on" )
+  done
+
+  local selection
+  selection="$(dlg --separate-output \
+                   --backtitle "$BACKTITLE_C" \
+                   --title "Select switches to onboard" \
+                   --checklist "These switches previously passed validation.\nSelect which ones you want to enable Meraki connect on.\nUse SPACE to toggle, ENTER when done." \
+                   22 100 14 \
+                   "${items[@]}")" || return 1
+
+  selection="$(trim "$selection")"
+  if [[ -z "$selection" ]]; then
+    dlg --backtitle "$BACKTITLE_C" \
+        --title "No switches selected" \
+        --msgbox "No switches were selected for Meraki connect onboarding.\n\nNothing to do." 10 70
+    return 1
+  fi
+
+  mapfile -t IPS <<<"$selection"
+
+  # ---------- reuse / create runs/migration structure ----------
+  local RUN_ROOT="$SCRIPT_DIR/runs/migration"
+  mkdir -p "$RUN_ROOT"
+
+  local RUN_DIR=""
+  if [[ -n "${MIGRATION_RUN_DIR:-}" && -d "${MIGRATION_RUN_DIR:-}" ]]; then
+    RUN_DIR="$MIGRATION_RUN_DIR"
+  elif [[ -f "$RUN_ROOT/latest.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$RUN_ROOT/latest.env" || true
+    if [[ -n "${MIGRATION_RUN_DIR:-}" && -d "${MIGRATION_RUN_DIR:-}" ]]; then
+      RUN_DIR="$MIGRATION_RUN_DIR"
+    fi
+  fi
+
+  if [[ -z "$RUN_DIR" ]]; then
+    local RUN_ID="run-$(date -u +%Y%m%d%H%M%S)"
+    RUN_DIR="$RUN_ROOT/$RUN_ID"
+    mkdir -p "$RUN_DIR"
+    local SUMMARY_CSV_PLACEHOLDER="$RUN_DIR/summary.csv"
+    touch "$SUMMARY_CSV_PLACEHOLDER"
+    export MIGRATION_RUN_ID="$RUN_ID"
+    export MIGRATION_RUN_DIR="$RUN_DIR"
+    export MIGRATION_SUMMARY="$SUMMARY_CSV_PLACEHOLDER"
+    {
+      printf 'export MIGRATION_RUN_ID=%q\n' "$MIGRATION_RUN_ID"
+      printf 'export MIGRATION_RUN_DIR=%q\n' "$MIGRATION_RUN_DIR"
+      printf 'export MIGRATION_SUMMARY=%q\n' "$MIGRATION_SUMMARY"
+    } >"$RUN_ROOT/latest.env"
+    ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
+  fi
+
+  mkdir -p "$RUN_DIR/devlogs"
+
+  local SUMMARY_CSV="$RUN_DIR/meraki_connect_summary.csv"
+  echo "ip,hostname,service_enabled,config_fetch_ok,primary_tunnel,secondary_tunnel,registered,cloud_id,ready,notes" > "$SUMMARY_CSV"
+
+  # ---------- split-screen UI ----------
+  VALIDATE_STATUS_FILE="$RUN_DIR/meraki_connect_ui.status"
+  : >"$VALIDATE_STATUS_FILE"
+  validate_ui_start
+  validate_ui_status "Running 'service meraki connect' and 'show meraki connect' on selected switches…"
+
+  local total=${#IPS[@]}
+
+  local have_sshpass=0
+  if command -v sshpass >/dev/null 2>&1 && [[ -n "$SSH_PASS" ]]; then
+    have_sshpass=1
+  fi
+
+  # ---------- per-switch worker ----------
+  _onboard_one_switch_meraki() {
+    local ip="$1" host="$2"
+
+    local ping_ok="no"
+    local svc_enabled="no"
+    local fetch_ok="no"
+    local primary="down"
+    local secondary="down"
+    local registered="no"
+    local cloud_id=""
+
+    local -a reasons=()
+
+    local ping_log="$RUN_DIR/devlogs/${ip}.meraki_connect.ping.log"
+    local ssh_log_tmp="$RUN_DIR/devlogs/${ip}.meraki_connect.tmp"
+    local ssh_log="$RUN_DIR/devlogs/${ip}.meraki_connect.log"
+
+    validate_ui_status "[$ip] Pinging (3 probes)…"
+    if ping -c 3 -W 2 "$ip" >"$ping_log" 2>&1; then
+      ping_ok="yes"
+      validate_ui_status "[$ip] Ping OK; enabling Meraki connect via SSH…"
+    else
+      ping_ok="no"
+      reasons+=( "ping_failed" )
+      validate_ui_status "[$ip] Ping FAILED."
+    fi
+
+    if [[ "$ping_ok" == "yes" ]]; then
+      local ssh_cmd
+      if (( have_sshpass )); then
+        ssh_cmd=(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 -o ConnectTimeout=30 -o BatchMode=no -tt "${SSH_USER}@${ip}")
+      else
+        ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 -o ConnectTimeout=30 -tt "${SSH_USER}@${ip}")
+      fi
+
+      # First: enable service in global config + immediate show
+      {
+        printf '\r\nterminal length 0\r\nterminal width 511\r\n'
+        printf 'configure terminal\r\n'
+        printf 'service meraki connect\r\n'
+        printf 'end\r\n'
+        printf 'show meraki connect\r\n'
+        printf 'exit\r\n'
+      } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
+
+      tr -d '\r' <"$ssh_log_tmp" >"$ssh_log"
+      rm -f "$ssh_log_tmp" 2>/dev/null || true
+
+      # hostname from prompt if possible
+      local h_probe
+      h_probe="$(awk 'match($0,/^([[:alnum:]_.:-]+)[>#][[:space:]]*$/,m){print m[1]; exit}' "$ssh_log")"
+      if [[ -n "$h_probe" ]]; then
+        host="$h_probe"
+      fi
+
+      # Check that service is enabled (from the first session)
+      if grep -qi 'Service[[:space:]]\+meraki[[:space:]]\+connect:[[:space:]]*enable' "$ssh_log"; then
+        svc_enabled="yes"
+      else
+        reasons+=( "service_not_enabled" )
+      fi
+
+      # Now: up to 3 attempts to see tunnels up / registered / cloud ID
+      local attempt state_log
+      for attempt in 1 2 3; do
+        if (( attempt == 1 )); then
+          state_log="$ssh_log"
+        else
+          state_log="$RUN_DIR/devlogs/${ip}.meraki_connect.state${attempt}.log"
+          validate_ui_status "[$ip] Meraki connect not fully up yet (attempt $((attempt-1))/3); waiting 15s then re-checking…"
+          sleep 15
+          {
+            printf '\r\nterminal length 0\r\nterminal width 511\r\n'
+            printf 'show meraki connect\r\n'
+            printf 'exit\r\n'
+          } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
+          tr -d '\r' <"$ssh_log_tmp" >"$state_log"
+          rm -f "$ssh_log_tmp" 2>/dev/null || true
+        fi
+
+        # Reset values before parsing this attempt
+        fetch_ok="no"
+        primary="down"
+        secondary="down"
+        registered="no"
+        cloud_id=""
+
+        # Fetch State line (Config fetch succeeded)
+        local fetch_line
+        fetch_line="$(awk -F':' '/Fetch State/ {print $2; exit}' "$state_log" 2>/dev/null || true)"
+        fetch_line="$(echo "$fetch_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+        if [[ "$fetch_line" == *"succeeded"* ]]; then
+          fetch_ok="yes"
+        fi
+
+        # Tunnel state: only in "Meraki Tunnel State" section of *this* log
+        local primary_state secondary_state
+        primary_state="$(awk '
+          /Meraki Tunnel State/ {ctx=1; next}
+          ctx && /Meraki Tunnel Interface/ {ctx=0; exit}
+          ctx && /Primary:/ {sub(/.*:/,""); gsub(/^[ \t]+/,""); print; exit}
+        ' "$state_log" 2>/dev/null || true)"
+        secondary_state="$(awk '
+          /Meraki Tunnel State/ {ctx=1; next}
+          ctx && /Meraki Tunnel Interface/ {ctx=0; exit}
+          ctx && /Secondary:/ {sub(/.*:/,""); gsub(/^[ \t]+/,""); print; exit}
+        ' "$state_log" 2>/dev/null || true)"
+
+        primary_state="$(echo "$primary_state" | sed -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+        secondary_state="$(echo "$secondary_state" | sed -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+
+        [[ "$primary_state" == "up" ]] && primary="up"
+        [[ "$secondary_state" == "up" ]] && secondary="up"
+
+        # Device Registration section
+        local reg_status
+        reg_status="$(awk '
+          /Meraki Device Registration/ {ctx=1; next}
+          ctx && /^Meraki/ {ctx=0; exit}
+          ctx && /Status:/ {sub(/.*:/,""); gsub(/^[ \t]+/,""); print; exit}
+        ' "$state_log" 2>/dev/null || true)"
+        reg_status="$(echo "$reg_status" | sed -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+
+        [[ "$reg_status" == "registered" ]] && registered="yes"
+
+        cloud_id="$(awk '
+          /Meraki Device Registration/ {ctx=1; next}
+          ctx && /^Meraki/ {ctx=0; exit}
+          ctx && /Cloud ID:/ {sub(/.*:/,""); gsub(/^[ \t]+/,""); print; exit}
+        ' "$state_log" 2>/dev/null || true)"
+        cloud_id="$(echo "$cloud_id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+        # If everything critical is now good, we can stop retrying
+        if [[ "$fetch_ok" == "yes" && "$primary" == "up" && "$secondary" == "up" && "$registered" == "yes" && -n "$cloud_id" ]]; then
+          break
+        fi
+      done
+
+      # After all attempts, record missing pieces as reasons
+      [[ "$fetch_ok" != "yes" ]]      && reasons+=( "config_fetch_not_succeeded" )
+      [[ "$primary" != "up" ]]        && reasons+=( "primary_tunnel_not_up" )
+      [[ "$secondary" != "up" ]]      && reasons+=( "secondary_tunnel_not_up" )
+      [[ "$registered" != "yes" ]]    && reasons+=( "not_registered" )
+      [[ -z "$cloud_id" ]]            && reasons+=( "cloud_id_missing" )
+    fi
+
+    local ready="yes"
+    if [[ "$ping_ok" != "yes" ]]; then ready="no"; fi
+    if [[ "$svc_enabled" != "yes" ]]; then ready="no"; fi
+    if [[ "$fetch_ok" != "yes" ]]; then ready="no"; fi
+    if [[ "$primary" != "up" ]]; then ready="no"; fi
+    if [[ "$secondary" != "up" ]]; then ready="no"; fi
+    if [[ "$registered" != "yes" ]]; then ready="no"; fi
+    if [[ -z "$cloud_id" ]]; then ready="no"; fi
+
+    local notes=""
+    if ((${#reasons[@]})); then
+      notes="$(IFS=';'; printf '%s' "${reasons[*]}")"
+    fi
+
+    if [[ "$ready" == "yes" ]]; then
+      validate_ui_status "[$ip] Meraki connect READY (tunnels up, registered, Cloud ID: ${cloud_id})."
+    else
+      validate_ui_status "[$ip] Meraki connect NOT ready: ${notes:-see logs}."
+    fi
+
+    local csv_file="$RUN_DIR/devlogs/meraki_connect_${ip//./_}.line"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+      "$ip" "${host:-$ip}" \
+      "$svc_enabled" "$fetch_ok" "$primary" "$secondary" \
+      "$registered" "$cloud_id" "$ready" "$notes" >"$csv_file"
+  }
+
+  # ---------- launch workers in parallel (max 10 at a time) ----------
+  local max_parallel=10
+  local ACTIVE=0 DONE=0
+
+  validate_ui_gauge 1 "Starting Meraki connect onboarding… (up to ${max_parallel} in parallel)"
+
+  for i in "${!IPS[@]}"; do
+    local ip="${IPS[$i]}"
+    local host="${HOSTS[$i]:-$ip}"
+
+    _onboard_one_switch_meraki "$ip" "$host" &
+
+    ((ACTIVE++))
+    if (( ACTIVE >= max_parallel )); then
+      if wait -n 2>/dev/null; then :; fi
+      ((DONE++))
+      validate_ui_gauge $(( 100 * DONE / total )) "Completed $DONE / $total…"
+      ((ACTIVE--))
+    fi
+  done
+
+  while (( DONE < total )); do
+    if wait -n 2>/dev/null; then :; fi
+    ((DONE++))
+    validate_ui_gauge $(( 100 * DONE / total )) "Completed $DONE / $total…"
+  done
+
+  # ---------- assemble summary CSV ----------
+  for ip in "${IPS[@]}"; do
+    local line_file="$RUN_DIR/devlogs/meraki_connect_${ip//./_}.line"
+    [[ -f "$line_file" ]] && cat "$line_file" >>"$SUMMARY_CSV"
+  done
+
+  validate_ui_gauge 100 "Meraki connect onboarding complete."
+  validate_ui_stop
+
+  # ---------- build JSON of ready Cloud IDs + summary text ----------
+  local -a READY_IPS NOT_READY_IPS
+  local CLOUD_JSON="$RUN_DIR/meraki_cloud_ids.json"
+  local summary="$RUN_DIR/meraki_connect_summary.txt"
+
+  {
+    echo "Meraki connect onboarding summary"
+    echo "================================"
+    echo
+    echo "Run directory:"
+    echo "  $RUN_DIR"
+    echo
+    echo "Switch Meraki connect state:"
+    echo
+    printf "%-16s %-22s %-8s %-8s %-8s %-10s %-12s %-18s\n" \
+      "IP" "Hostname" "Svc" "Fetch" "Prim" "Sec" "Reg" "Cloud ID"
+    printf "%-16s %-22s %-8s %-8s %-8s %-10s %-12s %-18s\n" \
+      "----------------" "----------------------" "----" "----" "----" "--------" "--------" "------------------"
+
+    local first=1
+    local ip hostname svc fetch primary secondary reg cloud ready notes
+
+    while IFS=, read -r ip hostname svc fetch primary secondary reg cloud ready notes; do
+      if (( first )); then first=0; continue; fi
+
+      ip="${ip%\"}";        ip="${ip#\"}"
+      hostname="${hostname%\"}"; hostname="${hostname#\"}"
+      cloud="${cloud%\"}"; cloud="${cloud#\"}"
+      ready="${ready%\"}"; ready="${ready#\"}"
+
+      printf "%-16s %-22s %-8s %-8s %-8s %-10s %-12s %-18s\n" \
+        "$ip" "${hostname:-<unknown>}" \
+        "$svc" "$fetch" "$primary" "$secondary" "$reg" \
+        "${cloud:-<none>}"
+
+      if [[ "$ready" == "yes" ]]; then
+        READY_IPS+=( "$ip" )
+      else
+        NOT_READY_IPS+=( "$ip" )
+      fi
+    done <"$SUMMARY_CSV"
+
+    echo
+    if ((${#READY_IPS[@]})); then
+      echo "Switches that are READY for Dashboard onboarding (tunnels up, registered, Cloud ID present):"
+      for ip in "${READY_IPS[@]}"; do
+        echo "  - $ip"
+      done
+      echo
+    fi
+
+    if ((${#NOT_READY_IPS[@]})); then
+      echo "Switches that are NOT yet ready (check individual logs under devlogs/):"
+      for ip in "${NOT_READY_IPS[@]}"; do
+        echo "  - $ip"
+      done
+      echo
+    fi
+
+    echo "Cloud IDs for READY switches are also exported to:"
+    echo "  $CLOUD_JSON"
+    echo
+
+    if [[ -s "$MAP_JSON" ]]; then
+      echo "Switch-to-network mapping file (updated with cloudId where available):"
+      echo "  $MAP_JSON"
+      echo
+    fi
+  } >"$summary"
+
+  {
+    echo '['
+    local first=1
+    local header=1
+    local ip hostname svc fetch primary secondary reg cloud ready notes
+
+    while IFS=, read -r ip hostname svc fetch primary secondary reg cloud ready notes; do
+      if (( header )); then header=0; continue; fi
+
+      ip="${ip%\"}";        ip="${ip#\"}"
+      hostname="${hostname%\"}"; hostname="${hostname#\"}"
+      cloud="${cloud%\"}"; cloud="${cloud#\"}"
+      ready="${ready%\"}"; ready="${ready#\"}"
+
+      if [[ "$ready" != "yes" || -z "$cloud" ]]; then
+        continue
+      fi
+
+      if (( first )); then
+        first=0
+      else
+        echo ','
+      fi
+
+      printf '  {"ip": "%s", "hostname": "%s", "cloudId": "%s"}' \
+        "$ip" "${hostname:-}" "$cloud"
+    done <"$SUMMARY_CSV"
+    echo
+    echo ']'
+  } >"$CLOUD_JSON"
+
+  ln -sfn "$CLOUD_JSON" "$RUN_ROOT/latest_cloud_ids.json"
+
+  # ---------- inject cloudId into meraki_switch_network_map.json, if present ----------
+if [[ -s "$MAP_JSON" && -s "$CLOUD_JSON" ]]; then
+  validate_ui_status "Injecting Cloud IDs into $MAP_JSON (if any)…"
+  local tmp_map="$RUN_DIR/meraki_switch_network_map.with_cloud.tmp"
+
+  # Read both files at once:
+  # .[0] = switch map JSON
+  # .[1] = cloud IDs JSON
+  if jq -s '
+    . as [$map, $cloud]
+    | $map
+    | map(
+        . as $d
+        | ($cloud[] | select(.ip == $d.ip) | .cloudId) as $cid
+        | if $cid then . + {cloudId:$cid} else . end
+      )
+  ' "$MAP_JSON" "$CLOUD_JSON" >"$tmp_map" 2>"$RUN_DIR/devlogs/meraki_connect_jq.log"; then
+    # Use "command mv" to bypass any shell alias (mv -i etc.)
+    command mv "$tmp_map" "$MAP_JSON"
+  else
+    validate_ui_status "Failed to inject Cloud IDs into $MAP_JSON (see devlogs/meraki_connect_jq.log)."
+    rm -f "$tmp_map" 2>/dev/null || true
+  fi
+fi
+
+  dlg --backtitle "$BACKTITLE_C" \
+      --title "Meraki connect onboarding summary" \
+      --textbox "$summary" 24 100 || true
+
+    # Restore strict mode for the rest of the script
+  set -e
+  set -u
+  set -o pipefail
+
+  return 0
+}
+
+meraki_claim_cloud_monitored_switches() {
+  local BACKTITLE_CL="Meraki Dashboard claim – Cloud-Monitored Catalyst switches"
+
+  local MAP_JSON="$SCRIPT_DIR/meraki_switch_network_map.json"
+  local DISC_ENV="$SCRIPT_DIR/meraki_discovery.env"
+  local API_BASE="https://api.meraki.com/api/v1"
+
+  need curl || return 1
+  need jq   || return 1
+  need base64 || return 1
+
+  if [[ ! -s "$MAP_JSON" ]]; then
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "No mapping file" \
+        --msgbox "Switch→network mapping file not found or empty:\n  $MAP_JSON\n\nRun the Meraki mapping/onboarding steps first." 12 80
+    return 1
+  fi
+
+  if [[ ! -f "$DISC_ENV" ]]; then
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "ENV not found" \
+        --msgbox "Discovery env file with MERAKI_API_KEY not found:\n  $DISC_ENV" 10 80
+    return 1
+  fi
+
+  # ----- load API key + SSH creds -----
+  set +H
+  # shellcheck disable=SC1090
+  source "$DISC_ENV"
+  : "${MERAKI_API_KEY:?MERAKI_API_KEY is not set in $DISC_ENV}"
+  local SSH_USER="${SSH_USERNAME:-}"
+  local SSH_PASS="${SSH_PASSWORD:-}"
+  local ENABLE_PASS="${ENABLE_PASSWORD:-}"
+
+  if [[ -z "$SSH_USER" || -z "$SSH_PASS" || -z "$ENABLE_PASS" ]]; then
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "Missing credentials" \
+        --msgbox "SSH_USERNAME, SSH_PASSWORD, or ENABLE_PASSWORD is missing in:\n  $DISC_ENV\n\nThese are required to claim switches in MONITORED mode." 14 80
+    return 1
+  fi
+
+  # ----- build list of devices (base64 rows) from MAP_JSON -----
+  # Each row (after base64-decode) is:
+  #   [ ip, hostname, networkId, networkName, cloudId, networkAddress ]
+  local -a DEV_ROWS_B64=()
+  mapfile -t DEV_ROWS_B64 < <(
+    jq -r '
+      .[]
+      | select(.cloudId != null and .cloudId != "" and .networkId != null and .networkId != "")
+      | [ .ip,
+          (.hostname // ""),
+          .networkId,
+          (.networkName // ""),
+          .cloudId,
+          (.networkAddress // "")
+        ]
+      | @base64
+    ' "$MAP_JSON"
+  )
+
+  if (( ${#DEV_ROWS_B64[@]} == 0 )); then
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "Nothing to claim" \
+        --msgbox "No switches in $MAP_JSON have both a Meraki Cloud ID and a target networkId.\n\nRun Meraki connect + mapping again before claiming." 13 80
+    return 1
+  fi
+
+  # helper: extract field N from a base64-encoded JSON array row
+  _row_field() {
+    local row_b64="$1" idx="$2"
+    echo "$row_b64" | base64 -d 2>/dev/null | jq -r ".[$idx]"
+  }
+
+  # ----- show pre-claim summary -----
+  local tmp_summary
+  tmp_summary="$(mktemp)"
+  {
+    echo "Cloud-Monitored Catalyst switches ready to be claimed"
+    echo "====================================================="
+    echo
+    printf "%-16s %-22s %-18s %-12s %-18s %s\n" \
+      "IP" "Hostname" "Network" "Net ID" "Cloud ID" "Address"
+    printf "%-16s %-22s %-18s %-12s %-18s %s\n" \
+      "----------------" "----------------------" "------------------" "------------" "------------------" "------------------------------"
+
+    local row ip host nid nname cid addr
+    for row in "${DEV_ROWS_B64[@]}"; do
+      ip="$(_row_field "$row" 0)"
+      host="$(_row_field "$row" 1)"
+      nid="$(_row_field "$row" 2)"
+      nname="$(_row_field "$row" 3)"
+      cid="$(_row_field "$row" 4)"
+      addr="$(_row_field "$row" 5)"
+
+      printf "%-16s %-22s %-18s %-12s %-18s %s\n" \
+        "$ip" "${host:-<unknown>}" "${nname:-<none>}" "$nid" "$cid" "${addr:-<none>}"
+    done
+  } >"$tmp_summary"
+
+  dlg --backtitle "$BACKTITLE_CL" \
+      --title "Switches to claim" \
+      --textbox "$tmp_summary" 22 110 || true
+
+  if ! dlg --backtitle "$BACKTITLE_CL" \
+           --title "Confirm claim" \
+           --yesno "Proceed to claim these Cloud-Monitored Catalyst switches into Meraki Dashboard in MONITORED mode?" 10 80; then
+    rm -f "$tmp_summary" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$tmp_summary" 2>/dev/null || true
+
+  # ----- pick / reuse run directory for logs -----
+  local RUN_ROOT="$SCRIPT_DIR/runs/migration"
+  mkdir -p "$RUN_ROOT"
+  local RUN_DIR=""
+  if [[ -n "${MIGRATION_RUN_DIR:-}" && -d "${MIGRATION_RUN_DIR:-}" ]]; then
+    RUN_DIR="$MIGRATION_RUN_DIR"
+  elif [[ -f "$RUN_ROOT/latest.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$RUN_ROOT/latest.env" || true
+    if [[ -n "${MIGRATION_RUN_DIR:-}" && -d "${MIGRATION_RUN_DIR:-}" ]]; then
+      RUN_DIR="$MIGRATION_RUN_DIR"
+    fi
+  fi
+  if [[ -z "$RUN_DIR" ]]; then
+    RUN_DIR="$RUN_ROOT/claim-$(date -u +%Y%m%d%H%M%S)"
+    mkdir -p "$RUN_DIR"
+  fi
+
+  local CLAIM_LOG="$RUN_DIR/meraki_claim.log"
+  : >"$CLAIM_LOG"
+  ln -sfn "$CLAIM_LOG" "$SCRIPT_DIR/meraki_claim.log"
+
+  # ----- temp dir for API -----
+  local TMPDIR
+  TMPDIR="$(mktemp -d)"
+
+  # clean up temp on function exit
+  trap '[[ -d "$TMPDIR" ]] && rm -rf "$TMPDIR"' RETURN
+
+  # ----- tiny Meraki API helper (Bearer → X-Cisco fallback, 429 handling) -----
+  _claim_call() {
+    local method="$1" path="$2" body="$3"
+    local hdr="$TMPDIR/hdr.$$" bodyf="$TMPDIR/body.$$"
+    local code mode
+
+    for mode in bearer x-cisco; do
+      while :; do
+        if [[ "$mode" == "bearer" ]]; then
+          code="$(curl -sS -D "$hdr" -o "$bodyf" -w '%{http_code}' \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer $MERAKI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -X "$method" "$API_BASE$path" \
+            --data "$body")"
+        else
+          code="$(curl -sS -D "$hdr" -o "$bodyf" -w '%{http_code}' \
+            -H "Accept: application/json" \
+            -H "X-Cisco-Meraki-API-Key: $MERAKI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -X "$method" "$API_BASE$path" \
+            --data "$body")"
+        fi
+
+        if [[ "$code" == "429" ]]; then
+          local wait
+          wait="$(awk '/^Retry-After:/ {print $2}' "$hdr" | tr -d '\r')"
+          [[ -z "$wait" ]] && wait=1
+          sleep "$wait"
+          continue
+        fi
+        break
+      done
+
+      if [[ "$code" == "401" && "$mode" == "bearer" ]]; then
+        continue  # try X-Cisco next
+      fi
+      break
+    done
+
+    echo "$code" >"$TMPDIR/code.$$"
+    cp "$hdr" "$TMPDIR/last_headers" 2>/dev/null || true
+    cp "$bodyf" "$TMPDIR/last_body"   2>/dev/null || true
+
+    if ! [[ "$code" =~ ^20[01]$ ]]; then
+      return 1
+    fi
+    return 0
+  }
+
+  # ----- helper: log + push into dialog tailbox -----
+  claim_status() {
+    local msg="$1"
+    printf '%s\n' "$msg" | tee -a "$CLAIM_LOG" >/dev/null
+    validate_ui_status "$msg"
+  }
+
+  # ----- start claim UI (tailbox + gauge) -----
+  local CLAIM_STATUS_FILE="$RUN_DIR/meraki_claim_ui.status"
+  VALIDATE_STATUS_FILE="$CLAIM_STATUS_FILE"
+  : >"$VALIDATE_STATUS_FILE"
+  validate_ui_start "Meraki Dashboard claim – monitored mode"
+
+  local total=${#DEV_ROWS_B64[@]}
+  local DONE=0 any_fail=0
+
+  validate_ui_gauge 1 "Starting Meraki claim…"
+
+  local row ip host nid nname cid addr path
+  for row in "${DEV_ROWS_B64[@]}"; do
+    ip="$(_row_field "$row" 0)"
+    host="$(_row_field "$row" 1)"
+    nid="$(_row_field "$row" 2)"
+    nname="$(_row_field "$row" 3)"
+    cid="$(_row_field "$row" 4)"
+    addr="$(_row_field "$row" 5)"
+
+    host="$(echo "${host:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    addr="$(echo "${addr:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    claim_status "[$ip] Claiming Cloud ID $cid into network ${nname:-<unknown>} ($nid)…"
+
+    path="/networks/$nid/devices/claim"
+
+    # body for /networks/{id}/devices/claim – one device at a time, MONITORED mode
+    local claim_body
+    claim_body="$(jq -n --arg cid "$cid" \
+                       --arg u "$SSH_USER" \
+                       --arg p "$SSH_PASS" \
+                       --arg e "$ENABLE_PASS" '
+      {
+        serials:       [$cid],
+        addAtomically: true,
+        detailsByDevice: [
+          {
+            serial: $cid,
+            details: [
+              {name:"device mode",      value:"monitored"},
+              {name:"username",        value:$u},
+              {name:"password",        value:$p},
+              {name:"enable password", value:$e}
+            ]
+          }
+        ]
+      }')" || true
+
+    if _claim_call POST "$path" "$claim_body"; then
+      claim_status "  -> Claim SUCCESS for $cid"
+    else
+      any_fail=1
+      local code; code="$(cat "$TMPDIR/code.$$" 2>/dev/null || echo "?")"
+      claim_status "  -> Claim FAILED for $cid (HTTP $code) on path $path. See meraki_claim.log for details."
+      sed -n '1,80p' "$TMPDIR/last_body" >>"$CLAIM_LOG" 2>/dev/null || true
+      ((DONE++))
+      validate_ui_gauge $(( 100 * DONE / total )) "Claimed $DONE / $total (some failures)…"
+      continue
+    fi
+
+    # Build payload to set device name (hostname) and physical address
+    local dev_body=""
+    if [[ -n "$addr" && -n "$host" ]]; then
+      dev_body="$(jq -n --arg n "$host" --arg a "$addr" \
+        '{name:$n, address:$a, updateLocation:true, moveMapMarker:true}')" || true
+      claim_status "  -> Setting Dashboard device name to: $host"
+      claim_status "  -> Updating Dashboard device address to: $addr"
+    elif [[ -n "$host" ]]; then
+      dev_body="$(jq -n --arg n "$host" '{name:$n}')" || true
+      claim_status "  -> Setting Dashboard device name to: $host"
+    elif [[ -n "$addr" ]]; then
+      dev_body="$(jq -n --arg a "$addr" \
+        '{address:$a, updateLocation:true, moveMapMarker:true}')" || true
+      claim_status "  -> Updating Dashboard device address to: $addr"
+    fi
+
+    if [[ -n "$dev_body" ]]; then
+      if _claim_call PUT "/devices/$cid" "$dev_body"; then
+        claim_status "     Device name/address update SUCCESS"
+      else
+        any_fail=1
+        local code; code="$(cat "$TMPDIR/code.$$" 2>/dev/null || echo "?")"
+        claim_status "     Device name/address update FAILED for $cid (HTTP $code)."
+        sed -n '1,80p' "$TMPDIR/last_body" >>"$CLAIM_LOG" 2>/dev/null || true
+      fi
+    fi
+
+    ((DONE++))
+    validate_ui_gauge $(( 100 * DONE / total )) "Claimed $DONE / $total switches…"
+  done
+
+  validate_ui_gauge 100 "Meraki claim complete."
+  validate_ui_stop
+
+  if (( any_fail == 0 )); then
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "Meraki claim complete" \
+        --textbox "$CLAIM_LOG" 24 100 || true
+  else
+    dlg --backtitle "$BACKTITLE_CL" \
+        --title "Meraki claim complete (with errors)" \
+        --textbox "$CLAIM_LOG" 24 100 || true
+  fi
+
+  return "$any_fail"
+}
+
+
+
+# ------------------------------------------------------------
+# Wrapper: run validation, mapping, firewall info, then onboard
+# ------------------------------------------------------------
+run_validate_map_and_onboard() {
   (
     set +e
     set +u
@@ -1503,17 +2689,37 @@ run_validate_and_map() {
   local rc=$?
 
   if (( rc != 0 )); then
-    echo "Validation failed – aborting network mapping. (rc=$rc)" >&2
+    echo "Validation failed – aborting mapping/onboarding. (rc=$rc)" >&2
     return "$rc"
   fi
 
-  # tiny pause so the “Validation OK” dialog clears cleanly
+  # tiny pause so dialogs clear nicely
   sleep 1
 
-  # Meraki org/network picker + mapping UI
-  meraki_switch_network_mapper "$@"
+  meraki_switch_network_mapper "$@"         || return $?
+  meraki_firewall_info_helper "$@"          || true
+  onboard_meraki_connect_switches "$@"      || return $?
+  meraki_claim_cloud_monitored_switches "$@" || return $?
 }
-
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  run_validate_and_map "$@"
+  cmd="${1:-all}"
+  shift || true
+
+  case "$cmd" in
+    firewall)
+      meraki_firewall_info_helper "$@"
+      ;;
+    onboard)
+      onboard_meraki_connect_switches "$@"
+      ;;
+    claim)
+      meraki_claim_cloud_monitored_switches "$@"
+      ;;
+    validate-and-map)
+      run_validate_and_map "$@"
+      ;;
+    all|*)
+      run_validate_map_and_onboard "$@"
+      ;;
+  esac
 fi
