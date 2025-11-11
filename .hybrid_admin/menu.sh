@@ -20,7 +20,7 @@ declare -A DONE_FILE=(
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/validated_switches.env"
   ["Migrate Switches"]="/root/.hybrid_admin/runs/migration/latest/meraki_claim_ui.status"
-  # (None yet for IOS-XE Upgrade / Deploy IOS-XE / Schedule Image Upgrade)
+  # (None yet for IOS-XE Upgrade / Logging / Clean Configuration / Server Service Control / Server Management header)
 )
 
 # Items: label -> script path
@@ -30,6 +30,10 @@ declare -A ITEMS=(
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/meraki_preflight.sh"
   ["IOS-XE Upgrade"]=""  # handled by submenu
   ["Migrate Switches"]="/root/.hybrid_admin/migration.sh"
+  ["Logging"]="/root/.hybrid_admin/show_logs.sh"
+  ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
+  ["Server Management"]=""  # header / separator, not an actual script
+  ["Server Service Control"]="/root/.hybrid_admin/service_control.sh"
 )
 
 # Submenus: label -> function name
@@ -46,10 +50,24 @@ declare -A HELP_RAW=(
   ["Deploy IOS-XE"]="Copy image to flash, then install/activate/commit on selected switches."
   ["Schedule Image Upgrade"]="Schedule a future image upgrade (snapshots envs, uses 'at')."
   ["Migrate Switches"]="Run the Catalyst-to-Meraki switch migration workflow and claim devices into Dashboard."
+  ["Logging"]="View CMDS deployment and migration log files."
+  ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
+  ["Server Management"]="Server management tools and utilities."
+  ["Server Service Control"]="Start/stop/restart CMDS server-side services."
 )
 
 # Display order (main menu)
-ORDER=("Setup Wizard" "Switch Discovery" "IOS-XE Upgrade" "Validate IOS-XE configuration" "Migrate Switches")
+ORDER=(
+  "Setup Wizard"
+  "Switch Discovery"
+  "IOS-XE Upgrade"
+  "Validate IOS-XE configuration"
+  "Migrate Switches"
+  "Logging"
+  "Clean Configuration (New Batch Deployment)"
+  "Server Management"
+  "Server Service Control"
+)
 
 cleanup(){ clear; }
 trap cleanup EXIT
@@ -81,6 +99,14 @@ colorize_help(){  # $1=label
 display_label(){  # $1=label -> returns label with green check and submenu marker if applicable
   local lbl="$1" text
 
+  # Special formatting for the section header
+  if [[ "$lbl" == "Server Management" ]]; then
+    # Just a visual separator; no checkmark, no submenu marker
+    text="---------------- Server Management ----------------"
+    printf "%s" "$text"
+    return
+  fi
+
   # Base label with optional green check
   if is_done "$lbl"; then
     text="$lbl  $MARK_CHECK"
@@ -91,7 +117,7 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
   # If this label opens a submenu, append an indicator
   if [[ -n "${SUBMENU_FN[$lbl]:-}" ]]; then
     text="$text  >"
-    # Or: text="$text  ▶" if your terminal supports it and you prefer that.
+    # Or: text="$text  ▶" if you prefer that and the terminal cooperates.
   fi
 
   printf "%s" "$text"
@@ -99,6 +125,12 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
 
 run_target(){
   local script="$1" label="$2"
+
+  # Do nothing if this is the header/separator
+  if [[ "$label" == "Server Management" ]]; then
+    return
+  fi
+
   # If this label maps to a submenu, open it
   if [[ -n "${SUBMENU_FN[$label]:-}" ]]; then
     "${SUBMENU_FN[$label]}"
