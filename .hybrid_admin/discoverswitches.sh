@@ -311,6 +311,7 @@ probe_host() {
       printf 'show clock\r\n'
       printf 'show version\r\n'
       printf 'show running-config | include ^hostname\r\n'
+      printf 'show running-config | include ^username\r\n'
       printf 'show inventory\r\n'
       printf 'exit\r\n'
     } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
@@ -327,6 +328,7 @@ probe_host() {
         printf 'show clock\r\n'
         printf 'show version\r\n'
         printf 'show running-config | include ^hostname\r\n'
+        printf 'show running-config | include ^username\r\n'
         printf 'show inventory\r\n'
         printf 'exit\r\n'
       } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
@@ -339,6 +341,7 @@ probe_host() {
         printf 'show clock\r\n'
         printf 'show version\r\n'
         printf 'show running-config | include ^hostname\r\n'
+        printf 'show running-config | include ^username\r\n'
         printf 'show inventory\r\n'
         printf 'exit\r\n'
       } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
@@ -367,12 +370,38 @@ probe_host() {
   sn="$(grep -m1 -E 'SN:[[:space:]]*[A-Za-z0-9]+' "$outn" | sed -E 's/.*SN:[[:space:]]*([^,[:space:]]+).*/\1/')"
   pid="$(clean_field "${pid:-}")"; sn="$(clean_field "${sn:-}")"
 
+  # --- Blacklist detection: username meraki-user ---
+  local bl_flag="false"
+  local bl_reason=""
+  if grep -Eq '^username[[:space:]]+meraki-user\b' "$outn"; then
+    bl_flag="true"
+    bl_reason="meraki-user exists"
+    log_msg "probe_host: ip=$ip blacklist meraki-user exists"
+  fi
+
   rm -f "$out_priv" "$facts" "$outn"
 
   if (( login_ok )); then
     log_msg "probe_host: ip=$ip login=ok hostname='${hostname:-}' version='${version:-}' pid='${pid:-}' sn='${sn:-}'"
-    jq -n --arg ip "$ip" --arg host "${hostname:-}" --arg ver "${version:-}" --arg pid "${pid:-}" --arg sn "${sn:-}" \
-          '{ip:$ip, ssh:true, login:true, hostname:$host, version:$ver, pid:$pid, serial:$sn}'
+    jq -n \
+      --arg ip "$ip" \
+      --arg host "${hostname:-}" \
+      --arg ver "${version:-}" \
+      --arg pid "${pid:-}" \
+      --arg sn "${sn:-}" \
+      --arg bl "$bl_flag" \
+      --arg blr "$bl_reason" \
+      '{
+         ip: $ip,
+         ssh: true,
+         login: true,
+         hostname: $host,
+         version: $ver,
+         pid: $pid,
+         serial: $sn,
+         blacklisted: ($bl == "true"),
+         blacklist_reason: $blr
+       }'
   else
     log_msg "probe_host: ip=$ip login=failed"
     jq -n --arg ip "$ip" '{ip:$ip, ssh:true, login:false}'
@@ -417,9 +446,53 @@ nmap_cmd_base() {
   (( USE_IFACE )) && opts+=(-e "$DISCOVERY_INTERFACE")
   printf '%s ' "${opts[@]}"
 }
-pass_a() { local probes=(-PE -PS22,80,443,830 -PA22,443); (( USE_IFACE )) && probes+=(-PR); local cmd=(nmap $(nmap_cmd_base) -sn "${probes[@]}" --max-retries 2 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
-pass_b() { local cmd=(nmap $(nmap_cmd_base) -sn -PE "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' || true; }
-pass_c() { local cmd=(nmap $(nmap_cmd_base) -sn -Pn -PS22,80,443 "${TARGETS[@]}"); "${cmd[@]}" -oG - 2>/dev/null | awk '/Status: Up/{print $2}' || true; }
+
+run_nmap_with_heartbeat() {
+  local label="$1"; shift   # e.g. "Discovering live hosts (pass 1/3)"
+  local -a args=("$@")      # extra nmap args, e.g. -PE, -Pn, etc.
+
+  local -a cmd=(nmap $(nmap_cmd_base) -sn "${args[@]}" "${TARGETS[@]}")
+  local tmp; tmp="$(mktemp)"
+
+  # Fire off nmap in the background; capture just the IPs to a temp file
+  {
+    "${cmd[@]}" -oG - 2>/dev/null | awk '/Up$/{print $2}' >"$tmp"
+  } &
+  local scan_pid=$!
+
+  # Heartbeat loop: while nmap is running, emit status every 5 seconds
+  local elapsed=0
+  while kill -0 "$scan_pid" 2>/dev/null; do
+    ui_status "${label}… (elapsed ${elapsed}s)"
+    sleep 5
+    ((elapsed+=5))
+  done
+
+  # Wait for nmap to actually finish (and ignore its exit code)
+  wait "$scan_pid" 2>/dev/null || true
+
+  # Now stream the discovered IPs and log them
+  while read -r ip; do
+    [[ -z "$ip" ]] && continue
+    ui_status "Discovered live host: $ip"
+    printf '%s\n' "$ip"
+  done < "$tmp"
+
+  rm -f "$tmp"
+}
+pass_a() {
+  local probes=(-PE -PS22,80,443,830 -PA22,443)
+  (( USE_IFACE )) && probes+=(-PR)
+  run_nmap_with_heartbeat "Discovering live hosts (pass 1/3)" "${probes[@]}"
+}
+
+pass_b() {
+  run_nmap_with_heartbeat "Discovering live hosts (ICMP-only)" -PE
+}
+
+pass_c() {
+  run_nmap_with_heartbeat "Discovering live hosts (TCP ping)" -Pn -PS22,80,443
+}
 pass_fping() {
   command -v fping >/dev/null 2>&1 || return 0
   local out=()
@@ -430,9 +503,13 @@ pass_fping() {
       mapfile -t out < <(printf '%s\n' "$t" | fping -a -q 2>/dev/null || true)
     fi
   done
-  printf '%s\n' "${out[@]}" | awk 'NF'
+  printf '%s\n' "${out[@]}" | awk 'NF' \
+    | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        ui_status "Discovered live host (fping): $ip"
+        printf '%s\n' "$ip"
+      done || true
 }
-
 discover_targets() {
   ui_status "Discovering live hosts (pass 1/3)…"; ui_gauge 5 "Scanning (hybrid)…"
   local live=(); mapfile -t live < <(pass_a)
@@ -533,7 +610,7 @@ make_upgrade_plan() {
     ui_status "No discovery JSON to build an upgrade plan (file empty)."
     log_msg "make_upgrade_plan: $json is empty or missing"
     echo "[]" > "$UP_JSON_OUT"
-    { echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade"; } > "$UP_CSV_OUT"
+    { echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"; } > "$UP_CSV_OUT"
     return 0
   fi
 
@@ -542,8 +619,8 @@ make_upgrade_plan() {
   log_msg "make_upgrade_plan: discovery entries=$disc_count"
   ui_gauge 90 "Building upgrade plan for $disc_count device(s)…"
 
-  jq -r '.[] | [.ip, .pid, .version, .hostname] | @tsv' "$json" |
-    while IFS=$'\t' read -r ip pid cur_ver host; do
+  jq -r '.[] | [.ip, .pid, .version, .hostname, (.blacklisted//false), (.blacklist_reason//"")] | @tsv' "$json" |
+    while IFS=$'\t' read -r ip pid cur_ver host blacklisted bl_reason; do
       IFS='|' read -r tgt_file tgt_path tgt_ver tgt_size <<<"$(choose_image "$pid")"
 
       local action need
@@ -557,15 +634,33 @@ make_upgrade_plan() {
         SAME|UNKNOWN|"")   need="false" ;;
       esac
 
-      jq -n --arg ip "$ip" --arg hostname "${host:-}" --arg pid "$pid" \
-            --arg current_version "${cur_ver:-}" --arg target_version "${tgt_ver:-}" \
-            --arg target_file "${tgt_file:-}" --arg target_path "${tgt_path:-}" \
-            --arg target_size "${tgt_size:-}" --arg action "$action" --arg needs "$need" \
-            '{ip:$ip, hostname:$hostname, pid:$pid,
-              current_version:$current_version, target_version:$target_version,
-              target_file:$target_file, target_path:$target_path,
-              target_size_bytes: ($target_size|tonumber?),
-              plan_action:$action, needs_upgrade: ($needs=="true") }'
+      jq -n \
+        --arg ip "$ip" \
+        --arg hostname "${host:-}" \
+        --arg pid "$pid" \
+        --arg current_version "${cur_ver:-}" \
+        --arg target_version "${tgt_ver:-}" \
+        --arg target_file "${tgt_file:-}" \
+        --arg target_path "${tgt_path:-}" \
+        --arg target_size "${tgt_size:-}" \
+        --arg action "$action" \
+        --arg needs "$need" \
+        --arg bl "$blacklisted" \
+        --arg blr "${bl_reason:-}" \
+        '{
+           ip: $ip,
+           hostname: $hostname,
+           pid: $pid,
+           current_version: $current_version,
+           target_version: $target_version,
+           target_file: $target_file,
+           target_path: $target_path,
+           target_size_bytes: ($target_size|tonumber?),
+           plan_action: $action,
+           needs_upgrade: ($needs=="true"),
+           blacklisted: ($bl=="true"),
+           blacklist_reason: $blr
+         }'
     done | jq -s '.' > "$UP_JSON_OUT"
 
   local up_count
@@ -576,23 +671,38 @@ make_upgrade_plan() {
     log_msg "make_upgrade_plan: WARNING plan entries=0 while discovery entries=$disc_count; building passthrough plan."
     jq '[ .[] | {
             ip,
-            hostname,
-            pid,
+            hostname: (.hostname//""),
+            pid: (.pid//""),
             current_version: (.version//""),
             target_version: "",
             target_file: "",
             target_path: "",
             target_size_bytes: null,
             plan_action: "UNKNOWN",
-            needs_upgrade: false
+            needs_upgrade: false,
+            blacklisted: (.blacklisted//false),
+            blacklist_reason: (.blacklist_reason//"")
           } ]' "$json" > "$UP_JSON_OUT"
     up_count="$(jq 'length' "$UP_JSON_OUT" 2>/dev/null || echo 0)"
     log_msg "make_upgrade_plan: passthrough plan entries=$up_count"
   fi
 
   {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade"
-    jq -r '.[] | [.ip, (.hostname//""), (.pid//""), (.current_version//""), (.target_version//""), (.plan_action//""), (.target_file//""), (.target_path//""), (.target_size_bytes//""), (.needs_upgrade//false)] | @csv' "$UP_JSON_OUT"
+    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"
+    jq -r '.[] | [
+        .ip,
+        (.hostname//""),
+        (.pid//""),
+        (.current_version//""),
+        (.target_version//""),
+        (.plan_action//""),
+        (.target_file//""),
+        (.target_path//""),
+        (.target_size_bytes//""),
+        (.needs_upgrade//false),
+        (.blacklisted//false),
+        (.blacklist_reason//"")
+      ] | @csv' "$UP_JSON_OUT"
   } > "$UP_CSV_OUT"
 
   ui_status "Upgrade plan written: $UP_CSV_OUT (entries: $up_count)"
@@ -602,12 +712,43 @@ make_upgrade_plan() {
 # ===== Selection (dialog checklist) =====
 do_selection_dialog() {
   local -a items=()
-  while IFS=$'\t' read -r ip host pid cur tgt action need; do
-    host="${host:--}"; pid="${pid:--}"; cur="${cur:-?}"; tgt="${tgt:-?}"; action="${action:-UNKNOWN}"
+  # Map ip -> blacklist reason (if any), so we can ignore them later
+  declare -A BLKMAP=()
+
+  while IFS=$'\t' read -r ip host pid cur tgt action need blacklisted bl_reason; do
+    host="${host:--}"
+    pid="${pid:--}"
+    cur="${cur:-?}"
+    tgt="${tgt:-?}"
+    action="${action:-UNKNOWN}"
+
     local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})"
-    local def="off"; [[ "$need" == "true" ]] && def="on"
+    local def="off"
+
+    if [[ "$blacklisted" == "true" ]]; then
+      # Blacklisted: leave unchecked and annotate, remember reason
+      local reason="${bl_reason:-meraki-user exists}"
+      text="$text  [BLACKLISTED: ${reason}]"
+      def="off"
+      BLKMAP["$ip"]="$reason"
+    else
+      # Normal devices: pre-select only if needs_upgrade == true
+      [[ "$need" == "true" ]] && def="on"
+    fi
+
     items+=("$ip" "$text" "$def")
-  done < <(jq -r '.[] | [.ip, (.hostname//"-"), (.pid//"-"), (.current_version//"?"), (.target_version//"?"), (.plan_action//"UNKNOWN"), (.needs_upgrade//false)] | @tsv' "$UP_JSON_OUT")
+  done < <(jq -r '.[] |
+           [
+             .ip,
+             (.hostname//"-"),
+             (.pid//"-"),
+             (.current_version//"?"),
+             (.target_version//"?"),
+             (.plan_action//"UNKNOWN"),
+             (.needs_upgrade//false),
+             (.blacklisted//false),
+             (.blacklist_reason//"")
+           ] | @tsv' "$UP_JSON_OUT")
 
   if (( ${#items[@]} == 0 )); then
     dialog --no-shadow --infobox "No devices available for selection.\n(Upgrade plan had zero items.)" 7 60
@@ -619,8 +760,8 @@ do_selection_dialog() {
   local tmp_sel; tmp_sel="$(mktemp)"
   dialog --no-shadow --title "Select switches to upgrade" \
          --backtitle "Upgrade Selection" \
-         --checklist "Use <SPACE> to toggle. Pre-selected = needs upgrade." \
-         22 100 15 \
+         --checklist "Use <SPACE> to toggle. BLACKLISTED entries are shown for visibility but cannot be selected (ignored even if checked)." \
+         22 140 15 \
          "${items[@]}" 2> "$tmp_sel"
   local rc=$?
   if (( rc != 0 )); then
@@ -633,25 +774,52 @@ do_selection_dialog() {
   mapfile -t SEL_ARR < <(tr -d '"' < "$tmp_sel")
   rm -f "$tmp_sel"
 
-  if (( ${#SEL_ARR[@]} == 0 )); then
-    dialog --no-shadow --infobox "No switches selected. Nothing to do." 6 50
-    sleep 2
+  # Filter out any blacklisted IPs from the user’s choices
+  local -a FILTERED_SEL=()
+  local ip
+  for ip in "${SEL_ARR[@]}"; do
+    [[ -z "$ip" ]] && continue
+    if [[ -n "${BLKMAP[$ip]:-}" ]]; then
+      # BLACKLISTED: ignore this entry entirely
+      continue
+    fi
+    FILTERED_SEL+=("$ip")
+  done
+
+  if (( ${#FILTERED_SEL[@]} == 0 )); then
+    dialog --no-shadow --infobox \
+"All selected devices are BLACKLISTED (e.g. meraki-user exists).
+Clean up configuration before attempting to migrate these switches." 8 70
+    sleep 3
     return 3
   fi
 
   local ips_json
-  ips_json="$(printf '%s\n' "${SEL_ARR[@]}" | jq -R -s 'split("\n")|map(select(length>0))')"
+  ips_json="$(printf '%s\n' "${FILTERED_SEL[@]}" | jq -R -s 'split("\n")|map(select(length>0))')"
   jq --argjson ips "$ips_json" '[ .[] | select( (.ip|tostring) as $x | $ips | index($x) ) ]' "$UP_JSON_OUT" > "$SEL_JSON_OUT"
 
   {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade"
-    jq -r '.[] | [.ip, (.hostname//""), (.pid//""), (.current_version//""), (.target_version//""), (.plan_action//""), (.target_file//""), (.target_path//""), (.target_size_bytes//""), (.needs_upgrade//false)] | @csv' "$SEL_JSON_OUT"
+    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"
+    jq -r '.[] | [
+        .ip,
+        (.hostname//""),
+        (.pid//""),
+        (.current_version//""),
+        (.target_version//""),
+        (.plan_action//""),
+        (.target_file//""),
+        (.target_path//""),
+        (.target_size_bytes//""),
+        (.needs_upgrade//false),
+        (.blacklisted//false),
+        (.blacklist_reason//"")
+      ] | @csv' "$SEL_JSON_OUT"
   } > "$SEL_CSV_OUT"
 
   {
     echo "# Generated $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     printf "export UPGRADE_BASE_ENV=%q\n" "$ENV_FILE"
-    printf "export UPGRADE_SELECTED_IPS=%q\n" "${SEL_ARR[*]}"
+    printf "export UPGRADE_SELECTED_IPS=%q\n" "${FILTERED_SEL[*]}"
     printf "export UPGRADE_SELECTED_JSON=%q\n" "$SEL_JSON_OUT"
     printf "export UPGRADE_SELECTED_CSV=%q\n" "$SEL_CSV_OUT"
   } > "$SEL_ENV_OUT"
@@ -662,13 +830,14 @@ do_selection_dialog() {
 Env:  $SEL_ENV_OUT
 
 Selected IPs:
-  ${SEL_ARR[*]}
+  ${FILTERED_SEL[*]}
 
-Use this env in your upgrade step." 12 80
+BLACKLISTED entries (e.g. meraki-user exists) were ignored.
+
+Use this env in your upgrade step." 13 80
   sleep 3
   return 0
 }
-
 # ===== Main =====
 main() {
   log_msg "=== scan run start ==="
