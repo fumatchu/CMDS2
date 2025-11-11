@@ -18,6 +18,8 @@ MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
+  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/validated_switches.env"
+  ["Migrate Switches"]="/root/.hybrid_admin/runs/migration/latest/meraki_claim_ui.status"
   # (None yet for IOS-XE Upgrade / Deploy IOS-XE / Schedule Image Upgrade)
 )
 
@@ -25,7 +27,9 @@ declare -A DONE_FILE=(
 declare -A ITEMS=(
   ["Setup Wizard"]="/root/.hybrid_admin/setupwizard.sh"
   ["Switch Discovery"]="/root/.hybrid_admin/discoverswitches.sh"
+  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/meraki_preflight.sh"
   ["IOS-XE Upgrade"]=""  # handled by submenu
+  ["Migrate Switches"]="/root/.hybrid_admin/migration.sh"
 )
 
 # Submenus: label -> function name
@@ -37,20 +41,33 @@ declare -A SUBMENU_FN=(
 declare -A HELP_RAW=(
   ["Setup Wizard"]="Guided first-time setup: env, API keys, credentials, and paths."
   ["Switch Discovery"]="Discover live Catalyst switches, probe via SSH, and build the selection for upgrades."
+  ["Validate IOS-XE configuration"]="Run preflight validation for selected switches and configuration before upgrade."
   ["IOS-XE Upgrade"]="Run IOS-XE install/activate/commit workflows and tools."
   ["Deploy IOS-XE"]="Copy image to flash, then install/activate/commit on selected switches."
   ["Schedule Image Upgrade"]="Schedule a future image upgrade (snapshots envs, uses 'at')."
+  ["Migrate Switches"]="Run the Catalyst-to-Meraki switch migration workflow and claim devices into Dashboard."
 )
 
 # Display order (main menu)
-ORDER=("Setup Wizard" "Switch Discovery" "IOS-XE Upgrade")
+ORDER=("Setup Wizard" "Switch Discovery" "IOS-XE Upgrade" "Validate IOS-XE configuration" "Migrate Switches")
 
 cleanup(){ clear; }
 trap cleanup EXIT
 
-is_done(){  # $1=label -> returns 0 if artifact exists and non-empty
+is_done(){  # $1=label -> returns 0 if artifact indicates completion
   local lbl="$1" f="${DONE_FILE[$lbl]:-}"
-  [[ -n "$f" && -s "$f" ]]
+
+  # Must have a file path and that file must be non-empty
+  [[ -n "$f" && -s "$f" ]] || return 1
+
+  # Special logic for Migrate Switches: only "done" if there is NO "FAILED" in the status file
+  if [[ "$lbl" == "Migrate Switches" ]]; then
+    if grep -q "FAILED" "$f" 2>/dev/null; then
+      return 1
+    fi
+  fi
+
+  return 0
 }
 
 colorize_help(){  # $1=label
@@ -61,13 +78,23 @@ colorize_help(){  # $1=label
   printf '%b%s%b%b' "$HELP_COLOR_PREFIX" "${HELP_RAW[$lbl]:-Run $lbl}" "$HELP_COLOR_RESET" "$extra"
 }
 
-display_label(){  # $1=label -> returns label with green check if complete
-  local lbl="$1"
+display_label(){  # $1=label -> returns label with green check and submenu marker if applicable
+  local lbl="$1" text
+
+  # Base label with optional green check
   if is_done "$lbl"; then
-    printf "%s  %s" "$lbl" "$MARK_CHECK"
+    text="$lbl  $MARK_CHECK"
   else
-    printf "%s" "$lbl"
+    text="$lbl"
   fi
+
+  # If this label opens a submenu, append an indicator
+  if [[ -n "${SUBMENU_FN[$lbl]:-}" ]]; then
+    text="$text  >"
+    # Or: text="$text  ▶" if your terminal supports it and you prefer that.
+  fi
+
+  printf "%s" "$text"
 }
 
 run_target(){
@@ -109,7 +136,7 @@ submenu_iosxe(){
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # NEW: Schedule Image Upgrade
+    # Schedule Image Upgrade
     local lbl2="Schedule Image Upgrade"
     local path2="/root/.hybrid_admin/scheduler.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2")")
