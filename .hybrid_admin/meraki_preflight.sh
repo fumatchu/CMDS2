@@ -20,7 +20,9 @@
 #   ./script fix-aaa        # just AAA fixes (reads runs/preflight/latest.csv)
 #   ./script fix-routing    # just IP routing / default route fixes (reads runs/preflight/latest.csv)
 
-set -uo pipefail
+# Be strict about pipelines, but do NOT use 'set -u' here:
+# this script relies on lots of optional env vars that may be unset.
+set -o pipefail
 
 # ---------- prerequisites ----------
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
@@ -561,9 +563,36 @@ meraki_preflight(){
     ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "Probed $DONE / $TOTAL"
   done
 
-  gauge 100 "Done"
+    gauge 100 "Done"
   log "Summary: $SUMMARY_CSV"
   ui_stop
+
+  # --------- build validated_switches.env + validated_ips.json for downstream steps ---------
+  local VAL_ENV="$SCRIPT_DIR/validated_switches.env"
+  local VAL_JSON="$SCRIPT_DIR/validated_ips.json"
+
+  # Collect IPs where ready == yes (col 12 in summary.csv)
+  local validated_ips
+  validated_ips="$(awk -F, 'NR>1 && $12=="yes" {print $1}' "$SUMMARY_CSV" | xargs)"
+
+  if [[ -n "$validated_ips" ]]; then
+    # ENV file used by onboarding: VALIDATED_SWITCH_IPS="ip1 ip2 ..."
+    printf 'export VALIDATED_SWITCH_IPS=%q\n' "$validated_ips" > "$VAL_ENV"
+
+    # JSON used as fallback: [ {ip, hostname}, ... ]
+    awk -F, 'NR>1 && $12=="yes" {printf "%s,%s\n",$1,$2}' "$SUMMARY_CSV" \
+      | jq -R -s '
+          split("\n")
+          | map(
+              select(length>0)
+              | split(",")
+              | {ip: .[0], hostname: .[1]}
+            )
+        ' > "$VAL_JSON" 2>/dev/null || true
+  else
+    # No validated switches – remove any stale files
+    rm -f "$VAL_ENV" "$VAL_JSON" 2>/dev/null || true
+  fi
 
   clear
   echo "Preflight complete."
@@ -997,6 +1026,12 @@ fix_aaa_one(){
 }
 
 meraki_fix_aaa(){
+  # Relax strict mode inside this function so an unset var
+  # doesn’t kill the whole script.
+  set +e
+  set +u
+  set +o pipefail
+
   trap 'ui_stop' EXIT
 
   # env
@@ -1009,23 +1044,50 @@ meraki_fix_aaa(){
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
   local LATEST_ENV="$PRE_ROOT/latest.env"
   local SUM=""
-  if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
-  [[ -z "${SUM:-}" || ! -f "$SUM" ]] && { dialog --no-shadow --infobox "No preflight summary found.\nRun preflight first." 6 60; sleep 2; clear; trap - EXIT; return 1; }
+  if [[ -f "$LATEST_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$LATEST_ENV"
+    SUM="${PRE_FLIGHT_SUMMARY:-}"
+  fi
+
+  if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
+    dialog --no-shadow --infobox "No preflight summary found.\nRun preflight first." 6 60
+    sleep 2
+    clear
+    trap - EXIT
+    # restore stricter mode before returning
+    set -u
+    set -o pipefail
+    return 1
+  fi
 
   # IOS-XE minimum version check (unless already done in 'all' pipeline)
   if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
     if ! enforce_min_ios_or_abort "$SUM"; then
       trap - EXIT
+      set -u
+      set -o pipefail
       return 1
     fi
   fi
 
-  # targets: any with aaa_new_model_missing OR aaa_login_missing OR aaa_exec_missing in notes (col 13)
-  mapfile -t TARGETS < <(awk -F, 'NR>1 { if (index($13,"aaa_new_model_missing;")>0 || index($13,"aaa_login_missing;")>0 || index($13,"aaa_exec_missing;")>0) print $1 }' "$SUM")
+  # targets: any with aaa_*_missing in notes (col 13)
+  mapfile -t TARGETS < <(
+    awk -F, 'NR>1 {
+      if (index($13,"aaa_new_model_missing;")>0 ||
+          index($13,"aaa_login_missing;")>0      ||
+          index($13,"aaa_exec_missing;")>0) print $1
+    }' "$SUM"
+  )
 
   if (( ${#TARGETS[@]} == 0 )); then
     dialog --no-shadow --infobox "All switches already have required AAA.\nNothing to do." 6 60
-    sleep 2; clear; trap - EXIT; return 0
+    sleep 2
+    clear
+    trap - EXIT
+    set -u
+    set -o pipefail
+    return 0
   fi
 
   RUN_ID="aaa-$(date -u +%Y%m%d%H%M%S)"
@@ -1055,13 +1117,18 @@ meraki_fix_aaa(){
     sleep "$(rand_ms)"
     if (( ACTIVE >= MAX_CONCURRENCY )); then
       if wait -n; then :; fi
-      ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "AAA fixed: $DONE / $TOTAL"
+      ((DONE++))
+      local pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "AAA fixed: $DONE / $TOTAL"
       ((ACTIVE--))
     fi
   done
+
   while (( DONE < TOTAL )); do
     if wait -n; then :; fi
-    ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "AAA fixed: $DONE / $TOTAL"
+    ((DONE++))
+    local pct=$(( 100 * DONE / TOTAL ))
+    gauge "$pct" "AAA fixed: $DONE / $TOTAL"
   done
 
   gauge 100 "Done"
@@ -1071,8 +1138,12 @@ meraki_fix_aaa(){
   sleep 2
   clear
   trap - EXIT
-}
 
+  # restore stricter mode for whatever comes next in the script
+  set -u
+  set -o pipefail
+  return 0
+}
 # =====================================================================
 # IP ROUTING / DEFAULT ROUTE FIX
 # =====================================================================
@@ -1362,37 +1433,67 @@ meraki_fix_ip_routing(){
 # PIPELINE
 # =====================================================================
 meraki_all(){
-  # full pipeline: preflight -> IOS check once -> DNS -> NTP -> AAA -> routing
-  meraki_preflight || return $?
+  echo "[hybrid] === Starting full preflight pipeline ==="
 
+  # 1) Preflight
+  echo "[hybrid] -> meraki_preflight"
+  meraki_preflight || {
+    local rc=$?
+    echo "[hybrid] meraki_preflight failed with rc=$rc"
+    return "$rc"
+  }
+
+  # 2) Grab summary path from latest.env
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
   local LATEST_ENV="$PRE_ROOT/latest.env"
   local SUM=""
 
   if [[ -f "$LATEST_ENV" ]]; then
+    # shellcheck disable=SC1090
     source "$LATEST_ENV"
     SUM="${PRE_FLIGHT_SUMMARY:-}"
   fi
 
   if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
-    echo "Preflight summary missing after preflight. Aborting." >&2
+    echo "[hybrid] ERROR: Preflight summary missing after preflight. Aborting." >&2
     return 1
   fi
 
-  # Run IOS-XE check ONCE for the 'all' pipeline
+  echo "[hybrid] Preflight summary: $SUM"
+
+  # 3) IOS min-version check ONCE for the whole pipeline
+  echo "[hybrid] -> enforce_min_ios_or_abort"
   if ! enforce_min_ios_or_abort "$SUM"; then
+    echo "[hybrid] IOS minimum version check failed; stopping pipeline."
     return 1
   fi
 
-  # Tell per-fix functions to skip their own IOS checks
+  # Tell the per-fix functions to skip their own IOS checks
   SKIP_IOS_CHECK=1
 
-  meraki_fix_dns        || return $?
-  meraki_fix_ntp        || true
-  meraki_fix_aaa        || true
-  meraki_fix_ip_routing || true
-}
+  # 4) DNS
+  echo "[hybrid] -> meraki_fix_dns"
+  meraki_fix_dns || {
+    local rc=$?
+    echo "[hybrid] meraki_fix_dns failed with rc=$rc (stopping)"
+    return "$rc"
+  }
 
+  # 5) NTP
+  echo "[hybrid] -> meraki_fix_ntp"
+  meraki_fix_ntp || echo "[hybrid] meraki_fix_ntp returned non-zero (continuing)"
+
+  # 6) AAA
+  echo "[hybrid] -> meraki_fix_aaa"
+  meraki_fix_aaa || echo "[hybrid] meraki_fix_aaa returned non-zero (continuing)"
+
+  # 7) IP routing / default route
+  echo "[hybrid] -> meraki_fix_ip_routing"
+  meraki_fix_ip_routing || echo "[hybrid] meraki_fix_ip_routing returned non-zero (continuing)"
+
+  echo "[hybrid] === Preflight pipeline finished ==="
+  return 0
+}
 # =====================================================================
 # Entry
 # =====================================================================
