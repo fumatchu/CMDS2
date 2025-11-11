@@ -1860,7 +1860,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
 # 3) Enable & verify "service meraki connect" on switches
 #    (parallel: up to 10 at a time, with 3x 15s retries)
 # ------------------------------------------------------------
-  onboard_meraki_connect_switches() {
+onboard_meraki_connect_switches() {
   local BACKTITLE_C="Meraki Cloud Monitoring – enable & verify connectivity"
 
   # Relax strict mode inside this function so a failing jq/SSH parse
@@ -1895,7 +1895,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
     return 1
   fi
 
-    # ---------- decide which switches to onboard ----------
+  # ---------- decide which switches to onboard ----------
   # Preferred: use mapped switches from meraki_switch_network_map.json
   local -a IPS=()
   local -a HOSTS=()
@@ -1981,12 +1981,6 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
     mapfile -t IPS <<<"$selection"
   fi
 
-
-
-
-
-
-
   # ---------- reuse / create runs/migration structure ----------
   local RUN_ROOT="$SCRIPT_DIR/runs/migration"
   mkdir -p "$RUN_ROOT"
@@ -2028,7 +2022,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
   VALIDATE_STATUS_FILE="$RUN_DIR/meraki_connect_ui.status"
   : >"$VALIDATE_STATUS_FILE"
   validate_ui_start
-  validate_ui_status "Running 'service meraki connect' and 'show meraki connect' on selected switches…"
+  validate_ui_status "Running 'service meraki connect' and 'show meraki connect/show meraki' on selected switches…"
 
   local total=${#IPS[@]}
 
@@ -2075,13 +2069,14 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
                  -o ConnectTimeout=30 -tt "${SSH_USER}@${ip}")
       fi
 
-      # First: enable service in global config + immediate show
+      # First: enable service in global config + show meraki connect and show meraki
       {
         printf '\r\nterminal length 0\r\nterminal width 511\r\n'
         printf 'configure terminal\r\n'
         printf 'service meraki connect\r\n'
         printf 'end\r\n'
         printf 'show meraki connect\r\n'
+        printf 'show meraki\r\n'
         printf 'exit\r\n'
       } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
 
@@ -2114,6 +2109,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
           {
             printf '\r\nterminal length 0\r\nterminal width 511\r\n'
             printf 'show meraki connect\r\n'
+            printf 'show meraki\r\n'
             printf 'exit\r\n'
           } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
           tr -d '\r' <"$ssh_log_tmp" >"$state_log"
@@ -2161,7 +2157,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
           ctx && /^Meraki/ {ctx=0; exit}
           ctx && /Status:/ {sub(/.*:/,""); gsub(/^[ \t]+/,""); print; exit}
         ' "$state_log" 2>/dev/null || true)"
-        reg_status="$(echo "$reg_status" | sed -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+        reg_status="$(echo "$reg_status" | sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' | tr '[:upper:]' '[:lower:]')"
 
         [[ "$reg_status" == "registered" ]] && registered="yes"
 
@@ -2206,6 +2202,36 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
       validate_ui_status "[$ip] Meraki connect NOT ready: ${notes:-see logs}."
     fi
 
+    # --- NEW: parse stack members from "show meraki" into a TSV ---
+    # One TSV per management IP:
+    #   deviceNumber<TAB>pid<TAB>serial<TAB>cloudId
+    local stack_tsv="$RUN_DIR/devlogs/meraki_stack_${ip//./_}.tsv"
+    : >"$stack_tsv"
+
+    if [[ "$ready" == "yes" ]]; then
+      awk '
+        /^Num[[:space:]]+PID[[:space:]]+Number[[:space:]]+Cloud[[:space:]]+ID/ { ctx=1; next }
+        ctx && /^-+/ { next }
+        ctx && NF == 0 { ctx=0; next }
+        ctx {
+          dev   = $1
+          pid   = $2
+          serial= $3
+          cloud = $4
+          if (cloud != "" && cloud != "-") {
+            print dev "\t" pid "\t" serial "\t" cloud
+          }
+        }
+      ' "$ssh_log" >"$stack_tsv" 2>/dev/null || true
+
+      # Fallback: if parsing failed but we have a single cloud_id,
+      # at least emit one row so non-stack devices still work.
+      if [[ ! -s "$stack_tsv" && -n "$cloud_id" ]]; then
+        printf '1\t\t\t%s\n' "$cloud_id" >"$stack_tsv"
+      fi
+    fi
+    # --- END NEW ---
+
     local csv_file="$RUN_DIR/devlogs/meraki_connect_${ip//./_}.line"
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
       "$ip" "${host:-$ip}" \
@@ -2249,7 +2275,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
   validate_ui_gauge 100 "Meraki connect onboarding complete."
   validate_ui_stop
 
-  # ---------- build JSON of ready Cloud IDs + summary text ----------
+  # ---------- build JSON of ready Cloud IDs (including stack members) + summary text ----------
   local -a READY_IPS NOT_READY_IPS
   local CLOUD_JSON="$RUN_DIR/meraki_cloud_ids.json"
   local summary="$RUN_DIR/meraki_connect_summary.txt"
@@ -2268,21 +2294,59 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
     printf "%-16s %-22s %-8s %-8s %-8s %-10s %-12s %-18s\n" \
       "----------------" "----------------------" "----" "----" "----" "--------" "--------" "------------------"
 
-    local first=1
+        local first=1
     local ip hostname svc fetch primary secondary reg cloud ready notes
 
     while IFS=, read -r ip hostname svc fetch primary secondary reg cloud ready notes; do
-      if (( first )); then first=0; continue; fi
+      # first line of CSV is header, skip it
+      if (( first )); then
+        first=0
+        continue
+      fi
 
       ip="${ip%\"}";        ip="${ip#\"}"
       hostname="${hostname%\"}"; hostname="${hostname#\"}"
-      cloud="${cloud%\"}"; cloud="${cloud#\"}"
-      ready="${ready%\"}"; ready="${ready#\"}"
+      cloud="${cloud%\"}";  cloud="${cloud#\"}"
+      ready="${ready%\"}";  ready="${ready#\"}"
+
+            # Look for per-stack Cloud IDs for this management IP
+      # meraki_stack_<ip>.tsv: deviceNumber<TAB>pid<TAB>serial<TAB>cloudId
+      local cloud_display stack_tsv stack_count first_cid
+      cloud_display="$cloud"
+      stack_tsv="$RUN_DIR/devlogs/meraki_stack_${ip//./_}.tsv"
+
+      if [[ -s "$stack_tsv" ]]; then
+        # Count only rows whose Cloud ID looks like XXXX-XXXX-XXXX
+        stack_count=$(
+          awk -F'\t' '
+            $4 ~ /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/ { c++ }
+            END { print c+0 }
+          ' "$stack_tsv" 2>/dev/null || echo 0
+        )
+
+        if (( stack_count > 1 )); then
+          # First real Cloud ID for display
+          first_cid=$(
+            awk -F'\t' '
+              $4 ~ /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/ { print $4; exit }
+            ' "$stack_tsv" 2>/dev/null
+          )
+          cloud_display="${first_cid:-$cloud} (+$((stack_count-1)) more)"
+        elif (( stack_count == 1 )); then
+          # Single valid Cloud ID – show that (even if table has extra "closed" rows)
+          first_cid=$(
+            awk -F'\t' '
+              $4 ~ /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/ { print $4; exit }
+            ' "$stack_tsv" 2>/dev/null
+          )
+          cloud_display="${first_cid:-$cloud}"
+        fi
+      fi
 
       printf "%-16s %-22s %-8s %-8s %-8s %-10s %-12s %-18s\n" \
         "$ip" "${hostname:-<unknown>}" \
         "$svc" "$fetch" "$primary" "$secondary" "$reg" \
-        "${cloud:-<none>}"
+        "${cloud_display:-<none>}"
 
       if [[ "$ready" == "yes" ]]; then
         READY_IPS+=( "$ip" )
@@ -2308,7 +2372,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
       echo
     fi
 
-    echo "Cloud IDs for READY switches are also exported to:"
+    echo "Cloud IDs for READY switches (including stacks) are also exported to:"
     echo "  $CLOUD_JSON"
     echo
 
@@ -2319,6 +2383,7 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
     fi
   } >"$summary"
 
+  # ---------- NEW: build meraki_cloud_ids.json with all stack members ----------
   {
     echo '['
     local first=1
@@ -2333,18 +2398,35 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
       cloud="${cloud%\"}"; cloud="${cloud#\"}"
       ready="${ready%\"}"; ready="${ready#\"}"
 
-      if [[ "$ready" != "yes" || -z "$cloud" ]]; then
-        continue
-      fi
+      # Only export Cloud IDs for management IPs that are fully ready
+      [[ "$ready" != "yes" ]] && continue
 
-      if (( first )); then
-        first=0
+      local stack_tsv="$RUN_DIR/devlogs/meraki_stack_${ip//./_}.tsv"
+
+      if [[ -s "$stack_tsv" ]]; then
+        # Every line in meraki_stack_*.tsv is one stack member:
+        #   deviceNumber<TAB>pid<TAB>serial<TAB>cloudId
+        while IFS=$'\t' read -r devnum pid serial cid; do
+          [[ -z "$cid" ]] && continue
+          if (( first )); then
+            first=0
+          else
+            echo ','
+          fi
+          printf '  {"ip": "%s", "hostname": "%s", "deviceNumber": "%s", "pid": "%s", "serial": "%s", "cloudId": "%s"}' \
+            "$ip" "${hostname:-}" "${devnum:-}" "${pid:-}" "${serial:-}" "$cid"
+        done <"$stack_tsv"
       else
-        echo ','
+        # Fallback: non-stack / parse failure – behave like old code using single cloud field
+        [[ -z "$cloud" ]] && continue
+        if (( first )); then
+          first=0
+        else
+          echo ','
+        fi
+        printf '  {"ip": "%s", "hostname": "%s", "cloudId": "%s"}' \
+          "$ip" "${hostname:-}" "$cloud"
       fi
-
-      printf '  {"ip": "%s", "hostname": "%s", "cloudId": "%s"}' \
-        "$ip" "${hostname:-}" "$cloud"
     done <"$SUMMARY_CSV"
     echo
     echo ']'
@@ -2352,36 +2434,46 @@ $'Dashboard firewall requirements with your own firewall policy.\n'
 
   ln -sfn "$CLOUD_JSON" "$RUN_ROOT/latest_cloud_ids.json"
 
-  # ---------- inject cloudId into meraki_switch_network_map.json, if present ----------
-if [[ -s "$MAP_JSON" && -s "$CLOUD_JSON" ]]; then
-  validate_ui_status "Injecting Cloud IDs into $MAP_JSON (if any)…"
-  local tmp_map="$RUN_DIR/meraki_switch_network_map.with_cloud.tmp"
+  # ---------- inject cloudId into meraki_switch_network_map.json, including stacks ----------
+  if [[ -s "$MAP_JSON" && -s "$CLOUD_JSON" ]]; then
+    validate_ui_status "Injecting Cloud IDs (including stacks) into $MAP_JSON…"
+    local tmp_map="$RUN_DIR/meraki_switch_network_map.with_cloud.tmp"
 
-  # Read both files at once:
-  # .[0] = switch map JSON
-  # .[1] = cloud IDs JSON
-  if jq -s '
-    . as [$map, $cloud]
-    | $map
-    | map(
-        . as $d
-        | ($cloud[] | select(.ip == $d.ip) | .cloudId) as $cid
-        | if $cid then . + {cloudId:$cid} else . end
-      )
-  ' "$MAP_JSON" "$CLOUD_JSON" >"$tmp_map" 2>"$RUN_DIR/devlogs/meraki_connect_jq.log"; then
-    # Use "command mv" to bypass any shell alias (mv -i etc.)
-    command mv "$tmp_map" "$MAP_JSON"
-  else
-    validate_ui_status "Failed to inject Cloud IDs into $MAP_JSON (see devlogs/meraki_connect_jq.log)."
-    rm -f "$tmp_map" 2>/dev/null || true
+    # Read both files at once:
+    # .[0] = switch map JSON
+    # .[1] = cloud IDs JSON (may have multiple entries per IP)
+    if jq -s '
+      . as [$map, $cloud]
+      | [
+          $map[]
+          | . as $d
+          | ($cloud | map(select(.ip == $d.ip))) as $c
+          | if ($c | length) == 0 then
+              # No Cloud IDs for this IP → leave row as-is (not yet onboarded)
+              $d
+            else
+              # One row in $c per stack member / standalone device
+              $c[]
+              | $d
+                + { cloudId: .cloudId }
+                + (if .pid          then {pid: .pid}                      else {} end)
+                + (if .serial       then {serial: .serial}                else {} end)
+                + (if .deviceNumber then {stackDeviceNumber: .deviceNumber} else {} end)
+            end
+        ]
+    ' "$MAP_JSON" "$CLOUD_JSON" >"$tmp_map" 2>"$RUN_DIR/devlogs/meraki_connect_jq.log"; then
+      command mv "$tmp_map" "$MAP_JSON"
+    else
+      validate_ui_status "Failed to inject Cloud IDs into $MAP_JSON (see devlogs/meraki_connect_jq.log)."
+      rm -f "$tmp_map" 2>/dev/null || true
+    fi
   fi
-fi
 
   dlg --backtitle "$BACKTITLE_C" \
       --title "Meraki connect onboarding summary" \
       --textbox "$summary" 24 100 || true
 
-    # Restore strict mode for the rest of the script
+  # Restore strict mode for the rest of the script
   set -e
   set -u
   set -o pipefail
@@ -2433,18 +2525,37 @@ meraki_claim_cloud_monitored_switches() {
   # ----- build list of devices (base64 rows) from MAP_JSON -----
   # Each row (after base64-decode) is:
   #   [ ip, hostname, networkId, networkName, cloudId, networkAddress ]
+  #
+  # IMPORTANT:
+  #   - Filter out bogus cloudIds like "closed"/"closed."
+  #   - Only keep cloudIds that look like XXXX-XXXX-XXXX
+  #   - De-duplicate by cloudId so we don’t show the same device multiple times
   local -a DEV_ROWS_B64=()
   mapfile -t DEV_ROWS_B64 < <(
     jq -r '
-      .[]
-      | select(.cloudId != null and .cloudId != "" and .networkId != null and .networkId != "")
-      | [ .ip,
-          (.hostname // ""),
-          .networkId,
-          (.networkName // ""),
-          .cloudId,
-          (.networkAddress // "")
-        ]
+      [
+        .[]
+        # Must have networkId + cloudId
+        | select(.networkId != null and .networkId != "")
+        | select(.cloudId != null and .cloudId != "")
+        # Skip junk cloud IDs like "closed" / "closed."
+        | select((.cloudId | ascii_downcase) != "closed")
+        | select((.cloudId | ascii_downcase) != "closed.")
+        # Only keep real Catalyst Cloud IDs: XXXX-XXXX-XXXX (A–Z / 0–9)
+        | select(.cloudId | test("^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$"))
+        | {
+            ip: (.ip // ""),
+            hostname: (.hostname // ""),
+            networkId: .networkId,
+            networkName: (.networkName // ""),
+            cloudId: .cloudId,
+            networkAddress: (.networkAddress // "")
+          }
+      ]
+      # De-duplicate by cloudId (so stale duplicate rows don’t show up)
+      | unique_by(.cloudId)
+      | .[]
+      | [ .ip, .hostname, .networkId, .networkName, .cloudId, .networkAddress ]
       | @base64
     ' "$MAP_JSON"
   )
@@ -2452,7 +2563,7 @@ meraki_claim_cloud_monitored_switches() {
   if (( ${#DEV_ROWS_B64[@]} == 0 )); then
     dlg --backtitle "$BACKTITLE_CL" \
         --title "Nothing to claim" \
-        --msgbox "No switches in $MAP_JSON have both a Meraki Cloud ID and a target networkId.\n\nRun Meraki connect + mapping again before claiming." 13 80
+        --msgbox "No switches in $MAP_JSON have a valid Meraki Cloud ID and networkId.\n\nThis usually means Meraki connect is not fully up or parsing failed.\nFix issues and rerun onboarding before claiming." 15 80
     return 1
   fi
 
@@ -2641,16 +2752,15 @@ meraki_claim_cloud_monitored_switches() {
       continue
     fi
 
-    # Build payload to set device name (hostname) and physical address
-        # Build payload to set physical address only
-    # (Dashboard will learn hostname automatically from the device)
+    # Build payload to set physical address only (Dashboard will learn hostname automatically)
     local dev_body=""
     if [[ -n "$addr" ]]; then
       dev_body="$(jq -n --arg a "$addr" \
         '{address:$a, updateLocation:true, moveMapMarker:true}')" || true
       claim_status "  -> Updating Dashboard device address to: $addr"
     fi
-        if [[ -n "$dev_body" ]]; then
+
+    if [[ -n "$dev_body" ]]; then
       local update_ok=0
       local tries=0
       local code=""
@@ -2704,7 +2814,6 @@ meraki_claim_cloud_monitored_switches() {
 
   return "$any_fail"
 }
-
 
 
 # ------------------------------------------------------------
