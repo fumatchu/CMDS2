@@ -19,7 +19,7 @@ declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/validated_switches.env"
-  ["Migrate Switches"]="/root/.hybrid_admin/runs/migration/latest/meraki_claim_ui.status"
+  ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"
   # (None yet for IOS-XE Upgrade / Logging / Clean Configuration / Server Service Control / Server Management header)
 )
 
@@ -75,17 +75,32 @@ trap cleanup EXIT
 is_done(){  # $1=label -> returns 0 if artifact indicates completion
   local lbl="$1" f="${DONE_FILE[$lbl]:-}"
 
-  # Must have a file path and that file must be non-empty
-  [[ -n "$f" && -s "$f" ]] || return 1
+  [[ -n "$f" ]] || return 1
 
-  # Special logic for Migrate Switches: only "done" if there is NO "FAILED" in the status file
   if [[ "$lbl" == "Migrate Switches" ]]; then
-    if grep -q "FAILED" "$f" 2>/dev/null; then
+    # For migration: the presence of the symlink marks completion.
+    # (Optionally fail if the target contains "FAILED")
+    if [[ -L "$f" ]]; then
+      # If you want to *ignore* failures and still show as done, just: return 0
+      local tgt
+      tgt="$(readlink -f -- "$f" 2>/dev/null || true)"
+      if [[ -n "$tgt" && -e "$tgt" ]]; then
+        # Only show as done if no FAILED lines in the actual claim log
+        if grep -q "FAILED" "$tgt" 2>/dev/null; then
+          return 1
+        else
+          return 0
+        fi
+      fi
+      # Symlink exists but target missing → consider not done
       return 1
     fi
+    # No symlink → not done
+    return 1
   fi
 
-  return 0
+  # Default behavior for all other items: must be a non-empty file
+  [[ -s "$f" ]]
 }
 
 colorize_help(){  # $1=label
