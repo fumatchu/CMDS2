@@ -19,8 +19,8 @@ declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/validated_switches.env"
+  # For migration, we use a symlink to the latest claim log
   ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"
-  # (None yet for IOS-XE Upgrade / Logging / Clean Configuration / Server Service Control / Server Management header)
 )
 
 # Items: label -> script path
@@ -33,12 +33,13 @@ declare -A ITEMS=(
   ["Logging"]="/root/.hybrid_admin/show_logs.sh"
   ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
   ["Server Management"]=""  # header / separator, not an actual script
-  ["Server Service Control"]="/root/.hybrid_admin/service_control.sh"
+  ["Server Service Control"]=""  # now handled by a submenu
 )
 
 # Submenus: label -> function name
 declare -A SUBMENU_FN=(
   ["IOS-XE Upgrade"]="submenu_iosxe"
+  ["Server Service Control"]="submenu_server_services"   # NEW → adds ">" and opens submenu
 )
 
 # Per-item help (status line)
@@ -53,7 +54,7 @@ declare -A HELP_RAW=(
   ["Logging"]="View CMDS deployment and migration log files."
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
   ["Server Management"]="Server management tools and utilities."
-  ["Server Service Control"]="Start/stop/restart CMDS server-side services."
+  ["Server Service Control"]="Manage CMDS services or reboot the server."
 )
 
 # Display order (main menu)
@@ -78,28 +79,22 @@ is_done(){  # $1=label -> returns 0 if artifact indicates completion
   [[ -n "$f" ]] || return 1
 
   if [[ "$lbl" == "Migrate Switches" ]]; then
-    # For migration: the presence of the symlink marks completion.
-    # (Optionally fail if the target contains "FAILED")
+    # Presence of symlink marks completion; optionally fail if underlying log has "FAILED"
     if [[ -L "$f" ]]; then
-      # If you want to *ignore* failures and still show as done, just: return 0
-      local tgt
-      tgt="$(readlink -f -- "$f" 2>/dev/null || true)"
+      local tgt; tgt="$(readlink -f -- "$f" 2>/dev/null || true)"
       if [[ -n "$tgt" && -e "$tgt" ]]; then
-        # Only show as done if no FAILED lines in the actual claim log
         if grep -q "FAILED" "$tgt" 2>/dev/null; then
           return 1
         else
           return 0
         fi
       fi
-      # Symlink exists but target missing → consider not done
       return 1
     fi
-    # No symlink → not done
     return 1
   fi
 
-  # Default behavior for all other items: must be a non-empty file
+  # Default: must be a non-empty file
   [[ -s "$f" ]]
 }
 
@@ -114,11 +109,9 @@ colorize_help(){  # $1=label
 display_label(){  # $1=label -> returns label with green check and submenu marker if applicable
   local lbl="$1" text
 
-  # Special formatting for the section header
+  # Section header formatting
   if [[ "$lbl" == "Server Management" ]]; then
-    # Just a visual separator; no checkmark, no submenu marker
-    text="---------------- Server Management ----------------"
-    printf "%s" "$text"
+    printf "%s" "---------------- Server Management ----------------"
     return
   fi
 
@@ -129,10 +122,9 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
     text="$lbl"
   fi
 
-  # If this label opens a submenu, append an indicator
+  # Submenu marker
   if [[ -n "${SUBMENU_FN[$lbl]:-}" ]]; then
     text="$text  >"
-    # Or: text="$text  ▶" if you prefer that and the terminal cooperates.
   fi
 
   printf "%s" "$text"
@@ -141,7 +133,7 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
 run_target(){
   local script="$1" label="$2"
 
-  # Do nothing if this is the header/separator
+  # Header item does nothing
   if [[ "$label" == "Server Management" ]]; then
     return
   fi
@@ -175,21 +167,13 @@ submenu_iosxe(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # Deploy now
     local lbl1="Deploy IOS-XE"
     local path1="/root/.hybrid_admin/image_upgrade.sh"
-    MENU_ITEMS+=("$i" "$lbl1" "$(colorize_help "$lbl1")")
-    PATH_BY_TAG["$i"]="$path1"
-    LABEL_BY_TAG["$i"]="$lbl1"
-    ((i++))
+    MENU_ITEMS+=("$i" "$lbl1" "$(colorize_help "$lbl1")"); PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
 
-    # Schedule Image Upgrade
     local lbl2="Schedule Image Upgrade"
     local path2="/root/.hybrid_admin/scheduler.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2")")
-    PATH_BY_TAG["$i"]="$path2"
-    LABEL_BY_TAG["$i"]="$lbl2"
-    ((i++))
+    MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2)")"); PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to main menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
 
@@ -207,6 +191,70 @@ submenu_iosxe(){
   done
 }
 
+# ---------- Server Service Control submenu (NEW) ----------
+submenu_server_services(){
+  local SUB_TITLE="Server Service Control"
+
+  # tiny helper to color help text yellow (same as main menu)
+  color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+
+  while true; do
+    local MENU_ITEMS=()
+    local -A PATH_BY_TAG=()
+    local -A LABEL_BY_TAG=()
+    local i=1
+
+    # Option 1: manage services
+    local lbl1="Manage CMDS Services"
+    local path1="/root/.hybrid_admin/service_control.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Start/stop/restart CMDS services via dialog.")")
+    PATH_BY_TAG["$i"]="$path1"
+    LABEL_BY_TAG["$i"]="$lbl1"
+    ((i++))
+
+    # Option 2: reboot server
+    local lbl2="Reboot Server"
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Safely reboot this server (confirmation required).")")
+    PATH_BY_TAG["$i"]=""
+    LABEL_BY_TAG["$i"]="$lbl2"
+    ((i++))
+
+    MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
+
+    local CHOICE=$(
+      dialog --no-shadow --colors --item-help \
+        --backtitle "$BACKTITLE" \
+        --title "$SUB_TITLE" \
+        --menu "Select an option:" 14 78 8 \
+        "${MENU_ITEMS[@]}" \
+        3>&1 1>&2 2>&3
+    ) || return 0
+
+    case "$CHOICE" in
+      0) return 0 ;;
+      1) run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}" ;;
+      2)
+        if [[ $EUID -ne 0 ]]; then
+          dialog --no-shadow --backtitle "$BACKTITLE" --title "Permission required" \
+                 --msgbox "Reboot requires root privileges." 7 60
+          continue
+        fi
+        dialog --no-shadow --backtitle "$BACKTITLE" --title "Confirm Reboot" --yesno \
+"Are you sure you want to reboot this server now?
+
+Active tasks or SSH sessions may be interrupted." 10 70
+        if (( $? == 0 )); then
+          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 3 seconds…" 5 40; sleep 1
+          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 2 seconds…" 5 40; sleep 1
+          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 1 second…" 5 40; sleep 1
+          clear
+          systemctl reboot || reboot || shutdown -r now
+          exit 0
+        fi
+        ;;
+    esac
+  done
+}
 # ---------- Main menu loop ----------
 while true; do
   MENU_ITEMS=()
