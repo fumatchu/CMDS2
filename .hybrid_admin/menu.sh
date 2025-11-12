@@ -133,12 +133,12 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
 run_target(){
   local script="$1" label="$2"
 
-  # Header item does nothing
+  # Section header? do nothing.
   if [[ "$label" == "Server Management" ]]; then
     return
   fi
 
-  # If this label maps to a submenu, open it
+  # Submenu?
   if [[ -n "${SUBMENU_FN[$label]:-}" ]]; then
     "${SUBMENU_FN[$label]}"
     return
@@ -146,18 +146,23 @@ run_target(){
 
   clear
   if [[ -n "$script" && -f "$script" ]]; then
+    # Run child and capture status without letting -e kill us
+    set +e
     bash "$script"
     local rc=$?
-    if (( rc != 0 )); then
-      dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
-             --msgbox "Script exited with status $rc.\n\n$script" 8 72
-    fi
+    set -e
+
+    case "$rc" in
+      0) : ;;                            # success
+      1|255|130|143) return 0 ;;         # dialog Cancel/Esc/Ctrl-C → not an error
+      *)  dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
+                --msgbox "Script exited with status $rc.\n\n$script" 8 72 ;;
+    esac
   else
     dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
            --msgbox "Cannot find:\n${script:-<none>}" 7 60
   fi
 }
-
 # ---------- IOS-XE Upgrade submenu ----------
 submenu_iosxe(){
   local SUB_TITLE="IOS-XE Upgrade"
