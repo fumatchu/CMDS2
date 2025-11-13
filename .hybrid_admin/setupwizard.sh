@@ -243,8 +243,7 @@ validate_dns_servers() {
   Primary   ($DNS_PRIMARY): ${P_ANS}
   Secondary ($DNS_SECONDARY): ${S_ANS}
 
-Note: These are *fallback* resolvers. If a switch already has working DNS,
-we won’t overwrite it." 13 "$W_DEF"
+Note: These are *fallback* resolvers. If switch does not have any" 13 "$W_DEF"
       export DNS_PRIMARY DNS_SECONDARY
       return 0
     fi
@@ -392,14 +391,14 @@ fi
 # 3) SSH CREDS (require non-empty) + TEST
 ###############################################################################
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" --inputbox "Enter SSH username:" 8 "$W_DEF"
+  dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" --inputbox "Enter SSH switch username:" 8 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
   SSH_USERNAME="$(trim "${DOUT:-}")"
   [ -n "$SSH_USERNAME" ] && break
   dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 "$W_DEF"
 done
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF"
+  dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" --insecure --passwordbox "Enter SSH switch password (masked with *):" 9 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
   SSH_PASSWORD="$(trim "${DOUT:-}")"
   [ -n "$SSH_PASSWORD" ] && break
@@ -415,7 +414,7 @@ if [ -n "$DISCOVERY_IPS" ]; then
   SSH_TEST_IP="$(trim "${DOUT:-}")"
 else
   while :; do
-    dlg --clear --backtitle "$BACKTITLE" --title "Test Device IP" --inputbox "Enter an IP address to test the SSH login:" 9 "$W_DEF" "$SSH_TEST_IP"
+    dlg --clear --backtitle "$BACKTITLE" --title "Test Device IP" --inputbox "Enter a switch IP address to test the SSH login:" 9 "$W_DEF" "$SSH_TEST_IP"
     rc=$?; [ $rc -eq 0 ] || { clear; exit 1; }
     val="$(trim "${DOUT:-}")"
     [ -n "$val" ] && is_valid_ip "$val" && SSH_TEST_IP="$val" && break
@@ -476,7 +475,7 @@ while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Enable Password (required)" \
       --insecure --passwordbox \
 "Enter the device's ENABLE password.
-We'll verify it now so it can be sent to Meraki during claim later." \
+We'll verify it now so it can be sent during claim process." \
       10 "$W_DEF"
   rc=$?; [ $rc -ne 0 ] && { clear; exit 1; }
 
@@ -497,7 +496,7 @@ We'll verify it now so it can be sent to Meraki during claim later." \
   if [ $rc -eq 0 ] || [ $rc -eq 5 ]; then
     ENABLE_TEST_OK="1"
     dlg --backtitle "$BACKTITLE" --title "Enable Test" \
-        --msgbox "Enable password verified and stored for later Meraki claim." 7 "$W_DEF"
+        --msgbox "Enable password verified and stored for later claim." 7 "$W_DEF"
     break
   fi
 
@@ -515,14 +514,17 @@ done
 # 3b) MERAKI API KEY
 ###############################################################################
 while :; do
-  dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox "Paste your Meraki Dashboard API key:\n(Asterisks shown while typing; last 4 shown in summary.)" 10 "$W_WIDE"
+  dlg --clear --backtitle "$BACKTITLE" \
+      --title "Meraki API Key" \
+      --insecure --passwordbox \
+"Paste your Meraki Dashboard API key:" \
+      8 "$W_DEF"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
   printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$' >/dev/null 2>&1 && break
   dlg --yesno "The key format looks unusual.\nUse it anyway?" 9 "$W_DEF"; [ $? -eq 0 ] && break
 done
-
 ###############################################################################
 # 3c) DNS — REQUIRED (validated with dig; fallbacks)
 ###############################################################################
@@ -692,11 +694,12 @@ while :; do
     esac
   fi
 
-  # Cat9k (universal) menu
+    # Cat9k (universal) menu
   if [ -s "$U_FILE" ]; then
     # shellcheck disable=SC2086
     dlg --clear --backtitle "$BACKTITLE" --title "Select Firmware — Cat9k (universal)" \
-        --menu "Choose a Cat9k (9300/9400/9500/9600) image (sorted by version asc):" 22 "$W_WIDE" 16 $U_ARGS
+        --menu "Choose a Cat9k (9300/9400/9500/9600) image (sorted by version asc):" \
+        12 "$((W_DEF + 10))" 4 $U_ARGS
     [ $? -eq 0 ] && FW_CAT9K_FILE="${DOUT:-}"
   fi
 
@@ -704,7 +707,8 @@ while :; do
   if [ -s "$L_FILE" ]; then
     # shellcheck disable=SC2086
     dlg --clear --backtitle "$BACKTITLE" --title "Select Firmware — Cat9k-Lite (9200)" \
-        --menu "Choose a Cat9k-Lite (9200) image (sorted by version asc):" 22 "$W_WIDE" 16 $L_ARGS
+        --menu "Choose a Cat9k-Lite (9200) image (sorted by version asc):" \
+        12 "$((W_DEF + 10))" 4 $L_ARGS
     [ $? -eq 0 ] && FW_CAT9K_LITE_FILE="${DOUT:-}"
   fi
 
@@ -931,13 +935,7 @@ SVI_SUMMARY="$( printf '%s (%s)' "$HTTP_CLIENT_SOURCE_IFACE" "$HTTP_CLIENT_VLAN_
 ENABLE_SUMMARY="provided (verified)"
 DEFPRIV_SUMMARY="$( [ "$DEFAULT_PRIV15_OK" = "1" ] && echo "# (priv 15)" || echo "> (user exec)" )"
 
-summary="Saved: ${ENV_FILE}
-
-Discovery run ID:
-  ${DISCOVERY_RUN_ID}
-Discovery run directory:
-  ${DISCOVERY_RUN_DIR}
-  (per-device logs: ${DISCOVERY_RUN_DIR}/devlogs)
+summary="Wizard Results:
 
 SSH Username: ${SSH_USERNAME}
 SSH Password: ${PW_MASK}
@@ -974,5 +972,6 @@ Cat9k-Lite (9200):
 "
 fi
 
-dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "$summary" 24 "$W_WIDE"
+dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" \
+    --msgbox "$summary" 40 85
 clear
