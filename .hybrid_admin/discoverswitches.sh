@@ -149,10 +149,20 @@ _ui_calc_layout() {
   local lines cols
   if ! read -r lines cols < <(stty size 2>/dev/null); then lines=24 cols=80; fi
   if (( lines < 18 || cols < 70 )); then DIALOG_AVAILABLE=0; return; fi
+
+  # Log window: almost full height, leaves room for gauge + margins
   TAIL_H=$((lines - 10)); (( TAIL_H < 10 )) && TAIL_H=10
   TAIL_W=$((cols - 4));   (( TAIL_W < 68 )) && TAIL_W=68
-  GAUGE_H=7; GAUGE_W=$TAIL_W; GAUGE_ROW=$((TAIL_H + 2)); GAUGE_COL=2
+
+  GAUGE_H=7
+  GAUGE_W=$TAIL_W
+
+  # Tailbox begins at row 2; its bottom row is (2 + TAIL_H - 1) = TAIL_H+1
+  # Start gauge a couple of lines below that.
+  GAUGE_ROW=$((TAIL_H + 3))
+  GAUGE_COL=2
 }
+
 _ui_fd_open() {
   [[ -n "${PROG_FD:-}" ]] || return 1
   if [[ -e "/proc/$$/fd/$PROG_FD" ]]; then return 0; fi
@@ -167,7 +177,8 @@ ui_start() {
     exec {PROG_FD}<>"$PROG_PIPE"
     (
       dialog --no-shadow \
-             --begin 1 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
+             --backtitle "Discovering Switches" \
+             --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
              --and-widget \
              --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
              --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE"
@@ -177,6 +188,7 @@ ui_start() {
     echo "[info] UI plain mode (set UI_MODE=dialog and install 'dialog')."
   fi
 }
+
 ui_status() {
   local msg="$1"
   log_msg "STATUS: $msg"
@@ -827,14 +839,7 @@ Clean up configuration before attempting to migrate these switches." 8 70
   dialog --no-shadow --infobox \
 "Selection saved.
 
-Env:  $SEL_ENV_OUT
-
-Selected IPs:
-  ${FILTERED_SEL[*]}
-
-BLACKLISTED entries (e.g. meraki-user exists) were ignored.
-
-Use this env in your upgrade step." 13 80
+BLACKLISTED entries (e.g. meraki-user exists) were ignored." 8 80
   sleep 3
   return 0
 }
