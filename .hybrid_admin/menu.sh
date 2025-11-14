@@ -32,14 +32,16 @@ declare -A ITEMS=(
   ["Migrate Switches"]="/root/.hybrid_admin/migration.sh"
   ["Logging"]="/root/.hybrid_admin/show_logs.sh"
   ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
+  ["Utilities"]=""  # handled by submenu
   ["Server Management"]=""  # header / separator, not an actual script
-  ["Server Service Control"]=""  # now handled by a submenu
+  ["Server Service Control"]=""  # handled by submenu
 )
 
 # Submenus: label -> function name
 declare -A SUBMENU_FN=(
   ["IOS-XE Upgrade"]="submenu_iosxe"
-  ["Server Service Control"]="submenu_server_services"   # NEW → adds ">" and opens submenu
+  ["Utilities"]="submenu_utilities"
+  ["Server Service Control"]="submenu_server_services"
 )
 
 # Per-item help (status line)
@@ -53,6 +55,8 @@ declare -A HELP_RAW=(
   ["Migrate Switches"]="Run the Catalyst-to-Meraki switch migration workflow and claim devices into Dashboard."
   ["Logging"]="View CMDS deployment and migration log files."
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
+  ["Utilities"]="Utility tools for monitoring and quick checks."
+  ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
 )
@@ -66,6 +70,7 @@ ORDER=(
   "Migrate Switches"
   "Logging"
   "Clean Configuration (New Batch Deployment)"
+  "Utilities"
   "Server Management"
   "Server Service Control"
 )
@@ -163,6 +168,7 @@ run_target(){
            --msgbox "Cannot find:\n${script:-<none>}" 7 60
   fi
 }
+
 # ---------- IOS-XE Upgrade submenu ----------
 submenu_iosxe(){
   local SUB_TITLE="IOS-XE Upgrade"
@@ -178,7 +184,7 @@ submenu_iosxe(){
 
     local lbl2="Schedule Image Upgrade"
     local path2="/root/.hybrid_admin/scheduler.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2)")"); PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
+    MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2")"); PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to main menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
 
@@ -196,11 +202,55 @@ submenu_iosxe(){
   done
 }
 
-# ---------- Server Service Control submenu (NEW) ----------
+# ---------- Utilities submenu ----------
+# ---------- Utilities submenu ----------
+submenu_utilities(){
+  local SUB_TITLE="Utilities"
+
+  color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+
+  while true; do
+    local MENU_ITEMS=()
+    local -A PATH_BY_TAG=()
+    local -A LABEL_BY_TAG=()
+    local i=1
+
+    # 1) Switch UP/Down Status (ping monitor)
+    local lbl1="Switch UP/Down Status"
+    local path1="/root/.hybrid_admin/ping.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Continuous ping monitor for selected switches (UP/DOWN).")")
+    PATH_BY_TAG["$i"]="$path1"
+    LABEL_BY_TAG["$i"]="$lbl1"
+    ((i++))
+
+    # 2) IOS-XE Image Management
+    local lbl2="IOS-XE Image Management"
+    local path2="/root/.hybrid_admin/image_management.sh"
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
+    PATH_BY_TAG["$i"]="$path2"
+    LABEL_BY_TAG["$i"]="$lbl2"
+    ((i++))
+
+    # Back
+    MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
+
+    local CHOICE=$(
+      dialog --no-shadow --colors --item-help \
+        --backtitle "$BACKTITLE" \
+        --title "$SUB_TITLE" \
+        --menu "Select a utility:" 14 78 8 \
+        "${MENU_ITEMS[@]}" \
+        3>&1 1>&2 2>&3
+    ) || return 0
+
+    [[ "$CHOICE" == "0" ]] && return 0
+    run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+  done
+}
+# ---------- Server Service Control submenu ----------
 submenu_server_services(){
   local SUB_TITLE="Server Service Control"
 
-  # tiny helper to color help text yellow (same as main menu)
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
   while true; do
@@ -260,6 +310,7 @@ Active tasks or SSH sessions may be interrupted." 10 70
     esac
   done
 }
+
 # ---------- Main menu loop ----------
 while true; do
   MENU_ITEMS=()
