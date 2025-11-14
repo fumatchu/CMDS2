@@ -103,14 +103,16 @@ _validate_calc_layout() {
     VALIDATE_DIALOG_AVAILABLE=0
     return
   fi
-  VALIDATE_TAIL_H=$((lines - 10)); (( VALIDATE_TAIL_H < 10 )) && VALIDATE_TAIL_H=10
-  VALIDATE_TAIL_W=$((cols - 4));   (( VALIDATE_TAIL_W < 68 )) && VALIDATE_TAIL_W=68
+
+  # Slightly smaller log window so the backtitle has breathing room
+  VALIDATE_TAIL_H=$((lines - 14)); (( VALIDATE_TAIL_H < 10 )) && VALIDATE_TAIL_H=10
+  VALIDATE_TAIL_W=$((cols - 10));  (( VALIDATE_TAIL_W < 68 )) && VALIDATE_TAIL_W=68
+
   VALIDATE_GAUGE_H=7
   VALIDATE_GAUGE_W=$VALIDATE_TAIL_W
-  VALIDATE_GAUGE_ROW=$((VALIDATE_TAIL_H + 2))
+  VALIDATE_GAUGE_ROW=$((VALIDATE_TAIL_H + 3))
   VALIDATE_GAUGE_COL=2
 }
-
 _validate_fd_open() {
   [[ -n "${VALIDATE_FD:-}" ]] || return 1
   if [[ -e "/proc/$$/fd/$VALIDATE_FD" ]]; then
@@ -139,13 +141,15 @@ validate_ui_start() {
     mkfifo "$VALIDATE_PIPE"
     exec {VALIDATE_FD}<>"$VALIDATE_PIPE"
     (
-      dialog --no-shadow \
-             --begin 1 2 --title "$title" \
-             --tailboxbg "$VALIDATE_STATUS_FILE" "$VALIDATE_TAIL_H" "$VALIDATE_TAIL_W" \
-             --and-widget \
-             --begin "$VALIDATE_GAUGE_ROW" "$VALIDATE_GAUGE_COL" \
-             --title "Overall Progress" \
-             --gauge "Starting…" "$VALIDATE_GAUGE_H" "$VALIDATE_GAUGE_W" 0 < "$VALIDATE_PIPE"
+  dialog --no-shadow \
+         --backtitle "CMDS Migration – Validating Selection" \
+         --begin 2 2 \
+         --title "$title" \
+         --tailboxbg "$VALIDATE_STATUS_FILE" "$VALIDATE_TAIL_H" "$VALIDATE_TAIL_W" \
+         --and-widget \
+         --begin "$VALIDATE_GAUGE_ROW" "$VALIDATE_GAUGE_COL" \
+         --title "Overall Progress" \
+         --gauge "Starting…" "$VALIDATE_GAUGE_H" "$VALIDATE_GAUGE_W" 0 < "$VALIDATE_PIPE"
     ) &
     VALIDATE_DIALOG_PID=$!
     sleep 0.15
@@ -781,7 +785,7 @@ validate_switches_before_migration() {
   # ---------- dialogs ----------
   dlg --backtitle "$BACKTITLE_V" \
       --title "Validation summary" \
-      --textbox "$summary" 24 160 || true
+      --textbox "$summary" 35 160 || true
 
   local rc=0
   if ((${#BAD_PING_IPS[@]} || ${#BAD_VER_IPS[@]} || ${#BAD_CFG_IPS[@]} || ${#BAD_MERAKI_IPS[@]})); then
@@ -1522,7 +1526,7 @@ USAGE
 
   dlg --backtitle "$BACKTITLE_M" \
       --title "Done" \
-      --infobox "Switch-to-network mapping saved." 5 60
+      --infobox "Switch-to-network mapping saved" 5 60
 
   sleep 2
 
@@ -2372,15 +2376,6 @@ onboard_meraki_connect_switches() {
       echo
     fi
 
-    echo "Cloud IDs for READY switches (including stacks) are also exported to:"
-    echo "  $CLOUD_JSON"
-    echo
-
-    if [[ -s "$MAP_JSON" ]]; then
-      echo "Switch-to-network mapping file (updated with cloudId where available):"
-      echo "  $MAP_JSON"
-      echo
-    fi
   } >"$summary"
 
   # ---------- NEW: build meraki_cloud_ids.json with all stack members ----------
@@ -2471,7 +2466,7 @@ onboard_meraki_connect_switches() {
 
   dlg --backtitle "$BACKTITLE_C" \
       --title "Meraki connect onboarding summary" \
-      --textbox "$summary" 24 100 || true
+      --textbox "$summary" 35 140 || true
 
   # Restore strict mode for the rest of the script
   set -e
@@ -2600,7 +2595,7 @@ meraki_claim_cloud_monitored_switches() {
 
   dlg --backtitle "$BACKTITLE_CL" \
       --title "Switches to claim" \
-      --textbox "$tmp_summary" 22 110 || true
+      --textbox "$tmp_summary" 22 140 || true
 
   rm -f "$tmp_summary" 2>/dev/null || true
 
