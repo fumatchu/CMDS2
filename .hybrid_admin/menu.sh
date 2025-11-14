@@ -203,7 +203,6 @@ submenu_iosxe(){
 }
 
 # ---------- Utilities submenu ----------
-# ---------- Utilities submenu ----------
 submenu_utilities(){
   local SUB_TITLE="Utilities"
 
@@ -226,9 +225,17 @@ submenu_utilities(){
     # 2) IOS-XE Image Management
     local lbl2="IOS-XE Image Management"
     local path2="/root/.hybrid_admin/image_management.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help 'Manage IOS-XE image files (list, inspect, and clean up).')")
     PATH_BY_TAG["$i"]="$path2"
     LABEL_BY_TAG["$i"]="$lbl2"
+    ((i++))
+
+    # 3) Backup Config Viewer
+    local lbl3="Backup Config Viewer"
+    local path3="/root/.hybrid_admin/back_config_viewer.sh"
+    MENU_ITEMS+=("$i" "$lbl3" "$(color_help 'Browse and search saved switch backup configs.')")
+    PATH_BY_TAG["$i"]="$path3"
+    LABEL_BY_TAG["$i"]="$lbl3"
     ((i++))
 
     # Back
@@ -238,7 +245,7 @@ submenu_utilities(){
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
-        --menu "Select a utility:" 14 78 8 \
+        --menu "Select a utility:" 16 78 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || return 0
@@ -247,6 +254,7 @@ submenu_utilities(){
     run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
   done
 }
+
 # ---------- Server Service Control submenu ----------
 submenu_server_services(){
   local SUB_TITLE="Server Service Control"
