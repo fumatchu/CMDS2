@@ -60,9 +60,33 @@ SSH_TIMEOUT="${SSH_TIMEOUT:-30}"
 DEBUG="${DISCOVERY_DEBUG:-0}"
 UI_MODE="${UI_MODE:-dialog}"                    # dialog|plain
 
+# Optional TFTP backup (like IOS-XE upgrade script)
+# You *can* override via ENV:
+#   export TFTP_BASE="tftp://<cmds-ip>/hybrid"
+TFTP_BASE="${TFTP_BASE:-}"
+
+detect_server_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 8.8.8.8 2>/dev/null \
+          | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null \
+                           | awk '{for(i=1;i<=NF;i++) if($i!="127.0.0.1"){print $i; exit}}')"
+  echo "$ip"
+}
+
+SERVER_IP=""
+if [[ -z "$TFTP_BASE" ]]; then
+  SERVER_IP="$(detect_server_ip)"
+  if [[ -n "$SERVER_IP" ]]; then
+    TFTP_BASE="tftp://${SERVER_IP}/hybrid"
+  fi
+fi
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
 need nmap; need jq; need awk; need sed
-command -v sshpass >/dev/null 2>&1 || echo "NOTE: sshpass not found; password auth disabled unless SSH_KEY_PATH is set."
+command -v sshpass >/dev/null 2>/dev/null || echo "NOTE: sshpass not found; password auth disabled unless SSH_KEY_PATH is set."
 
 OUT_DIR="$(dirname "$ENV_FILE")"
 JSON_OUT="$OUT_DIR/discovery_results.json"
@@ -169,6 +193,7 @@ _ui_fd_open() {
   { : >&"$PROG_FD"; } 2>/dev/null || return 1
   return 0
 }
+
 ui_start() {
   _ui_calc_layout
   log_msg "UI: start (DIALOG_AVAILABLE=$DIALOG_AVAILABLE)"
@@ -195,6 +220,7 @@ ui_status() {
   printf '%(%H:%M:%S)T %s\n' -1 "$msg" >> "$STATUS_FILE"
   (( DIALOG_AVAILABLE )) || echo "$msg"
 }
+
 ui_gauge()  {
   local p="$1"; shift || true; local m="${*:-Working…}"
   log_msg "GAUGE: ${p}%% - $m"
@@ -204,6 +230,7 @@ ui_gauge()  {
     echo "[progress] $p%% - $m"
   fi
 }
+
 ui_stop() {
   log_msg "UI: stop"
   if (( DIALOG_AVAILABLE )); then
@@ -225,7 +252,12 @@ ui_stop() {
 trap 'ui_stop' EXIT
 
 # ===== helpers =====
-clean_field() { local s; s="$(printf '%s' "$1" | tr -d '\r\n')"; s="$(printf '%s' "$s" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//; s/[#]$//')"; printf '%s' "$s"; }
+clean_field() {
+  local s
+  s="$(printf '%s' "$1" | tr -d '\r\n')"
+  s="$(printf '%s' "$s" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//; s/[#]$//')"
+  printf '%s' "$s"
+}
 
 # --- version helpers (for UPGRADE/DOWNGRADE/SAME labels) ---
 extract_iosxe_ver_from_file() {  # from: cat9k_lite_iosxe.17.15.03.SPA.bin
@@ -234,7 +266,11 @@ extract_iosxe_ver_from_file() {  # from: cat9k_lite_iosxe.17.15.03.SPA.bin
   [[ -n "$v" ]] || v="$(sed -nE 's/.*([0-9]+(\.[0-9]+){1,4}).*/\1/p' <<<"$b")"
   printf '%s\n' "$v"
 }
-sanitize_ver(){ local v="${1:-}"; v="${v//[^0-9.]/}"; sed -E 's/\.+/./g; s/^\.//; s/\.$//' <<<"$v"; }
+sanitize_ver(){
+  local v="${1:-}"
+  v="${v//[^0-9.]/}"
+  sed -E 's/\.+/./g; s/^\.//; s/\.$//' <<<"$v"
+}
 vercmp(){  # -1 (a<b), 0 (==), 1 (a>b)
   local a b i len ai bi
   a="$(sanitize_ver "$1")"; b="$(sanitize_ver "$2")"
@@ -244,12 +280,17 @@ vercmp(){  # -1 (a<b), 0 (==), 1 (a>b)
     ai="${A[i]:-0}"; bi="${B[i]:-0}"
     ((10#$ai < 10#$bi)) && { echo -1; return; }
     ((10#$ai > 10#$bi)) && { echo 1; return; }
-  done; echo 0
+  done
+  echo 0
 }
 plan_action_label(){  # UPGRADE/DOWNGRADE/SAME/UNKNOWN
   local cur="$(sanitize_ver "$1")" tgt="$(sanitize_ver "$2")"
   [[ -z "$cur" || -z "$tgt" ]] && { echo "UNKNOWN"; return; }
-  case "$(vercmp "$cur" "$tgt")" in -1) echo "UPGRADE";; 1) echo "DOWNGRADE";; 0) echo "SAME";; esac
+  case "$(vercmp "$cur" "$tgt")" in
+    -1) echo "UPGRADE" ;;
+     1) echo "DOWNGRADE" ;;
+     0) echo "SAME" ;;
+  esac
 }
 
 # ===== SSH probe (pure Bash; no expect) =====
@@ -380,7 +421,8 @@ probe_host() {
 
   pid="$(grep -m1 -E 'PID:[[:space:]]*[^,]+' "$outn" | sed -E 's/.*PID:[[:space:]]*([^,]+).*/\1/')"
   sn="$(grep -m1 -E 'SN:[[:space:]]*[A-Za-z0-9]+' "$outn" | sed -E 's/.*SN:[[:space:]]*([^,[:space:]]+).*/\1/')"
-  pid="$(clean_field "${pid:-}")"; sn="$(clean_field "${sn:-}")"
+  pid="$(clean_field "${pid:-}")"
+  sn="$(clean_field "${sn:-}")"
 
   # --- Blacklist detection: username meraki-user ---
   local bl_flag="false"
@@ -389,6 +431,47 @@ probe_host() {
     bl_flag="true"
     bl_reason="meraki-user exists"
     log_msg "probe_host: ip=$ip blacklist meraki-user exists"
+  fi
+
+  # --- Optional TFTP backup of running-config (only if login_ok and TFTP_BASE set) ---
+  if (( login_ok )) && [[ -n "$TFTP_BASE" ]]; then
+    local bk_hn bk_ts bk_url bk_raw bk_rc=0
+    # Use discovered hostname if we have it; otherwise synthesize one from IP
+    bk_hn="${hostname:-}"
+    [[ -z "$bk_hn" ]] && bk_hn="sw-${ip//./-}"
+    bk_ts="$(date -u +%Y%m%d-%H%M)"
+    bk_url="${TFTP_BASE}/${bk_hn}-${bk_ts}.cfg"
+
+    ui_status "[${ip}] Backing up running-config via TFTP…"
+    log_msg "backup: ip=$ip url=$bk_url"
+
+    bk_raw="$(mktemp)"
+
+    {
+      printf '\r\nterminal length 0\r\nterminal width 511\r\n'
+      # If we were not at privilege 15 in the first pass but we do have an
+      # enable password, try entering enable before copying.
+      if (( at15 == 0 )) && [[ -n "${ENABLE_PASSWORD:-}" ]]; then
+        printf 'enable\r\n'
+        printf '%s\r\n' "$ENABLE_PASSWORD"
+      fi
+      printf 'copy running-config %s\r\n' "$bk_url"
+      printf '\r\n'; sleep 0.5; printf '\r\n'
+      printf 'exit\r\n'
+    } | _run_ssh_script "${SSH_TIMEOUT:-120}" >"$bk_raw" 2>&1 || bk_rc=$?
+
+    # Append backup session to the per-host log
+    tr -d '\r' < "$bk_raw" >> "$log"
+
+    if grep -qiE 'bytes copied|Copy complete|[Ss]uccess' "$bk_raw"; then
+      ui_status "[${ip}] TFTP backup complete."
+      log_msg "backup: ip=$ip status=OK rc=$bk_rc"
+      rm -f "$bk_raw"
+    else
+      ui_status "[${ip}] TFTP backup FAILED (see devlogs)."
+      log_msg "backup: ip=$ip status=FAILED rc=$bk_rc"
+      mv -f "$bk_raw" "$RUN_DIR/${ip}.backup.out"
+    fi
   fi
 
   rm -f "$out_priv" "$facts" "$outn"
@@ -492,6 +575,7 @@ run_nmap_with_heartbeat() {
 
   rm -f "$tmp"
 }
+
 pass_a() {
   local probes=(-PE -PS22,80,443,830 -PA22,443)
   (( USE_IFACE )) && probes+=(-PR)
@@ -505,8 +589,9 @@ pass_b() {
 pass_c() {
   run_nmap_with_heartbeat "Discovering live hosts (TCP ping)" -Pn -PS22,80,443
 }
+
 pass_fping() {
-  command -v fping >/dev/null 2>&1 || return 0
+  command -v fping >/dev/null 2>/dev/null || return 0
   local out=()
   for t in "${TARGETS[@]}"; do
     if [[ "$t" =~ / ]]; then
@@ -522,6 +607,7 @@ pass_fping() {
         printf '%s\n' "$ip"
       done || true
 }
+
 discover_targets() {
   ui_status "Discovering live hosts (pass 1/3)…"; ui_gauge 5 "Scanning (hybrid)…"
   local live=(); mapfile -t live < <(pass_a)
@@ -843,14 +929,22 @@ BLACKLISTED entries (e.g. meraki-user exists) were ignored." 8 80
   sleep 3
   return 0
 }
+
 # ===== Main =====
 main() {
   log_msg "=== scan run start ==="
   log_msg "ENV_FILE=$ENV_FILE"
   log_msg "DISCOVERY_MODE=${DISCOVERY_MODE:-} DISCOVERY_IPS=${DISCOVERY_IPS:-} DISCOVERY_NETWORKS=${DISCOVERY_NETWORKS:-}"
   log_msg "SSH_USERNAME=${SSH_USERNAME:-} MAX_SSH_FANOUT=${MAX_SSH_FANOUT:-1} UI_MODE=${UI_MODE:-dialog}"
+  log_msg "TFTP_BASE=${TFTP_BASE:-<none>}"
 
   ui_start; ui_gauge 1 "Initializing…"
+
+  if [[ -n "$TFTP_BASE" ]]; then
+    ui_status "TFTP backup enabled → ${TFTP_BASE}"
+  else
+    ui_status "TFTP backup disabled (no local server IP detected)."
+  fi
 
   resolve_targets || {
     ui_status "No targets; writing empty discovery outputs."
@@ -875,7 +969,9 @@ main() {
   SSH_TMP="$(mktemp)"
   filter_ssh_open "${live[@]}" >"$SSH_TMP" 2>/dev/null || true
   ssh_hosts=()
-  if [[ -s "$SSH_TMP" ]]; then mapfile -t ssh_hosts < "$SSH_TMP" 2>/dev/null || true; fi
+  if [[ -s "$SSH_TMP" ]]; then
+    mapfile -t ssh_hosts < "$SSH_TMP" 2>/dev/null || true
+  fi
   rm -f "$SSH_TMP"
   ui_status "SSH port check: found ${#ssh_hosts[@]} host(s) with TCP/22 open."
   log_msg "main: ssh_open_count=${#ssh_hosts[@]} ssh_hosts='${ssh_hosts[*]:-}'"
