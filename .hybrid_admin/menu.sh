@@ -57,6 +57,9 @@ declare -A HELP_RAW=(
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
   ["Utilities"]="Utility tools for monitoring and quick checks."
   ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
+  ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
+  ["CLI Updater"]="Run ad-hoc CLI command packs on selected switches."
+  ["Backup Config Viewer"]="Browse and search saved switch backup configs."
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
 )
@@ -225,17 +228,25 @@ submenu_utilities(){
     # 2) IOS-XE Image Management
     local lbl2="IOS-XE Image Management"
     local path2="/root/.hybrid_admin/image_management.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(color_help 'Manage IOS-XE image files (list, inspect, and clean up).')")
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
     PATH_BY_TAG["$i"]="$path2"
     LABEL_BY_TAG["$i"]="$lbl2"
     ((i++))
 
-    # 3) Backup Config Viewer
-    local lbl3="Backup Config Viewer"
-    local path3="/root/.hybrid_admin/back_config_viewer.sh"
-    MENU_ITEMS+=("$i" "$lbl3" "$(color_help 'Browse and search saved switch backup configs.')")
+    # 3) CLI Updater
+    local lbl3="CLI Updater"
+    local path3="/root/.hybrid_admin/cli-updater.sh"
+    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
     PATH_BY_TAG["$i"]="$path3"
     LABEL_BY_TAG["$i"]="$lbl3"
+    ((i++))
+
+    # 4) Backup Config Viewer
+    local lbl4="Backup Config Viewer"
+    local path4="/root/.hybrid_admin/back_config_viewer.sh"
+    MENU_ITEMS+=("$i" "$lbl4" "$(color_help "Browse and search saved switch backup configs.")")
+    PATH_BY_TAG["$i"]="$path4"
+    LABEL_BY_TAG["$i"]="$lbl4"
     ((i++))
 
     # Back
