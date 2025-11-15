@@ -235,7 +235,7 @@ submenu_utilities(){
 
     # 3) CLI Updater
     local lbl3="CLI Updater"
-    local path3="/root/.hybrid_admin/cli-updater.sh"
+    local path3="/root/.hybrid_admin/cli_updater.sh"
     MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
     PATH_BY_TAG["$i"]="$path3"
     LABEL_BY_TAG["$i"]="$lbl3"
