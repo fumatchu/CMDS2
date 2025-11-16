@@ -46,7 +46,7 @@ declare -A SUBMENU_FN=(
 
 # Per-item help (status line)
 declare -A HELP_RAW=(
-  ["Setup Wizard"]="Guided first-time setup: env, API keys, credentials, and paths."
+  ["Setup Wizard"]="Guided Setup: Always run between batches (API keys, credentials)"
   ["Switch Discovery"]="Discover live Catalyst switches, probe via SSH, and build the selection for upgrades."
   ["Validate IOS-XE configuration"]="Run preflight validation for selected switches and configuration before upgrade."
   ["IOS-XE Upgrade"]="Run IOS-XE install/activate/commit workflows and tools."
