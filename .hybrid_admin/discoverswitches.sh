@@ -55,7 +55,10 @@ SSH_USERNAME="${SSH_USERNAME:-admin}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-}"
 ENABLE_PASSWORD="${ENABLE_PASSWORD:-}"
-MAX_SSH_FANOUT="${MAX_SSH_FANOUT:-1}"
+
+# fan-out: how many switches to probe at once (default 10; override with export MAX_SSH_FANOUT=5, etc.)
+MAX_SSH_FANOUT="${MAX_SSH_FANOUT:-10}"
+
 SSH_TIMEOUT="${SSH_TIMEOUT:-30}"
 DEBUG="${DISCOVERY_DEBUG:-0}"
 UI_MODE="${UI_MODE:-dialog}"                    # dialog|plain
@@ -652,6 +655,12 @@ if help wait >/dev/null 2>&1 && help wait 2>&1 | grep -q -- '-n'; then HAS_WAIT_
 
 run_probe_pool() {
   local hosts=("$@") max=${MAX_SSH_FANOUT} total=${#hosts[@]}
+
+  # Clamp concurrency: at least 1, at most number of hosts
+  (( total == 0 )) && { log_msg "run_probe_pool: no hosts"; return 0; }
+  (( max < 1 )) && max=1
+  (( max > total )) && max=$total
+
   local running=0 done=0 pids=()
   log_msg "run_probe_pool: fanout=$max total=$total"
   for ip in "${hosts[@]}"; do
@@ -935,7 +944,7 @@ main() {
   log_msg "=== scan run start ==="
   log_msg "ENV_FILE=$ENV_FILE"
   log_msg "DISCOVERY_MODE=${DISCOVERY_MODE:-} DISCOVERY_IPS=${DISCOVERY_IPS:-} DISCOVERY_NETWORKS=${DISCOVERY_NETWORKS:-}"
-  log_msg "SSH_USERNAME=${SSH_USERNAME:-} MAX_SSH_FANOUT=${MAX_SSH_FANOUT:-1} UI_MODE=${UI_MODE:-dialog}"
+  log_msg "SSH_USERNAME=${SSH_USERNAME:-} MAX_SSH_FANOUT=${MAX_SSH_FANOUT:-10} UI_MODE=${UI_MODE:-dialog}"
   log_msg "TFTP_BASE=${TFTP_BASE:-<none>}"
 
   ui_start; ui_gauge 1 "Initializing…"
