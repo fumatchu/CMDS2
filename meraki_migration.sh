@@ -25,7 +25,7 @@ while true; do
       --title "$TITLE" \
       --menu "Select an option:" 18 110 8 \
         1 "Catalyst to Meraki (hybrid) (Device Local)" \
-          "${HELP_COLOR_PREFIX}Device-local workflow that uses Cloud CLI (R/W) to migrate Catalyst to Meraki while retaining IOS-XE; opens the hybrid tools menu.${HELP_COLOR_RESET}" \
+          "${HELP_COLOR_PREFIX}Workflow for Configuration source: Device; Migrate Catalyst to Meraki while retaining IOS-XE; opens the hybrid tools menu.${HELP_COLOR_RESET}" \
         0 "Exit" \
           "${HELP_COLOR_PREFIX}Quit the deployment server menu.${HELP_COLOR_RESET}" \
       3>&1 1>&2 2>&3
