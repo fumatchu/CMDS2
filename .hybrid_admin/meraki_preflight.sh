@@ -594,6 +594,24 @@ meraki_preflight(){
     rm -f "$VAL_ENV" "$VAL_JSON" 2>/dev/null || true
   fi
 
+    # --------- mark this batch as "validated" for the menu checkmark ---------
+  # This is *batch-scoped* and is safe to remove in the Clean step.
+  local BATCH_FLAG="$SCRIPT_DIR/preflight_validated.flag"
+  {
+    echo "RUN_ID=$RUN_ID"
+    echo "SUMMARY_CSV=$SUMMARY_CSV"
+    echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$BATCH_FLAG"
+
+    # --------- mark this batch as "validated" for the menu checkmark ---------
+  # This is *batch-scoped* and is safe to remove in the Clean step.
+  local BATCH_FLAG="$SCRIPT_DIR/preflight_validated.flag"
+  {
+    echo "RUN_ID=$RUN_ID"
+    echo "SUMMARY_CSV=$SUMMARY_CSV"
+    echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$BATCH_FLAG"
+
   clear
   echo "Preflight complete."
   echo "Run directory: $RUN_DIR"

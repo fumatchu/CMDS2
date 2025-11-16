@@ -14,7 +14,7 @@ fi
 
 # Collect files (non-recursive; just the target directory)
 mapfile -d '' FILES < <(find "$TARGET_DIR" -maxdepth 1 -type f \
-  \( -name '*.csv' -o -name '*.env' -o -name '*.json' \) -print0)
+  \( -name '*.csv' -o -name '*.env' -o -name '*.json' -o -name '*.flag' \) -print0)
 
 # Also remove the meraki_claim.log symlink if present
 if [[ -L "$TARGET_DIR/meraki_claim.log" ]]; then

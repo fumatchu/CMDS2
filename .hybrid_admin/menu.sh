@@ -18,7 +18,7 @@ MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
-  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/validated_switches.env"
+  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/preflight_validated.flag"
   # For migration, we use a symlink to the latest claim log
   ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"
 )
