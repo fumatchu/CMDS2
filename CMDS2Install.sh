@@ -314,13 +314,13 @@ show_server_checklist() {
 This will Install the Server and all the requirements
 
 Checklist:
-Before the Installer starts, please make sure you have the following information:
-  1. An NTP Subnet for your clients. This server will provide synchronized time
+Before the Installer starts, please make sure you have the following information if you enable services:
+  1. An NTP Subnet for your clients. This server can provide synchronized time (optional)
   2. The beginning and ending lease range for DHCP (optional)
   3. The client default gateway IP Address for the DHCP Scope (optional)
   4. A Friendly name as a description to the DHCP scope created (optional)
 
-*********************************************" 20 100
+*********************************************" 20 110
 }
 # ========= CONFIGURE CHRONY =========
 declare -a ADDR
