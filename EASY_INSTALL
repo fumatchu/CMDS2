@@ -1,7 +1,7 @@
 #Installing
 #Install Rocky Minimal 10 in your favorite supported hypervisor
 https://download.rockylinux.org/pub/rocky/10/isos/aarch64/Rocky-10.0-aarch64-minimal.iso
-Make sure you eanble root SSH access
+Make sure you enable root SSH access
 #After the Server OS GUI install:
 #SSH into the server (as root) and do the following:
 #(Just copy and paste the following line on remote SSH terminal)
