@@ -1846,7 +1846,8 @@ install_hybrid_admin_module() (
   if [[ -d "$DEST_HA" ]]; then
     chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
   fi
-  install_server_admin_module() (
+ 
+ install_server_admin_module() (
   set -Eeuo pipefail
 
   # --- configurable (override before calling) ---
@@ -1935,7 +1936,7 @@ install_hybrid_admin_module() (
 
   dialog --no-shadow --backtitle "$BACKTITLE" --title "Completed" \
          --msgbox "Server Administration module has been installed to:\n$DEST_SA" 8 70
-)
+) 
   # 2) Install meraki_migration in PATH
   gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
   if [[ -f "$SRC_MM" ]]; then
