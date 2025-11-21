@@ -1846,7 +1846,96 @@ install_hybrid_admin_module() (
   if [[ -d "$DEST_HA" ]]; then
     chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
   fi
+  install_server_admin_module() (
+  set -Eeuo pipefail
 
+  # --- configurable (override before calling) ---
+  : "${STEP_PAUSE:=0.7}"
+  : "${BACKTITLE:=Installing Server Administration Module}"
+  : "${TITLE:=Server Administration Installer}"
+  : "${SRC_BASE:=/root/CMDS2Installer}"
+
+  # --- paths ---
+  LOG_FILE="/var/log/server-admin-install.log"
+  SRC_SA="${SRC_BASE}/.server_admin"
+  DEST_SA="/root/.server_admin"
+
+  # --- deps ---
+  command -v dialog >/dev/null 2>&1 || { echo "Missing: dialog" >&2; exit 3; }
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log(){ printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"; }
+
+  # --- gauge plumbing ---
+  PIPE="" PROG_FD="" DIALOG_PID=""
+  cleanup() {
+    { [[ -n "${PROG_FD:-}" ]] && exec {PROG_FD}>&-; } 2>/dev/null || true
+    { [[ -n "${DIALOG_PID:-}" ]] && kill "$DIALOG_PID" 2>/dev/null; } || true
+    { [[ -n "${PIPE:-}" && -p "$PIPE" ]] && rm -f "$PIPE"; } || true
+    tput cnorm 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  start_gauge() {
+    PIPE="$(mktemp -u)"
+    mkfifo "$PIPE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" \
+           --gauge "Starting…" 10 70 0 < "$PIPE" & DIALOG_PID=$!
+    exec {PROG_FD}> "$PIPE"
+    rm -f "$PIPE"
+  }
+  gauge(){ local p="$1"; shift; local m="${*:-Working…}"; printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; }
+
+  # --- work ---
+  log "=== Server Admin install start ==="
+  start_gauge
+  gauge 1  "Initializing…" ; sleep "$STEP_PAUSE"
+
+  # 0) Sanity check: do we have a source tree?
+  if [[ ! -d "$SRC_SA" ]]; then
+    log "Source directory not found: $SRC_SA"
+    gauge 100 "Source .server_admin not found."
+    sleep "$STEP_PAUSE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
+           --msgbox "Could not find:\n$SRC_SA\n\nNothing to install." 9 70
+    return 1
+  fi
+
+  # 1) Move/merge .server_admin → /root and chmod 700
+  gauge 10 "Staging Server Administration files…" ; sleep "$STEP_PAUSE"
+  if [[ -d "$DEST_SA" ]]; then
+    gauge 25 "Merging into existing .server_admin…" ; sleep "$STEP_PAUSE"
+    rsync -a "$SRC_SA"/ "$DEST_SA"/ >>"$LOG_FILE" 2>&1 || true
+    rm -rf "$SRC_SA"
+  else
+    gauge 25 "Moving .server_admin to /root…" ; sleep "$STEP_PAUSE"
+    mv "$SRC_SA" "$DEST_SA" >>"$LOG_FILE" 2>&1
+  fi
+
+  if [[ -d "$DEST_SA" ]]; then
+    gauge 45 "Setting permissions on .server_admin…" ; sleep "$STEP_PAUSE"
+    chmod -R 700 "$DEST_SA" >>"$LOG_FILE" 2>&1 || true
+    # Ensure shell scripts are executable
+    find "$DEST_SA" -maxdepth 2 -type f -name '*.sh' -exec chmod 700 {} \; >>"$LOG_FILE" 2>&1 || true
+  fi
+
+  # 2) Simple validation
+  gauge 70 "Validating install…" ; sleep "$STEP_PAUSE"
+  if [[ ! -d "$DEST_SA" ]]; then
+    log "Destination directory missing after move: $DEST_SA"
+    gauge 100 "Installation failed."
+    sleep "$STEP_PAUSE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Install Error" \
+           --msgbox "Server Administration module failed to install.\n\nSee $LOG_FILE for details." 9 72
+    return 1
+  fi
+
+  log "Server Admin installed at $DEST_SA"
+  gauge 100 "Server Administration module installed."
+  sleep "$STEP_PAUSE"
+
+  dialog --no-shadow --backtitle "$BACKTITLE" --title "Completed" \
+         --msgbox "Server Administration module has been installed to:\n$DEST_SA" 8 70
+)
   # 2) Install meraki_migration in PATH
   gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
   if [[ -f "$SRC_MM" ]]; then
@@ -2665,6 +2754,7 @@ configure_fail2ban
 configure_dnf_automatic
 remove_home_mapper
 install_hybrid_admin_module
+install_server_admin_module
 check_and_enable_services
 cleanup_installer_files
 prompt_reboot_now

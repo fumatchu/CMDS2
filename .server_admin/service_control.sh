@@ -22,8 +22,8 @@ alias dialog='dialog --backtitle "Service Manager" --colors'
 # ─── Admin tool mappings (optional helpers per unit) ──────────────────────────
 declare -A SERVICE_ADMIN_TOOLS=(
   [samba.service]="/root/.servman/SambaMan"
-  [dhcpd.service]="/root/.servman/DHCPManager/dhcp-admin-dhcpd.sh"
-  [kea-dhcp4.service]="/root/.servman/DHCPManager/dhcp-admin-kea.sh"
+  [dhcpd.service]="/root/.servman/dhcp_admin.sh"
+  [kea-dhcp4.service]="/root/.server_admin/dhcp_admin.sh"
   [chronyd.service]="/root/.servman/NTPMan/ntp_admin.sh"
   [fail2ban.service]="/root/.servman/jail-admin.sh"
 )
@@ -36,6 +36,7 @@ CANDIDATE_UNITS=(
   dhcpd.service
   fail2ban.service
   kea-dhcp4.service
+  named.service
   sshd.service
   cockpit.socket
   # openvpn-server@*.service  # example of templated units if you need them
