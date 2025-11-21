@@ -1846,8 +1846,34 @@ install_hybrid_admin_module() (
   if [[ -d "$DEST_HA" ]]; then
     chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
   fi
- 
- install_server_admin_module() (
+
+  # 2) Install meraki_migration in PATH
+  gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
+  if [[ -f "$SRC_MM" ]]; then
+    install -m 700 -o root -g root "$SRC_MM" "$DEST_MM" >>"$LOG_FILE" 2>&1
+  fi
+  if [[ ! -x "$DEST_MM" ]]; then
+    gauge 100 "Failed: meraki_migration not found/installed"; sleep 1
+    log "ERROR: $DEST_MM missing or not executable"
+    exit 2
+  fi
+
+  # 3) Enable autostart on root login
+  gauge 55 "Enabling menu autostart for root login…"; sleep "$STEP_PAUSE"
+  mkdir -p "$(dirname "$BASH_PROFILE")"; touch "$BASH_PROFILE"
+  AUTOSTART_LINE='if tty -s && command -v meraki_migration.sh >/dev/null 2>&1; then meraki_migration.sh; fi'
+  grep -Fq "$AUTOSTART_LINE" "$BASH_PROFILE" || printf '\n# Hybrid Admin autostart\n%s\n' "$AUTOSTART_LINE" >> "$BASH_PROFILE"
+
+  # 4) Verify
+  gauge 75 "Verifying installation…"; sleep "$STEP_PAUSE"
+  [[ -d "$DEST_HA" ]] && chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
+
+  gauge 100 "Done! Hybrid Admin Module installed. Menu will launch on next root login."
+  sleep 1.2
+  log "=== Hybrid Admin install complete ==="
+)
+
+install_server_admin_module() (
   set -Eeuo pipefail
 
   # --- configurable (override before calling) ---
@@ -1936,32 +1962,8 @@ install_hybrid_admin_module() (
 
   dialog --no-shadow --backtitle "$BACKTITLE" --title "Completed" \
          --msgbox "Server Administration module has been installed to:\n$DEST_SA" 8 70
-) 
-  # 2) Install meraki_migration in PATH
-  gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
-  if [[ -f "$SRC_MM" ]]; then
-    install -m 700 -o root -g root "$SRC_MM" "$DEST_MM" >>"$LOG_FILE" 2>&1
-  fi
-  if [[ ! -x "$DEST_MM" ]]; then
-    gauge 100 "Failed: meraki_migration not found/installed"; sleep 1
-    log "ERROR: $DEST_MM missing or not executable"
-    exit 2
-  fi
-
-  # 3) Enable autostart on root login
-  gauge 55 "Enabling menu autostart for root login…"; sleep "$STEP_PAUSE"
-  mkdir -p "$(dirname "$BASH_PROFILE")"; touch "$BASH_PROFILE"
-  AUTOSTART_LINE='if tty -s && command -v meraki_migration.sh >/dev/null 2>&1; then meraki_migration.sh; fi'
-  grep -Fq "$AUTOSTART_LINE" "$BASH_PROFILE" || printf '\n# Hybrid Admin autostart\n%s\n' "$AUTOSTART_LINE" >> "$BASH_PROFILE"
-
-  # 4) Verify
-  gauge 75 "Verifying installation…"; sleep "$STEP_PAUSE"
-  [[ -d "$DEST_HA" ]] && chmod -R 700 "$DEST_HA" >>"$LOG_FILE" 2>&1 || true
-
-  gauge 100 "Done! Hybrid Admin Module installed. Menu will launch on next root login."
-  sleep 1.2
-  log "=== Hybrid Admin install complete ==="
 )
+
 #===========SERVICE CHECK & ENABLE PROGRESS=============
 check_and_enable_services() {
   TMP_LOG=$(mktemp)
