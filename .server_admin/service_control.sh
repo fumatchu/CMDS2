@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ServiceMan – systemd service manager (dialog UI) — sturdy unit detection
+# ServiceMan – systemd service manager (dialog UI) — dynamic unit detection
 set -euo pipefail
 
 # ─── Stable environment for systemctl ─────────────────────────────────────────
@@ -28,19 +28,32 @@ declare -A SERVICE_ADMIN_TOOLS=(
   [fail2ban.service]="/root/.servman/jail-admin.sh"
 )
 
-# ─── Candidate units to list (only those present will be shown) ───────────────
-CANDIDATE_UNITS=(
-  chronyd.service
-  httpd.service
-  tftp-server.socket
-  dhcpd.service
-  fail2ban.service
-  kea-dhcp4.service
-  named.service
-  sshd.service
-  cockpit.socket
-  # openvpn-server@*.service  # example of templated units if you need them
-)
+# Global candidate list (rebuilt dynamically)
+CANDIDATE_UNITS=()
+
+build_candidate_units() {
+  # Base services we always care about
+  CANDIDATE_UNITS=(
+    chronyd.service
+    httpd.service
+    tftp-server.socket
+    fail2ban.service
+    named.service
+    sshd.service
+    cockpit.socket
+  )
+
+  # Only add dhcpd if systemd knows about it (unit file exists)
+  if systemctl list-unit-files dhcpd.service >/dev/null 2>&1; then
+    CANDIDATE_UNITS+=(dhcpd.service)
+  fi
+
+  # Only add kea-dhcp4 if unit exists AND Kea config exists
+  if systemctl list-unit-files kea-dhcp4.service >/dev/null 2>&1 && \
+     [[ -f /etc/kea/kea-dhcp4.conf ]]; then
+    CANDIDATE_UNITS+=(kea-dhcp4.service)
+  fi
+}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 service_state() {
@@ -68,9 +81,8 @@ style_state() {
   esac
 }
 
-# Robust: a unit is "installed/present" if systemd knows about it (rc 0 or 3)
+# A unit is "installed/present" if systemd knows about it (rc 0 or 3)
 _present_unit() {
-  # 0 = active, 3 = inactive (loaded), both mean “known”
   if systemctl status "$1" >/dev/null 2>&1; then
     return 0
   else
@@ -81,6 +93,8 @@ _present_unit() {
 }
 
 get_installed_units() {
+  build_candidate_units  # refresh the candidate list each time
+
   local installed=() u
   for u in "${CANDIDATE_UNITS[@]}"; do
     # Handle templated patterns here if you add them later
