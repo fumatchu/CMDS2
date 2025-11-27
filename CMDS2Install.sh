@@ -682,15 +682,31 @@ configure_dhcp_server() {
     fi
   }
 
-  # ───────────────────────────── dnf installers ────────────────────────────────
-  install_isc_dhcp() {
+# ───────────────────────────── dnf installers ────────────────────────────────
+
+install_isc_dhcp() {
     enable_repos_with_gauge || return 1
-    run_gauge_cmd "Installing ISC DHCP (dhcp-server)" dnf -y install dhcp-server
-  }
-  install_kea() {
+    run_gauge_cmd "Installing ISC DHCP (dhcp-server)" \
+        dnf -y install dhcp-server
+}
+
+install_kea() {
     enable_repos_with_gauge || return 1
-    run_gauge_cmd "Installing Kea DHCP (kea)" dnf -y install kea
-  }
+
+    # Detect major OS version (e.g., "10" from "10.0")
+    local major
+    major=$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); split($2,a,"."); print a[0]}' /etc/os-release)
+
+    # Rocky 10.0 ships older OpenSSL (3.2.x) but Kea 3.0.1 expects >=3.4.x
+    # Avoid symbol lookup crash by pre-upgrading OpenSSL runtime
+    if [[ "$major" == "10" ]]; then
+        run_gauge_cmd "Updating OpenSSL runtime (openssl-libs)" \
+            dnf -y upgrade openssl-libs openssl || true
+    fi
+
+    run_gauge_cmd "Installing Kea DHCP (kea)" \
+        dnf -y install kea
+}
 
   # ───────────────────── shared IP/CIDR + domain helpers ──────────────────────
   is_valid_ip(){
