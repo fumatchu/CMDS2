@@ -581,7 +581,8 @@ configure_dhcp_server() {
   require_rocky9plus(){
     . /etc/os-release 2>/dev/null || true
     if [[ "${ID:-}" != "rocky" ]]; then
-      msgbox "Unsupported OS" "This installer is limited to Rocky Linux 9+."; return 1
+      msgbox "Unsupported OS" "This installer is limited to Rocky Linux 9+."
+      return 1
     fi
     local maj="${VERSION_ID%%.*}"
     if [[ -z "$maj" || "$maj" -lt 9 ]]; then
@@ -685,11 +686,26 @@ configure_dhcp_server() {
   # ───────────────────────────── dnf installers ────────────────────────────────
   install_isc_dhcp() {
     enable_repos_with_gauge || return 1
-    run_gauge_cmd "Installing ISC DHCP (dhcp-server)" dnf -y install dhcp-server
+    run_gauge_cmd "Installing ISC DHCP (dhcp-server)" \
+      dnf -y install dhcp-server
   }
+
   install_kea() {
     enable_repos_with_gauge || return 1
-    run_gauge_cmd "Installing Kea DHCP (kea)" dnf -y install kea
+
+    # Detect major OS version (e.g., "10" from "10.0")
+    local major
+    major=$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); split($2,a,"."); print a[0]}' /etc/os-release 2>/dev/null)
+
+    # On Rocky 10.x, Kea 3.0.1 is linked against a newer OpenSSL than the GA libs.
+    # Pre-upgrade openssl-libs to avoid symbol lookup errors (EVP_* missing).
+    if [[ "$major" == "10" ]]; then
+      run_gauge_cmd "Upgrading OpenSSL runtime for Kea (openssl-libs)" \
+        dnf -y upgrade --best --allowerasing openssl-libs
+    fi
+
+    run_gauge_cmd "Installing Kea DHCP (kea)" \
+      dnf -y install kea
   }
 
   # ───────────────────── shared IP/CIDR + domain helpers ──────────────────────
