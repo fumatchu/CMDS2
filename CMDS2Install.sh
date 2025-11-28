@@ -719,9 +719,6 @@ configure_dhcp_server() {
       dnf -y install kea
   }
 
-  # (rest of configure_dhcp_server goes here — menus, subnet prompts, etc.)
-}
-
   # ───────────────────── shared IP/CIDR + domain helpers ──────────────────────
   is_valid_ip(){
     [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
