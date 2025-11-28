@@ -581,7 +581,8 @@ configure_dhcp_server() {
   require_rocky9plus(){
     . /etc/os-release 2>/dev/null || true
     if [[ "${ID:-}" != "rocky" ]]; then
-      msgbox "Unsupported OS" "This installer is limited to Rocky Linux 9+."; return 1
+      msgbox "Unsupported OS" "This installer is limited to Rocky Linux 9+."
+      return 1
     fi
     local maj="${VERSION_ID%%.*}"
     if [[ -z "$maj" || "$maj" -lt 9 ]]; then
@@ -682,30 +683,43 @@ configure_dhcp_server() {
     fi
   }
 
-# ───────────────────────────── dnf installers ────────────────────────────────
+  # ─────────────────── Ensure OpenSSL is new enough for Kea ───────────────────
+  ensure_openssl_for_kea() {
+    local LOGDIR="/var/log/installer"
+    local SSLLOG="$LOGDIR/openssl-upgrade.log"
+    mkdir -p "$LOGDIR"
 
-install_isc_dhcp() {
+    : >"$SSLLOG"
+    # Use --best/--allowerasing so DNF can pull in crypto-policies, fips provider, etc.
+    dnf -y upgrade --best --allowerasing openssl-libs >>"$SSLLOG" 2>&1
+  }
+
+  # ───────────────────────────── dnf installers ────────────────────────────────
+  install_isc_dhcp() {
     enable_repos_with_gauge || return 1
     run_gauge_cmd "Installing ISC DHCP (dhcp-server)" \
-        dnf -y install dhcp-server
-}
+      dnf -y install dhcp-server
+  }
 
-install_kea() {
+  install_kea() {
     enable_repos_with_gauge || return 1
 
     # Detect major OS version (e.g., "10" from "10.0")
     local major
-    major=$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); split($2,a,"."); print a[0]}' /etc/os-release)
+    major=$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); split($2,a,"."); print a[0]}' /etc/os-release 2>/dev/null)
 
-    # Rocky 10.0 ships older OpenSSL (3.2.x) but Kea 3.0.1 expects >=3.4.x
-    # Avoid symbol lookup crash by pre-upgrading OpenSSL runtime
+    # On Rocky 10.x, Kea 3.0.1 is linked against a newer OpenSSL than the GA libs.
+    # Pre-upgrade openssl-libs to avoid symbol lookup errors (EVP_* missing).
     if [[ "$major" == "10" ]]; then
-        run_gauge_cmd "Updating OpenSSL runtime (openssl-libs)" \
-            dnf -y upgrade openssl-libs openssl || true
+      run_gauge_cmd "Upgrading OpenSSL runtime for Kea (openssl-libs)" \
+        ensure_openssl_for_kea
     fi
 
     run_gauge_cmd "Installing Kea DHCP (kea)" \
-        dnf -y install kea
+      dnf -y install kea
+  }
+
+  # (rest of configure_dhcp_server goes here — menus, subnet prompts, etc.)
 }
 
   # ───────────────────── shared IP/CIDR + domain helpers ──────────────────────
