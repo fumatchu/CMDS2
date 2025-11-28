@@ -683,17 +683,6 @@ configure_dhcp_server() {
     fi
   }
 
-  # ─────────────────── Ensure OpenSSL is new enough for Kea ───────────────────
-  ensure_openssl_for_kea() {
-    local LOGDIR="/var/log/installer"
-    local SSLLOG="$LOGDIR/openssl-upgrade.log"
-    mkdir -p "$LOGDIR"
-
-    : >"$SSLLOG"
-    # Use --best/--allowerasing so DNF can pull in crypto-policies, fips provider, etc.
-    dnf -y upgrade --best --allowerasing openssl-libs >>"$SSLLOG" 2>&1
-  }
-
   # ───────────────────────────── dnf installers ────────────────────────────────
   install_isc_dhcp() {
     enable_repos_with_gauge || return 1
@@ -712,7 +701,7 @@ configure_dhcp_server() {
     # Pre-upgrade openssl-libs to avoid symbol lookup errors (EVP_* missing).
     if [[ "$major" == "10" ]]; then
       run_gauge_cmd "Upgrading OpenSSL runtime for Kea (openssl-libs)" \
-        ensure_openssl_for_kea
+        dnf -y upgrade --best --allowerasing openssl-libs
     fi
 
     run_gauge_cmd "Installing Kea DHCP (kea)" \
