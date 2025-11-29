@@ -14,13 +14,37 @@ need ping
 BACKTITLE="CMDS-Deployment Server"
 TITLE="Switch Connectivity Monitor"
 
-# Path to upgrade plan JSON (override with UPGRADE_PLAN env if needed)
+# ─── Info / Recommendation dialog ─────────────────────────────────────────────
+dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" --yesno \
+"This utility continuously monitors switch reachability and refreshes \
+this window every 5 seconds.
+
+While it is running, this CMDS session will be \"busy\".
+
+Recommended workflow:
+  • Open a SECOND SSH session to this CMDS server.
+  • In that second session, run:
+      Switch UP/Down Status
+    from the Utilities menu.
+  • Keep your original CMDS session free for other tasks.
+
+Press  <Yes>  to start the monitor in THIS session now.
+Press  <No>   to return to the CMDS menu without starting it." 18 78
+
+rc=$?
+if (( rc != 0 )); then
+  # User chose No or Cancel → just return cleanly to the menu
+  clear
+  exit 0
+fi
+
+# ─── Load IP list from upgrade plan ───────────────────────────────────────────
 UPGRADE_PLAN="${UPGRADE_PLAN:-/root/.hybrid_admin/upgrade_plan.json}"
 
 if [[ ! -s "$UPGRADE_PLAN" ]]; then
   dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" \
          --msgbox "No upgrade plan found or file is empty:\n\n$UPGRADE_PLAN" 9 70
-  exit 1
+  exit 0
 fi
 
 # Get unique IP list from upgrade_plan.json
@@ -32,6 +56,7 @@ if (( ${#IPS[@]} == 0 )); then
   exit 0
 fi
 
+# ─── Main monitor loop ────────────────────────────────────────────────────────
 COUNTER=0
 
 while true; do
