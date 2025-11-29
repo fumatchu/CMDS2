@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Simple switch reachability check using dialog + colors
-# Reads IPs from upgrade_plan.json (created by discoverswitches.sh)
+# Continuous switch reachability monitor (auto-refresh + Q to quit + counter)
+# Uses dialog --infobox and refreshes every 5 seconds
 
-set -Eeuo pipefail
+# Be a bit less strict so the loop doesn't die on a non-zero command
+set -Euo pipefail
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 
@@ -31,18 +32,36 @@ if (( ${#IPS[@]} == 0 )); then
   exit 0
 fi
 
-# Build colored status output for dialog --colors
-OUT="Monitoring connectivity to switches (Catalyst Migration)\n\n"
+COUNTER=0
 
-for IP in "${IPS[@]}"; do
-  if ping -c 1 -W 1 "$IP" >/dev/null 2>&1; then
-    OUT+="$IP is \Z2UP\Zn\n"      # green
-  else
-    OUT+="$IP is \Z1DOWN\Zn\n"    # red
+while true; do
+  ((COUNTER++))
+
+  OUT="Monitoring connectivity to switches (Catalyst Migration)\n"
+  OUT+="Updated: $(date '+%Y-%m-%d %H:%M:%S')\n"
+  OUT+="Refresh Count: $COUNTER\n"
+  OUT+="Press \Z1Q\Zn to quit.\n\n"
+
+  # Don't let a single bad ping kill the loop
+  for IP in "${IPS[@]}"; do
+    if ping -c 1 -W 1 "$IP" >/dev/null 2>&1; then
+      OUT+="$IP  \Z2UP\Zn\n"      # green
+    else
+      OUT+="$IP  \Z1DOWN\Zn\n"    # red
+    fi
+  done
+
+  # dialog may return non-zero if user resizes/ESC/etc — ignore that
+  dialog --no-shadow --colors \
+         --backtitle "$BACKTITLE" \
+         --title "$TITLE" \
+         --infobox "$OUT" 0 0 || true
+
+  # Wait up to 5 seconds for a keypress from the TTY; Q/q exits
+  if read -t 5 -n1 key < /dev/tty 2>/dev/null; then
+    if [[ "$key" == "q" || "$key" == "Q" ]]; then
+      clear
+      exit 0
+    fi
   fi
 done
-
-dialog --no-shadow --colors \
-       --backtitle "$BACKTITLE" \
-       --title "$TITLE" \
-       --msgbox "$OUT" 0 0

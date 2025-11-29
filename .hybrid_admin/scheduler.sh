@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need dialog; need awk; need date; need at; need grep; need sed; need cut; need tr; need sort
+need dialog; need awk; need date; need at; need grep; need sed; need cut; need tr; need sort; need jq
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 cd "$SCRIPT_DIR"
@@ -25,6 +25,36 @@ view_file(){  # $1=file $2=title
 }
 
 UPGRADER="$SCRIPT_DIR/at_image_upgrade.sh"
+
+DISC_JSON="$SCRIPT_DIR/discovery_results.json"
+declare -a ELIGIBLE_IPS=()
+ELIGIBILITY_BUILT=0
+
+# Build eligible IP list from discovery_results.json
+build_eligibility(){
+  (( ELIGIBILITY_BUILT == 1 )) && return
+  ELIGIBILITY_BUILT=1
+  [[ -s "$DISC_JSON" ]] || return
+  mapfile -t ELIGIBLE_IPS < <(
+    jq -r '.[]
+      | select((.ssh // false) == true
+               and (.login // false) == true
+               and (.blacklisted // false) != true)
+      | .ip' "$DISC_JSON" 2>/dev/null | awk 'NF'
+  )
+}
+
+# Return 0 if IP is eligible according to discovery (or if we have no discovery info)
+is_ip_eligible(){
+  local ip="$1"
+  build_eligibility
+  (( ${#ELIGIBLE_IPS[@]} == 0 )) && return 0   # no discovery info → treat all as eligible
+  local e
+  for e in "${ELIGIBLE_IPS[@]}"; do
+    [[ "$e" == "$ip" ]] && return 0
+  done
+  return 1
+}
 
 # ---------- Helpers ----------
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
@@ -76,8 +106,9 @@ extract_target_image_from_discovery() {
   fi
 }
 
-# Targets preview from selected_upgrade.env (IPs)
-# Show only the first IP; if more, append (+N)
+# Targets preview from selected_upgrade.env (IPs) with discovery gating.
+# Show only eligible IPs (ssh=true, login=true, blacklisted!=true).
+# Show only the first IP; if more, append (+N).
 extract_targets_preview(){
   local sel="$1"
   [[ -f "$sel" ]] || { echo "<none>"; return; }
@@ -94,16 +125,38 @@ extract_targets_preview(){
     | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}'
   )
   if ((${#ips[@]}==0)); then echo "<none>"; return; fi
-  mapfile -t uniq < <(printf '%s\n' "${ips[@]}" | awk -F. '!seen[$0]++ { if ($4 != 0 && $4 != 255) print $0 }' | sort -V)
+
+  # Dedup / sanitize
+  mapfile -t uniq < <(
+    printf '%s\n' "${ips[@]}" \
+      | awk -F. '!seen[$0]++ { if ($4 != 0 && $4 != 255) print $0 }' \
+      | sort -V
+  )
 
   local total=${#uniq[@]}
   (( total == 0 )) && { echo "<none>"; return; }
 
-  local first="${uniq[0]}"
-  if (( total == 1 )); then
+  # Apply discovery eligibility gating (if discovery_results.json is present)
+  build_eligibility
+  local eligible=()
+  local ip
+  for ip in "${uniq[@]}"; do
+    if is_ip_eligible "$ip"; then
+      eligible+=("$ip")
+    fi
+  done
+
+  local etotal=${#eligible[@]}
+  if (( etotal == 0 )); then
+    echo "<none (0 eligible by discovery)>"
+    return
+  fi
+
+  local first="${eligible[0]}"
+  if (( etotal == 1 )); then
     echo "$first"
   else
-    echo "$first (+$((total-1)))"
+    echo "$first (+$((etotal-1)))"
   fi
 }
 
@@ -263,6 +316,22 @@ Run Setup Wizard and Discovery/Selection first." 12 74
     clear; exit 1
   fi
 
+  # Show current target preview with discovery gating
+  local TARGETS_PREVIEW
+  TARGETS_PREVIEW="$(extract_targets_preview "$SEL_PATH")"
+  if [[ "$TARGETS_PREVIEW" == "<none>" || "$TARGETS_PREVIEW" == "<none (0 eligible by discovery)>" ]]; then
+    dlg --title "No eligible targets" --msgbox \
+"selected_upgrade.env contains no eligible targets after applying discovery gating.
+
+Discovery requires:
+  - ssh=true
+  - login=true
+  - blacklisted!=true
+
+Fix discovery/selection and try again." 15 80
+    clear; exit 1
+  fi
+
   local NOTE=""
   dlg --title "Optional note" --inputbox "Enter an optional note (ticket/window/etc.)." 8 72
   [[ $? -eq 0 ]] && NOTE="$(trim "${DOUT:-}")"
@@ -311,14 +380,15 @@ Examples:
 
   local summary="Schedule summary
 
-Date/time (local):  ${RUN_LOCAL_HUMAN}
-Note:               ${NOTE:-<none>}
+Date/time (local):       ${RUN_LOCAL_HUMAN}
+Targets (by discovery):  ${TARGETS_PREVIEW}
+Note:                    ${NOTE:-<none>}
 
 Env snapshots (from current directory):
   meraki_discovery.env
   selected_upgrade.env
 "
-  dlg --title "Confirm schedule" --yesno "$summary\nProceed to create the scheduled job?" 18 78 || { clear; exit 0; }
+  dlg --title "Confirm schedule" --yesno "$summary\nProceed to create the scheduled job?" 20 78 || { clear; exit 0; }
 
   local JOB_ID="job-${YYYY}${MM}${DD}-${HH24}${MIN}${SS}-$RANDOM"
   local JOB_DIR="$SCRIPT_DIR/schedules/$JOB_ID"

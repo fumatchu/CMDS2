@@ -388,21 +388,18 @@ meraki_preflight(){
   fi
   [[ -n "$SSH_USERNAME" ]] || { dlg --title "Missing" --msgbox "SSH_USERNAME is empty in meraki_discovery.env" 7 60; clear; trap - EXIT; return 1; }
 
-  # determine source automatically – prefer selected over discovery
+  # ─── Determine source (selected first, then discovery) ──────────────────────
   local SRC=""
   local have_disc="" have_sel_json="" have_sel_ips=""
 
-  # selected_upgrade.json
   [[ -s "$SEL_JSON" && "$(jq 'length' "$SEL_JSON" 2>/dev/null || echo 0)" -gt 0 ]] && have_sel_json=1
 
-  # selected_upgrade.env (UPGRADE_SELECTED_IPS)
   if [[ -f "$SEL_ENV" ]]; then
     source "$SEL_ENV"
     UPGRADE_SELECTED_IPS="$(__deq "${UPGRADE_SELECTED_IPS-}")"
     [[ -n "$UPGRADE_SELECTED_IPS" ]] && have_sel_ips=1
   fi
 
-  # discovery_results.json as a fallback
   [[ -s "$DISC_JSON" ]] && have_disc=1
 
   if [[ -n "$have_sel_json" ]]; then
@@ -416,40 +413,61 @@ meraki_preflight(){
     clear; trap - EXIT; return 1
   fi
 
-  # checklist
+  # ─── Build discovery gate maps (ip -> ssh/login/blacklisted) ────────────────
+  declare -A DISC_SSH DISC_LOGIN DISC_BL DISC_BLR
+  if [[ -s "$DISC_JSON" ]]; then
+    while IFS=$'\t' read -r ip ssh login bl blr; do
+      DISC_SSH["$ip"]="$ssh"
+      DISC_LOGIN["$ip"]="$login"
+      DISC_BL["$ip"]="$bl"
+      DISC_BLR["$ip"]="$blr"
+    done < <(jq -r '.[] |
+                   [
+                     .ip,
+                     (.ssh//false),
+                     (.login//false),
+                     (.blacklisted//false),
+                     (.blacklist_reason//"")
+                   ] | @tsv' "$DISC_JSON")
+  fi
+
+  # ─── Load device lists from the chosen source ───────────────────────────────
   declare -a IPS HOSTS PIDS VERS SER
+
   if [[ "$SRC" == "disc" ]]; then
     mapfile -t IPS   < <(jq -r '.[].ip' "$DISC_JSON" 2>/dev/null)
     mapfile -t HOSTS < <(jq -r '.[].hostname // ""' "$DISC_JSON" 2>/dev/null)
     mapfile -t PIDS  < <(jq -r '.[].pid // ""' "$DISC_JSON" 2>/dev/null)
     mapfile -t VERS  < <(jq -r '.[].version // ""' "$DISC_JSON" 2>/dev/null)
     mapfile -t SER   < <(jq -r '.[].serial // ""' "$DISC_JSON" 2>/dev/null)
+
   elif [[ "$SRC" == "seljson" ]]; then
     mapfile -t IPS   < <(jq -r '.[].ip' "$SEL_JSON" 2>/dev/null)
     mapfile -t HOSTS < <(jq -r '.[].hostname // ""' "$SEL_JSON" 2>/dev/null)
     mapfile -t PIDS  < <(jq -r '.[].pid // ""' "$SEL_JSON" 2>/dev/null)
     mapfile -t VERS  < <(jq -r '.[].installed_version // ""' "$SEL_JSON" 2>/dev/null)
     mapfile -t SER   < <(jq -r '.[].serial // ""' "$SEL_JSON" 2>/dev/null)
+
   else
-    # SRC = "selips" — only have UPGRADE_SELECTED_IPS. Enrich from
-    # discovery_results.json (preferred) or discovery_results.csv (fallback).
+    # SRC = "selips" — only have UPGRADE_SELECTED_IPS. Enrich from discovery.
     read -r -a IPS <<<"${UPGRADE_SELECTED_IPS:-}"
 
     HOSTS=(); PIDS=(); VERS=(); SER=()
 
     if [[ -s "$DISC_JSON" ]]; then
-      # Build maps: ip -> hostname/version/pid/serial from discovery_results.json
       declare -A HMAP VMAP PMAP SMAP
       while IFS=$'\t' read -r ip h v p s; do
         HMAP["$ip"]="$h"
         VMAP["$ip"]="$v"
         PMAP["$ip"]="$p"
         SMAP["$ip"]="$s"
-      done < <(jq -r '.[] | [.ip,
-                               (.hostname // ""),
-                               (.version  // ""),
-                               (.pid      // ""),
-                               (.serial   // "")] | @tsv' "$DISC_JSON")
+      done < <(jq -r '.[] | [
+                    .ip,
+                    (.hostname // ""),
+                    (.version  // ""),
+                    (.pid      // ""),
+                    (.serial   // "")
+                  ] | @tsv' "$DISC_JSON")
 
       for ip in "${IPS[@]}"; do
         HOSTS+=( "${HMAP[$ip]:-}" )
@@ -457,39 +475,8 @@ meraki_preflight(){
         PIDS+=(  "${PMAP[$ip]:-}" )
         SER+=(   "${SMAP[$ip]:-}" )
       done
-
-    elif [[ -s "$DISC_CSV" ]]; then
-      # Fallback: build maps from discovery_results.csv
-      declare -A HMAP VMAP PMAP SMAP
-      local ip ssh login hostname version pid serial
-      local first=1
-      while IFS=, read -r ip ssh login hostname version pid serial; do
-        if (( first )); then
-          first=0
-          continue
-        fi
-        # strip surrounding quotes if present
-        ip="${ip%\"}"; ip="${ip#\"}"
-        hostname="${hostname%\"}"; hostname="${hostname#\"}"
-        version="${version%\"}";  version="${version#\"}"
-        pid="${pid%\"}";          pid="${pid#\"}"
-        serial="${serial%\"}";    serial="${serial#\"}"
-
-        HMAP["$ip"]="$hostname"
-        VMAP["$ip"]="$version"
-        PMAP["$ip"]="$pid"
-        SMAP["$ip"]="$serial"
-      done < "$DISC_CSV"
-
-      for ip in "${IPS[@]}"; do
-        HOSTS+=( "${HMAP[$ip]:-}" )
-        VERS+=(  "${VMAP[$ip]:-}" )
-        PIDS+=(  "${PMAP[$ip]:-}" )
-        SER+=(   "${SMAP[$ip]:-}" )
-      done
-
     else
-      # No discovery metadata available; keep descriptions minimal.
+      # No discovery metadata; keep descriptions minimal.
       for _ in "${IPS[@]}"; do
         HOSTS+=("")
         PIDS+=("")
@@ -501,40 +488,61 @@ meraki_preflight(){
 
   (( ${#IPS[@]} > 0 )) || { dlg --title "No devices" --msgbox "The chosen source has zero devices." 7 60; clear; trap - EXIT; return 1; }
 
+  # ─── Build checklist, filtered by discovery_results.json ───────────────────
   local CHK=()
   for i in "${!IPS[@]}"; do
-    local ip="${IPS[$i]}" h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
-    # NOTE: version intentionally *not* shown here to avoid stale info.
+    local ip="${IPS[$i]}"
+    local h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
+
+    # If we have discovery info for this IP, enforce:
+    #   ssh==true AND login==true AND blacklisted==false
+    if [[ -n "${DISC_SSH[$ip]+x}" ]]; then
+      local ssh_ok="${DISC_SSH[$ip]:-false}"
+      local login_ok="${DISC_LOGIN[$ip]:-false}"
+      local bl="${DISC_BL[$ip]:-false}"
+
+      if [[ "$ssh_ok" != "true" || "$login_ok" != "true" || "$bl" == "true" ]]; then
+        # Skip things we can't safely touch:
+        #  - ssh/login failed
+        #  - explicitly blacklisted (e.g. meraki-user exists or unknown device)
+        continue
+      fi
+    fi
+
     local desc; desc="$(trim "${h:-$ip}  ${p:+($p) }${s:+SN:$s}")"
     CHK+=( "$ip" "$desc" "on" )
   done
+
+  if (( ${#CHK[@]} == 0 )); then
+    dlg --title "No eligible devices" --msgbox "Discovery found devices, but none are eligible for preflight.\n\n(ssh/login failed or they are explicitly blacklisted.)" 11 75
+    clear; trap - EXIT; return 1
+  fi
 
   dlg --title "Select switches" --checklist "Choose devices to preflight:" 20 78 12 "${CHK[@]}"
   [[ $? -eq 0 ]] || { clear; trap - EXIT; return 1; }
   read -r -a TARGETS <<<"$DOUT"
   (( ${#TARGETS[@]} )) || { clear; trap - EXIT; return 0; }
 
-  # run directory
+  # ─── Run directory & summary wiring ────────────────────────────────────────
   RUN_ID="run-$(date -u +%Y%m%d%H%M%S)"
   RUN_ROOT="$SCRIPT_DIR/runs/preflight"; mkdir -p "$RUN_ROOT"
   RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
 
-  # export + persist "latest"
   PRE_FLIGHT_RUN_ID="$RUN_ID"; export PRE_FLIGHT_RUN_ID
   PRE_FLIGHT_RUN_DIR="$RUN_DIR"; export PRE_FLIGHT_RUN_DIR
   PRE_FLIGHT_SUMMARY=""; export PRE_FLIGHT_SUMMARY
+
   printf 'export PRE_FLIGHT_RUN_ID=%q\nexport PRE_FLIGHT_RUN_DIR=%q\n' \
     "$PRE_FLIGHT_RUN_ID" "$PRE_FLIGHT_RUN_DIR" > "$RUN_ROOT/latest.env"
   ln -sfn "$PRE_FLIGHT_RUN_DIR" "$RUN_ROOT/latest"
 
-  # CSV header
   SUMMARY_CSV="$RUN_DIR/summary.csv"
   echo "ip,hostname,ios_ver,install_mode,meraki_mode,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,tunnel,ready,notes" > "$SUMMARY_CSV"
   PRE_FLIGHT_SUMMARY="$SUMMARY_CSV"; export PRE_FLIGHT_SUMMARY
   printf 'export PRE_FLIGHT_SUMMARY=%q\n' "$PRE_FLIGHT_SUMMARY" >> "$RUN_ROOT/latest.env"
   ln -sfn "$PRE_FLIGHT_SUMMARY" "$RUN_ROOT/latest.csv"
 
-  # run workers
+  # ─── Run probes in parallel ────────────────────────────────────────────────
   UI_TITLE="Preflight"
   ui_start
   log "Preflight Run: $RUN_ID"
@@ -563,23 +571,20 @@ meraki_preflight(){
     ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "Probed $DONE / $TOTAL"
   done
 
-    gauge 100 "Done"
+  gauge 100 "Done"
   log "Summary: $SUMMARY_CSV"
   ui_stop
 
-  # --------- build validated_switches.env + validated_ips.json for downstream steps ---------
+  # ─── Build validated_switches.env + validated_ips.json ─────────────────────
   local VAL_ENV="$SCRIPT_DIR/validated_switches.env"
   local VAL_JSON="$SCRIPT_DIR/validated_ips.json"
 
-  # Collect IPs where ready == yes (col 12 in summary.csv)
   local validated_ips
   validated_ips="$(awk -F, 'NR>1 && $12=="yes" {print $1}' "$SUMMARY_CSV" | xargs)"
 
   if [[ -n "$validated_ips" ]]; then
-    # ENV file used by onboarding: VALIDATED_SWITCH_IPS="ip1 ip2 ..."
     printf 'export VALIDATED_SWITCH_IPS=%q\n' "$validated_ips" > "$VAL_ENV"
 
-    # JSON used as fallback: [ {ip, hostname}, ... ]
     awk -F, 'NR>1 && $12=="yes" {printf "%s,%s\n",$1,$2}' "$SUMMARY_CSV" \
       | jq -R -s '
           split("\n")
@@ -590,21 +595,10 @@ meraki_preflight(){
             )
         ' > "$VAL_JSON" 2>/dev/null || true
   else
-    # No validated switches – remove any stale files
     rm -f "$VAL_ENV" "$VAL_JSON" 2>/dev/null || true
   fi
 
-    # --------- mark this batch as "validated" for the menu checkmark ---------
-  # This is *batch-scoped* and is safe to remove in the Clean step.
-  local BATCH_FLAG="$SCRIPT_DIR/preflight_validated.flag"
-  {
-    echo "RUN_ID=$RUN_ID"
-    echo "SUMMARY_CSV=$SUMMARY_CSV"
-    echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } > "$BATCH_FLAG"
-
-    # --------- mark this batch as "validated" for the menu checkmark ---------
-  # This is *batch-scoped* and is safe to remove in the Clean step.
+  # mark batch as validated for menu checkmark
   local BATCH_FLAG="$SCRIPT_DIR/preflight_validated.flag"
   {
     echo "RUN_ID=$RUN_ID"
@@ -618,6 +612,7 @@ meraki_preflight(){
   echo "Summary CSV:   $SUMMARY_CSV"
   trap - EXIT
 }
+
 # =====================================================================
 # DNS FIX
 # =====================================================================

@@ -717,7 +717,9 @@ make_upgrade_plan() {
     ui_status "No discovery JSON to build an upgrade plan (file empty)."
     log_msg "make_upgrade_plan: $json is empty or missing"
     echo "[]" > "$UP_JSON_OUT"
-    { echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"; } > "$UP_CSV_OUT"
+    {
+      echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login"
+    } > "$UP_CSV_OUT"
     return 0
   fi
 
@@ -726,76 +728,91 @@ make_upgrade_plan() {
   log_msg "make_upgrade_plan: discovery entries=$disc_count"
   ui_gauge 90 "Building upgrade plan for $disc_count device(s)…"
 
-  jq -r '.[] | [.ip, .pid, .version, .hostname, (.blacklisted//false), (.blacklist_reason//"")] | @tsv' "$json" |
-    while IFS=$'\t' read -r ip pid cur_ver host blacklisted bl_reason; do
-      IFS='|' read -r tgt_file tgt_path tgt_ver tgt_size <<<"$(choose_image "$pid")"
+  # Pull ssh/login as well so we can keep them for debugging, but
+  # DO NOT use them to force blacklisting here. Blacklist decisions
+  # based on "unknown" are handled later in the selection dialog by
+  # looking at hostname/pid/version/plan_action.
+  jq -r '.[] |
+         [
+           .ip,
+           (.pid//""),
+           (.version//""),
+           (.hostname//""),
+           (.blacklisted//false),
+           (.blacklist_reason//""),
+           (.ssh//false),
+           (.login//false)
+         ] | @tsv' "$json" |
+  while IFS=$'\t' read -r ip pid cur_ver host blacklisted bl_reason ssh login; do
+    # Normalise
+    host="${host:-}"
+    pid="${pid:-}"
+    cur_ver="${cur_ver:-}"
+    blacklisted="${blacklisted:-false}"
+    bl_reason="${bl_reason:-}"
+    ssh="${ssh:-false}"
+    login="${login:-false}"
 
-      local action need
-      if [[ -n "$tgt_ver" && -n "$cur_ver" ]]; then
-        action="$(plan_action_label "$cur_ver" "$tgt_ver")"
-      else
-        action="UNKNOWN"
-      fi
-      case "$action" in
-        UPGRADE|DOWNGRADE) need="true" ;;
-        SAME|UNKNOWN|"")   need="false" ;;
-      esac
+    # Choose target image based on PID
+    IFS='|' read -r tgt_file tgt_path tgt_ver tgt_size <<<"$(choose_image "$pid")"
 
-      jq -n \
-        --arg ip "$ip" \
-        --arg hostname "${host:-}" \
-        --arg pid "$pid" \
-        --arg current_version "${cur_ver:-}" \
-        --arg target_version "${tgt_ver:-}" \
-        --arg target_file "${tgt_file:-}" \
-        --arg target_path "${tgt_path:-}" \
-        --arg target_size "${tgt_size:-}" \
-        --arg action "$action" \
-        --arg needs "$need" \
-        --arg bl "$blacklisted" \
-        --arg blr "${bl_reason:-}" \
-        '{
-           ip: $ip,
-           hostname: $hostname,
-           pid: $pid,
-           current_version: $current_version,
-           target_version: $target_version,
-           target_file: $target_file,
-           target_path: $target_path,
-           target_size_bytes: ($target_size|tonumber?),
-           plan_action: $action,
-           needs_upgrade: ($needs=="true"),
-           blacklisted: ($bl=="true"),
-           blacklist_reason: $blr
-         }'
-    done | jq -s '.' > "$UP_JSON_OUT"
+    # Decide upgrade / downgrade / same
+    local action need
+    if [[ -n "$tgt_ver" && -n "$cur_ver" ]]; then
+      action="$(plan_action_label "$cur_ver" "$tgt_ver")"
+    else
+      action="UNKNOWN"
+    fi
+    case "$action" in
+      UPGRADE|DOWNGRADE) need="true" ;;
+      SAME|UNKNOWN|"")   need="false" ;;
+    esac
+
+    # Blacklist flag: honour ONLY what discovery already set
+    # (e.g. meraki-user exists). Do NOT auto-mark based on ssh/login.
+    local bl_flag="$blacklisted"
+    local blr="$bl_reason"
+
+    jq -n \
+      --arg ip "$ip" \
+      --arg hostname "${host:-}" \
+      --arg pid "$pid" \
+      --arg current_version "${cur_ver:-}" \
+      --arg target_version "${tgt_ver:-}" \
+      --arg target_file "${tgt_file:-}" \
+      --arg target_path "${tgt_path:-}" \
+      --arg target_size "${tgt_size:-}" \
+      --arg action "$action" \
+      --arg needs "$need" \
+      --arg bl "$bl_flag" \
+      --arg blr "${blr:-}" \
+      --arg ssh "$ssh" \
+      --arg login "$login" \
+      '{
+         ip: $ip,
+         hostname: $hostname,
+         pid: $pid,
+         current_version: $current_version,
+         target_version: $target_version,
+         target_file: $target_file,
+         target_path: $target_path,
+         target_size_bytes: ($target_size|tonumber?),
+         plan_action: $action,
+         needs_upgrade: ($needs=="true"),
+         blacklisted: ($bl=="true"),
+         blacklist_reason: $blr,
+         ssh: ($ssh=="true"),
+         login: ($login=="true")
+       }'
+  done | jq -s '.' > "$UP_JSON_OUT"
 
   local up_count
   up_count="$(jq 'length' "$UP_JSON_OUT" 2>/dev/null || echo 0)"
-  log_msg "make_upgrade_plan: initial plan entries=$up_count"
+  log_msg "make_upgrade_plan: plan entries=$up_count"
 
-  if (( disc_count > 0 && up_count == 0 )); then
-    log_msg "make_upgrade_plan: WARNING plan entries=0 while discovery entries=$disc_count; building passthrough plan."
-    jq '[ .[] | {
-            ip,
-            hostname: (.hostname//""),
-            pid: (.pid//""),
-            current_version: (.version//""),
-            target_version: "",
-            target_file: "",
-            target_path: "",
-            target_size_bytes: null,
-            plan_action: "UNKNOWN",
-            needs_upgrade: false,
-            blacklisted: (.blacklisted//false),
-            blacklist_reason: (.blacklist_reason//"")
-          } ]' "$json" > "$UP_JSON_OUT"
-    up_count="$(jq 'length' "$UP_JSON_OUT" 2>/dev/null || echo 0)"
-    log_msg "make_upgrade_plan: passthrough plan entries=$up_count"
-  fi
-
+  # CSV export (includes ssh/login for debugging)
   {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"
+    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login"
     jq -r '.[] | [
         .ip,
         (.hostname//""),
@@ -808,7 +825,9 @@ make_upgrade_plan() {
         (.target_size_bytes//""),
         (.needs_upgrade//false),
         (.blacklisted//false),
-        (.blacklist_reason//"")
+        (.blacklist_reason//""),
+        (.ssh//false),
+        (.login//false)
       ] | @csv' "$UP_JSON_OUT"
   } > "$UP_CSV_OUT"
 
@@ -828,18 +847,48 @@ do_selection_dialog() {
     cur="${cur:-?}"
     tgt="${tgt:-?}"
     action="${action:-UNKNOWN}"
+    need="${need:-false}"
+    blacklisted="${blacklisted:-false}"
+    bl_reason="${bl_reason:-}"
 
+    # Human-readable row text
     local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})"
     local def="off"
 
+    # Figure out *effective* blacklist state and reason
+    local effective_blacklisted="false"
+    local reason=""
+
     if [[ "$blacklisted" == "true" ]]; then
-      # Blacklisted: leave unchecked and annotate, remember reason
-      local reason="${bl_reason:-meraki-user exists}"
+      # Explicitly blacklisted (e.g. meraki-user exists)
+      effective_blacklisted="true"
+      reason="${bl_reason:-meraki-user exists}"
+    else
+      # Auto-blacklist devices we *don’t* trust:
+      #  - missing or bogus hostname / PID / version
+      #  - or plan_action == UNKNOWN
+      local is_bad_host=0
+      [[ -z "$host" || "$host" == "-" || "$host" == "false" ]] && is_bad_host=1
+
+      local is_bad_pid=0
+      [[ -z "$pid"  || "$pid"  == "-" || "$pid"  == "false" ]] && is_bad_pid=1
+
+      local is_bad_ver=0
+      [[ -z "$cur"  || "$cur"  == "?" || "$cur"  == "false" ]] && is_bad_ver=1
+
+      if (( is_bad_host || is_bad_pid || is_bad_ver )) || [[ "$action" == "UNKNOWN" ]]; then
+        effective_blacklisted="true"
+        reason="login failed or unknown device"
+      fi
+    fi
+
+    if [[ "$effective_blacklisted" == "true" ]]; then
+      # Show, but don’t allow selection
       text="$text  [BLACKLISTED: ${reason}]"
       def="off"
       BLKMAP["$ip"]="$reason"
     else
-      # Normal devices: pre-select only if needs_upgrade == true
+      # Normal devices: only pre-select if we *actually* need upgrade
       [[ "$need" == "true" ]] && def="on"
     fi
 
@@ -858,11 +907,13 @@ do_selection_dialog() {
            ] | @tsv' "$UP_JSON_OUT")
 
   if (( ${#items[@]} == 0 )); then
-    dialog --no-shadow --infobox "No devices available for selection.\n(Upgrade plan had zero items.)" 7 60
+    dialog --no-shadow --infobox \
+      "No devices available for selection.\n(Upgrade plan had zero items.)" 7 60
     sleep 3
     return 1
   fi
 
+  # Show selection dialog
   ui_stop
   local tmp_sel; tmp_sel="$(mktemp)"
   dialog --no-shadow --title "Select switches to upgrade" \
@@ -895,8 +946,8 @@ do_selection_dialog() {
 
   if (( ${#FILTERED_SEL[@]} == 0 )); then
     dialog --no-shadow --infobox \
-"All selected devices are BLACKLISTED (e.g. meraki-user exists).
-Clean up configuration before attempting to migrate these switches." 8 70
+"All selected devices are BLACKLISTED (e.g. meraki-user exists or unknown device).
+Clean up configuration before attempting to migrate these switches." 8 80
     sleep 3
     return 3
   fi
@@ -934,7 +985,7 @@ Clean up configuration before attempting to migrate these switches." 8 70
   dialog --no-shadow --infobox \
 "Selection saved.
 
-BLACKLISTED entries (e.g. meraki-user exists) were ignored." 8 80
+BLACKLISTED entries (e.g. meraki-user exists or unknown device) were ignored." 8 90
   sleep 3
   return 0
 }

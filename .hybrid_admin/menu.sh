@@ -35,6 +35,7 @@ declare -A ITEMS=(
   ["Utilities"]=""  # handled by submenu
   ["Server Management"]=""  # header / separator, not an actual script
   ["Server Service Control"]=""  # handled by submenu
+  ["README"]="/root/.hybrid_admin/readme.sh"
 )
 
 # Submenus: label -> function name
@@ -62,6 +63,7 @@ declare -A HELP_RAW=(
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
+  ["README"]="View CMDS hybrid README / usage guide."
 )
 
 # Display order (main menu)
@@ -71,11 +73,12 @@ ORDER=(
   "IOS-XE Upgrade"
   "Validate IOS-XE configuration"
   "Migrate Switches"
-  "Logging"
   "Clean Configuration (New Batch Deployment)"
+  "Logging"
   "Utilities"
   "Server Management"
   "Server Service Control"
+  "README"
 )
 
 cleanup(){ clear; }
@@ -364,7 +367,7 @@ while true; do
     dialog --no-shadow --colors --item-help \
       --backtitle "$BACKTITLE" \
       --title "$TITLE" \
-      --menu "Select an option:" 18 78 10 \
+      --menu "Select an option:" 22 78 10 \
       "${MENU_ITEMS[@]}" \
       3>&1 1>&2 2>&3
   ) || exit 0

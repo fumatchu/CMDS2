@@ -16,6 +16,7 @@ command -v sshpass >/dev/null 2>&1 || true
 
 BASE_ENV="$SCRIPT_DIR/meraki_discovery.env"
 SEL_ENV="${1:-$SCRIPT_DIR/selected_upgrade.env}"
+DISC_JSON="$SCRIPT_DIR/discovery_results.json"
 
 # Headless error box
 err_box(){ echo "ERROR: $1" >&2; }
@@ -45,14 +46,48 @@ if [[ -z "${SSH_KEY_PATH:-}" && -n "$SSH_PASSWORD" ]] && ! command -v sshpass >/
   exit 1
 fi
 
+# ───────────────── TARGET SELECTION (with discovery gating) ─────────────────
 TARGETS=()
+
+# Use selection from env/plan first
 if [[ -n "$UPGRADE_SELECTED_IPS" ]]; then
   read -r -a TARGETS <<< "$UPGRADE_SELECTED_IPS"
 elif [[ -n "$UPGRADE_SELECTED_JSON" && -f "$UPGRADE_SELECTED_JSON" ]]; then
   mapfile -t TARGETS < <(jq -r '.[].ip' "$UPGRADE_SELECTED_JSON" | awk 'NF')
 fi
+
+# If discovery_results.json exists, gate to ssh/login OK, not blacklisted
+if [[ -s "$DISC_JSON" && ${#TARGETS[@]} -gt 0 ]]; then
+  declare -A DISC_SSH DISC_LOGIN DISC_BL
+
+  while IFS=$'\t' read -r ip ssh login bl; do
+    DISC_SSH["$ip"]="$ssh"
+    DISC_LOGIN["$ip"]="$login"
+    DISC_BL["$ip"]="$bl"
+  done < <(jq -r '.[] |
+                 [
+                   .ip,
+                   (.ssh // false),
+                   (.login // false),
+                   (.blacklisted // false)
+                 ] | @tsv' "$DISC_JSON")
+
+  filtered=()
+  for ip in "${TARGETS[@]}"; do
+    if [[ -n "${DISC_SSH[$ip]+x}" ]]; then
+      if [[ "${DISC_SSH[$ip]}" == "true" && \
+            "${DISC_LOGIN[$ip]}" == "true" && \
+            "${DISC_BL[$ip]}" != "true" ]]; then
+        filtered+=("$ip")
+      fi
+    fi
+  done
+
+  TARGETS=("${filtered[@]}")
+fi
+
 TOTAL=${#TARGETS[@]}
-(( TOTAL > 0 )) || { err_box "No targets to run."; exit 1; }
+(( TOTAL > 0 )) || { err_box "No eligible targets to run (all filtered by discovery_results.json or none selected)."; exit 1; }
 
 detect_server_ip(){
   local ip=""
@@ -453,7 +488,7 @@ http_fetch_image_for_ip(){
     (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\n' "$base"
     printf 'exit\r\n'
-  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$pre_raw" 2>&1 || true
+  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$pre_raw" 2>/dev/null || true
   tr -d '\r' < "$pre_raw" > "$pre_norm"
   existing_bytes="$(flash_size_from "$pre_norm" "$base")"; rm -f "$pre_raw" "$pre_norm"
   if [[ -n "$size" && -n "$existing_bytes" && "$existing_bytes" == "$size" && "${HTTP_FORCE_COPY:-0}" != "1" ]]; then
@@ -485,7 +520,7 @@ http_fetch_image_for_ip(){
         printf '\r\nterminal length 0\r\nterminal width 511\r\n'
         (( need_en )) && emit_enable
         printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-      } | timeout -k 5s 30s "${POLL_SSH[@]}" >"$p_raw" 2>&1 || true
+      } | timeout -k 5s 30s "${POLL_SSH[@]}" >"$p_raw" 2>/dev/null || true
       tr -d '\r' < "$p_raw" > "$p_norm"; cur="$(flash_size_from "$p_norm" "$base")"; rm -f "$p_raw" "$p_norm"
       if [[ -n "$cur" && "$cur" != "$last" ]]; then
         if [[ -n "$total" && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then pct=$((100*cur/total)); ((pct>99 && cur<total))&&pct=99; log "[${ip}] HTTP: progress $(fmt_bytes "$cur") / $(fmt_bytes "$total") (${pct}%)"
@@ -508,7 +543,7 @@ http_fetch_image_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$post_raw" 2>&1 || true
+  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$post_raw" 2>/dev/null || true
   tr -d '\r' < "$post_raw" > "$post_norm"; post_bytes="$(flash_size_from "$post_norm" "$base")"; rm -f "$post_raw" "$post_norm"
 
   if grep -qiE '(bytes copied|copied in [0-9.]+ sec|Copy complete|copied successfully|\[OK -[[:space:]]*[0-9]+[[:space:]]*bytes\])' "$copy_norm" || [[ -n "$post_bytes" ]]; then
@@ -533,7 +568,7 @@ write_memory_for_ip(){
     (( need_en )) && emit_enable
     printf 'write memory\r\n'
     printf 'exit\r\n'
-  } | timeout -k 8s 120s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+  } | timeout -k 8s 120s "${SSH_CMD[@]}" >"$raw" 2>/dev/null || true
   tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
   if grep -qiE '(\[OK\]|Copy complete|bytes copied|copied successfully)' "$norm"; then log "[${ip}] WR: OK"; rm -f "$raw" "$norm"; return 0; fi
   log "[${ip}] WR: ambiguous — proceeding"; mv -f "$norm" "$RUN_DIR/${ip}.write_memory.out"; rm -f "$raw"; return 1
@@ -564,7 +599,7 @@ install_activate_image_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>&1 || true
+  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>/dev/null || true
   tr -d '\r' < "$chk_raw" > "$chk_norm"; have="$(flash_size_from "$chk_norm" "$base")"; rm -f "$chk_raw" "$chk_norm"
   if [[ -z "$have" ]]; then log "[${ip}] INSTALL: image not found on flash — SKIP"; add_action "$ip,${host},install,skipped,missing_image"; return 2; fi
   if [[ -n "$size" && "$size" != "$have" ]]; then log "[${ip}] INSTALL: image size mismatch (have=${have}, want=${size}) — SKIP"; add_action "$ip,${host},install,skipped,size_mismatch"; return 2; fi

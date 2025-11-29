@@ -331,6 +331,21 @@ validate_switches_before_migration() {
     return 1
   fi
 
+  # ---------- load discovery metadata for gating (blacklist / ssh / login) ----------
+  declare -A DISC_SSH DISC_LOGIN DISC_BLACK DISC_HAS
+
+  if [[ -s "$DISC_JSON" ]]; then
+    while IFS=$'\t' read -r ip ssh login black; do
+      DISC_SSH["$ip"]="$ssh"
+      DISC_LOGIN["$ip"]="$login"
+      DISC_BLACK["$ip"]="$black"
+      DISC_HAS["$ip"]=1
+    done < <(
+      jq -r '.[] | "\(.ip)\t\(.ssh // false)\t\(.login // false)\t\(.blacklisted // false)"' \
+        "$DISC_JSON"
+    )
+  fi
+
   # ---------- checklist: choose which switches to validate ----------
   local -a items=()
   for i in "${!IPS[@]}"; do
@@ -338,10 +353,34 @@ validate_switches_before_migration() {
     local h="${HOSTS[$i]:-<unknown>}"
     local p="${PIDS[$i]:--}"
     local s="${SER[$i]:--}"
+
+    # If discovery metadata exists for this IP, enforce:
+    #   - not blacklisted
+    #   - ssh == true
+    #   - login == true
+    if [[ -n "${DISC_HAS[$ip]:-}" ]]; then
+      # Skip devices already onboarded / blocked
+      if [[ "${DISC_BLACK[$ip]}" == "true" ]]; then
+        continue
+      fi
+      # Skip unreachable / unknown devices
+      if [[ "${DISC_SSH[$ip]}" != "true" || "${DISC_LOGIN[$ip]}" != "true" ]]; then
+        continue
+      fi
+    fi
+
     local label
     printf -v label "%-15s %-24s %-12s %s" "$ip" "$h" "$p" "$s"
     items+=( "$ip" "$label" "on" )
   done
+
+  # If everything was filtered out, bail cleanly
+  if ((${#items[@]} == 0)); then
+    dlg --backtitle "$BACKTITLE_V" \
+        --title "No eligible switches" \
+        --msgbox "No switches are eligible for validation.\n\nAll discovered devices are either:\n  • blacklisted (e.g. Meraki user exists), or\n  • unreachable / unknown (SSH/login failed).\n\nCheck discovery_results.json and rerun discovery/selection." 14 80
+    return 1
+  fi
 
   local selection
   selection="$(dlg --separate-output \
