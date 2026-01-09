@@ -2141,20 +2141,27 @@ onboard_meraki_connect_switches() {
       fi
 
       # Now: up to 3 attempts to see tunnels up / registered / cloud ID
+            # Now: retry attempts to see tunnels up / registered / cloud ID
+      # Tuning knobs:
+      local MAX_TUNNEL_CHECKS=8     # was 3
+      local TUNNEL_CHECK_SLEEP=15   # seconds between checks
+
       local attempt state_log
-      for attempt in 1 2 3; do
+      for ((attempt=1; attempt<=MAX_TUNNEL_CHECKS; attempt++)); do
         if (( attempt == 1 )); then
           state_log="$ssh_log"
         else
           state_log="$RUN_DIR/devlogs/${ip}.meraki_connect.state${attempt}.log"
-          validate_ui_status "[$ip] Meraki connect not fully up yet (attempt $((attempt-1))/3); waiting 15s then re-checking…"
-          sleep 15
+          validate_ui_status "[$ip] Meraki connect not fully up yet (attempt $((attempt-1))/${MAX_TUNNEL_CHECKS}); waiting ${TUNNEL_CHECK_SLEEP}s then re-checking…"
+          sleep "$TUNNEL_CHECK_SLEEP"
+
           {
             printf '\r\nterminal length 0\r\nterminal width 511\r\n'
             printf 'show meraki connect\r\n'
             printf 'show meraki\r\n'
             printf 'exit\r\n'
           } | "${ssh_cmd[@]}" >"$ssh_log_tmp" 2>&1 || true
+
           tr -d '\r' <"$ssh_log_tmp" >"$state_log"
           rm -f "$ssh_log_tmp" 2>/dev/null || true
         fi
