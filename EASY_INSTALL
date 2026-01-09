@@ -6,4 +6,4 @@ Make sure you enable root SSH access
 #SSH into the server (as root) and do the following:
 #(Just copy and paste the following line on remote SSH terminal)
 
-dnf -y install wget && cd /root &&  bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
+sudo dnf -y install wget && cd "$HOME" && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
