@@ -134,6 +134,102 @@ detect_platform() {
 }
 
 # =========================
+# Helper: get free GB on /
+# =========================
+get_root_free_gb() {
+  local gb
+  gb=$(df -BG / | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+  if ! [[ "$gb" =~ ^[0-9]+$ ]]; then
+    echo ""
+    return 1
+  fi
+  echo "$gb"
+  return 0
+}
+
+# =========================
+# Raspberry Pi rootfs expand (ROOT RUN ONLY)
+# =========================
+pi_maybe_expand_rootfs() {
+  # Only for Raspberry Pi, and only when running as root
+  [[ "${DETECTED_PLATFORM}" == "rpi" ]] || return 0
+  [[ "$(id -un)" == "root" ]] || return 0
+
+  local free_gb
+  free_gb="$(get_root_free_gb)" || free_gb=""
+
+  if [[ -z "$free_gb" ]]; then
+    echo -e "[${RED}ERROR${TEXTRESET}] Unable to determine available disk space on root filesystem."
+    echo "Exiting..."
+    exit 1
+  fi
+
+  # Already good
+  if (( free_gb >= 8 )); then
+    return 0
+  fi
+
+  echo
+  echo -e "[${RED}ERROR${TEXTRESET}] Insufficient disk space on root filesystem."
+  echo -e "[${YELLOW}INFO${TEXTRESET}] Detected: ${free_gb}GB available on / — ${GREEN}8GB+ required${TEXTRESET}."
+  echo -e "[${YELLOW}INFO${TEXTRESET}] On Raspberry Pi images, it's common for the root partition to be left small until expanded."
+  echo
+
+  if ! command -v rootfs-expand >/dev/null 2>&1; then
+    echo -e "[${RED}ERROR${TEXTRESET}] 'rootfs-expand' was not found on this system."
+    echo -e "[${YELLOW}INFO${TEXTRESET}] Please expand the root filesystem manually, then re-run this installer."
+    echo "Exiting..."
+    exit 1
+  fi
+
+  echo -e "[${YELLOW}INFO${TEXTRESET}] Current storage summary:"
+  df -h / || true
+  echo
+
+  read -r -p "Run rootfs-expand now to grow / to the maximum available size? [y/N]: " ans
+  case "$ans" in
+    y|Y|yes|YES)
+      echo -e "[${YELLOW}INFO${TEXTRESET}] Running: rootfs-expand"
+      if rootfs-expand; then
+        echo -e "[${GREEN}SUCCESS${TEXTRESET}] rootfs-expand completed."
+      else
+        echo -e "[${RED}ERROR${TEXTRESET}] rootfs-expand failed."
+        echo -e "[${YELLOW}INFO${TEXTRESET}] Please expand the root filesystem manually, then re-run this installer."
+        echo "Exiting..."
+        exit 1
+      fi
+
+      echo
+      echo -e "[${YELLOW}INFO${TEXTRESET}] Re-checking available space on / ..."
+      free_gb="$(get_root_free_gb)" || free_gb=""
+      if [[ -z "$free_gb" ]]; then
+        echo -e "[${RED}ERROR${TEXTRESET}] Unable to determine available disk space after expansion."
+        echo "Exiting..."
+        exit 1
+      fi
+
+      if (( free_gb >= 8 )); then
+        echo -e "[${GREEN}SUCCESS${TEXTRESET}] Root filesystem now has ${free_gb}GB available (meets 8GB requirement)."
+        echo
+        return 0
+      fi
+
+      echo -e "[${RED}ERROR${TEXTRESET}] Root filesystem still does not meet requirements after expansion."
+      echo -e "[${YELLOW}INFO${TEXTRESET}] Detected: ${free_gb}GB available — ${GREEN}8GB or more${TEXTRESET} is required."
+      echo -e "[${YELLOW}INFO${TEXTRESET}] This typically means the SD card / disk itself is too small, or the image/partition layout limits growth."
+      echo "Exiting..."
+      exit 1
+      ;;
+    *)
+      echo -e "[${RED}ERROR${TEXTRESET}] Cannot proceed without at least 8GB available on /."
+      echo -e "[${YELLOW}INFO${TEXTRESET}] Re-run this installer after expanding the root filesystem."
+      echo "Exiting..."
+      exit 1
+      ;;
+  esac
+}
+
+# =========================
 # Raspberry Pi precheck:
 # 1) If NOT root, prompt to set root password (sudo passwd root)
 # 2) Ensure sshd allows root PASSWORD login and restart sshd if needed
@@ -288,10 +384,8 @@ fi
 # =========================
 OSVER_RAW=""
 if [[ -f /etc/os-release ]]; then
-  # VERSION_ID is typically like: "10.1"
   OSVER_RAW=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release 2>/dev/null)
 elif [[ -f /etc/redhat-release ]]; then
-  # Fallback: try to capture something like 10.1, else just 10
   OSVER_RAW=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -1)
 fi
 
@@ -322,10 +416,11 @@ fi
 
 # =========================
 # Checking root filesystem size (minimum 8GB required)
+# If Raspberry Pi and too small, offer rootfs-expand (ROOT ONLY)
 # =========================
-ROOT_FREE_GB=$(df -BG / | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+ROOT_FREE_GB="$(get_root_free_gb)" || ROOT_FREE_GB=""
 
-if ! [[ "$ROOT_FREE_GB" =~ ^[0-9]+$ ]]; then
+if [[ -z "$ROOT_FREE_GB" ]]; then
   echo -e "[${RED}ERROR${TEXTRESET}] Unable to determine available disk space on root filesystem."
   echo "Exiting..."
   exit 1
@@ -335,10 +430,15 @@ if (( ROOT_FREE_GB >= 8 )); then
   echo -e "[${GREEN}SUCCESS${TEXTRESET}] Root filesystem has ${ROOT_FREE_GB}GB available (minimum 8GB required)."
   sleep 2
 else
-  echo -e "[${RED}ERROR${TEXTRESET}] Insufficient disk space on root filesystem."
-  echo -e "Detected: ${ROOT_FREE_GB}GB available — ${GREEN}8GB or more${TEXTRESET} is required."
-  echo "Exiting..."
-  exit 1
+  # If Pi, try to expand; otherwise fail immediately.
+  if [[ "${DETECTED_PLATFORM}" == "rpi" ]]; then
+    pi_maybe_expand_rootfs
+  else
+    echo -e "[${RED}ERROR${TEXTRESET}] Insufficient disk space on root filesystem."
+    echo -e "Detected: ${ROOT_FREE_GB}GB available — ${GREEN}8GB or more${TEXTRESET} is required."
+    echo "Exiting..."
+    exit 1
+  fi
 fi
 
 echo -e "${CYAN}==>Retrieving requirements for the installer...${TEXTRESET}"
