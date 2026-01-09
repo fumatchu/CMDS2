@@ -1186,13 +1186,10 @@ EOL
   sleep 3
 }
 #===========Install Python and Dependencies==========
-python310_setup_module() {
-  local TITLE="Python 3.10 Setup"
-  local BACKTITLE="Python 3.10 Setup"
-  local LOGFILE="/var/log/python310-setup.log"
-  local PYVER="3.10.5"
-  local PYTGZ="Python-${PYVER}.tgz"
-  local PYSRC="Python-${PYVER}"
+python312_setup_module() {
+  local TITLE="Python 3 (System) Setup"
+  local BACKTITLE="Python 3 (System) Setup"
+  local LOGFILE="/var/log/python3-system-setup.log"
 
   mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
   : > "$LOGFILE"
@@ -1203,15 +1200,28 @@ python310_setup_module() {
 "ERROR: This function must be run as root (sudo)." 7 60
     sleep 2; return 1
   fi
-  local OSMAJOR=""
+
+  local OSMAJOR="" OSMINOR=""
   if [[ -r /etc/os-release ]]; then
-    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+    . /etc/os-release
+    OSMAJOR="${VERSION_ID%%.*}"
+    OSMINOR="${VERSION_ID#*.}"
+    [[ "$OSMINOR" == "$VERSION_ID" ]] && OSMINOR="0"
   elif [[ -r /etc/redhat-release ]]; then
     OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+    OSMINOR="0"
   fi
-  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+
+  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ ]]; then
     dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
-"ERROR: This installer supports Rocky Linux 9 or newer." 7 60
+"ERROR: Unable to detect Rocky Linux version." 7 60
+    sleep 2; return 1
+  fi
+
+  # Require Rocky 10.1+
+  if ! (( OSMAJOR > 10 || (OSMAJOR == 10 && OSMINOR >= 1) )); then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"ERROR: This installer supports Rocky Linux 10.1 or newer." 7 60
     sleep 2; return 1
   fi
 
@@ -1226,10 +1236,9 @@ python310_setup_module() {
     local label="$1"; shift
     _gauge_update "$((target_pct-1))" "$label..."
     { "$@" >>"$LOGFILE" 2>&1; } || return 1
-    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+    _gauge_update "$target_pct" "$label...done"; sleep 0.25
   }
 
-  # Dynamic pacing: faster early, slower near target
   _run_long_step() { # usage: _run_long_step <start_pct> <target_pct> <label> <cmd...>
     local start_pct="$1"; local target_pct="$2"; shift 2
     local label="$1"; shift
@@ -1240,16 +1249,11 @@ python310_setup_module() {
     local pct="$start_pct"
 
     while kill -0 "$pid" >/dev/null 2>&1; do
-      # Increment toward target-1, never reaching it until the command finishes
       pct=$((pct + 1))
       if (( pct >= target_pct )); then pct=$((target_pct-1)); fi
 
-      # Dynamic pacing: slow down as we get closer to the target
-      #   <= 60%  : snappy updates
-      #   61–70%  : moderate
-      #   71–(target-1): slower (feels realistic near the end)
       if   (( pct <= 60 )); then sleep 1
-      elif (( pct <= 70 )); then sleep 5
+      elif (( pct <= 70 )); then sleep 2
       else                       sleep 2
       fi
 
@@ -1257,54 +1261,67 @@ python310_setup_module() {
     done
 
     wait "$pid" || return 1
-    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+    _gauge_update "$target_pct" "$label...done"; sleep 0.25
   }
 
-  # ---- Run the build with a single gauge ----
+  # ---- Run with a single gauge ----
   {
-    _gauge_update 1 "Starting Python ${PYVER} setup (Rocky ${OSMAJOR})..."; sleep 0.4
+    _gauge_update 1 "Starting system Python/pip setup (Rocky ${OSMAJOR}.${OSMINOR})..."; sleep 0.4
 
-    _run_step 5  "Preparing /root working directory" bash -lc 'cd /root' || exit 1
-    _run_step 10 "Downloading ${PYTGZ}"             bash -lc "cd /root && wget -q https://www.python.org/ftp/python/${PYVER}/${PYTGZ}" || exit 1
-    _run_step 15 "Extracting ${PYTGZ}"              bash -lc "cd /root && tar xzf ${PYTGZ}" || exit 1
-    _run_step 25 "Configuring (enable optimizations)" bash -lc "cd /root/${PYSRC} && ./configure --enable-optimizations" || exit 1
+    # You said DNF deps are already handled, so we just verify python3/pip exist.
+    _run_step 10 "Verifying python3" bash -lc 'command -v python3 >/dev/null 2>&1' || exit 1
+    _run_step 15 "Verifying pip (python3 -m pip)" bash -lc 'python3 -m pip --version >/dev/null 2>&1' || exit 1
 
-    local JOBS; JOBS="$(nproc 2>/dev/null || echo 4)"
-    _run_long_step 25 80 "Compiling (make -j ${JOBS})" bash -lc "cd /root/${PYSRC} && make -j ${JOBS}" || exit 1
+    _run_long_step 20 55 "Upgrading pip/setuptools/wheel" bash -lc \
+      'python3 -m pip install --upgrade pip setuptools wheel' || exit 1
 
-    _run_step 85 "Installing (make altinstall)"     bash -lc "cd /root/${PYSRC} && make altinstall" || exit 1
-    _run_step 88 "Bootstrapping pip (ensurepip)"    /usr/local/bin/python3.10 -m ensurepip --upgrade || true
-    _run_long_step 90 93 "Upgrading pip/setuptools/wheel" /usr/local/bin/python3.10 -m pip install --upgrade pip setuptools wheel || exit 1
-    _run_long_step 93 96 "Installing meraki & requests"  /usr/local/bin/python3.10 -m pip install -U meraki requests || exit 1
-    _run_step 97 "Relocating sources to /opt/${PYSRC}" bash -lc "mv -f /root/${PYSRC}/ /opt/" || exit 1
-    _run_step 99 "Cleaning /root artifacts"         bash -lc "rm -f /root/Python* 2>/dev/null || true" || exit 1
+    # IMPORTANT:
+    # requests is installed/managed by RPM on Rocky/RHEL. pip cannot safely uninstall/upgrade it.
+    # If we try "pip install -U meraki requests", pip will fail on requests and meraki won't install.
+    _run_long_step 55 90 "Installing meraki" bash -lc \
+      'python3 -m pip install -U meraki' || exit 1
+
     _gauge_update 100 "Finalizing..."; sleep 0.5
-  } | dialog --backtitle "$BACKTITLE" --title "Building Python ${PYVER}" \
+  } | dialog --backtitle "$BACKTITLE" --title "System Python/Pip Setup" \
              --gauge "Initializing..." 18 90 0
 
   # ---- Post-check & summary ----
-  if ! command -v /usr/local/bin/python3.10 >/dev/null 2>&1; then
+  if ! command -v python3 >/dev/null 2>&1; then
     dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
-"Python 3.10 installation appears to have failed.
+"Python installation appears to be missing (python3 not found).
 See log: $LOGFILE" 8 70
     sleep 2; return 1
   fi
 
-  local PYBIN="/usr/local/bin/python3.10"
-  local PYV="$("$PYBIN" -V 2>&1 || true)"
-  local PIPV="$("$PYBIN" -m pip --version 2>&1 || true)"
-  local MERAKI_V="$("$PYBIN" -m pip show meraki 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
-  local REQ_V="$("$PYBIN" -m pip show requests 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"pip appears to be missing or broken (python3 -m pip failed).
+See log: $LOGFILE" 8 70
+    sleep 2; return 1
+  fi
 
-  local REPORT="Python setup complete.
+  local PYV PIPV
+  PYV="$(python3 -V 2>&1 || true)"
+  PIPV="$(python3 -m pip --version 2>&1 || true)"
+
+  # meraki installed via pip
+  local MERAKI_V
+  MERAKI_V="$(python3 -m pip show meraki 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+
+  # requests may be RPM-managed; validate by import/version (works regardless of pip metadata)
+  local REQ_V
+  REQ_V="$(python3 -c 'import requests; print(getattr(requests,"__version__","unknown"))' 2>/dev/null || true)"
+  [[ -z "$REQ_V" ]] && REQ_V="not installed"
+
+  local REPORT="System Python/pip setup complete.
 
 ${PYV}
 ${PIPV}
-meraki:  ${MERAKI_V:-not installed}
-requests: ${REQ_V:-not installed}
+meraki:   ${MERAKI_V:-not installed}
+requests: ${REQ_V}
 
-Binary: /usr/local/bin/python3.10
-Sources: /opt/${PYSRC}
+Binary: $(command -v python3)
+pip:    $(command -v pip3 2>/dev/null || echo 'pip3 not found (use: python3 -m pip)')
 Log: ${LOGFILE}
 
 Continuing..."
@@ -1312,6 +1329,127 @@ Continuing..."
   sleep 2
   return 0
 }
+#python310_setup_module() {
+#  local TITLE="Python 3.10 Setup"
+#  local BACKTITLE="Python 3.10 Setup"
+#  local LOGFILE="/var/log/python310-setup.log"
+#  local PYVER="3.10.5"
+#  local PYTGZ="Python-${PYVER}.tgz"
+#  local PYSRC="Python-${PYVER}"
+#
+#  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+#  : > "$LOGFILE"
+#
+#  # ---- Preflight (auto-close errors) ----
+#  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+#    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+#"ERROR: This function must be run as root (sudo)." 7 60
+#    sleep 2; return 1
+#  fi
+#  local OSMAJOR=""
+#  if [[ -r /etc/os-release ]]; then
+#    . /etc/os-release; OSMAJOR="${VERSION_ID%%.*}"
+#  elif [[ -r /etc/redhat-release ]]; then
+#    OSMAJOR="$(grep -oE '[0-9]+' /etc/redhat-release | head -1 || true)"
+#  fi
+#  if ! [[ "$OSMAJOR" =~ ^[0-9]+$ && $OSMAJOR -ge 9 ]]; then
+#    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+#"ERROR: This installer supports Rocky Linux 9 or newer." 7 60
+#    sleep 2; return 1
+#  fi
+#
+#  # ---- Gauge helpers ----
+#  _gauge_update() {  # usage: _gauge_update <pct> <message...>
+#    local pct="$1"; shift
+#    echo "XXX"; echo "$pct"; echo -e "$*"; echo "XXX"
+#  }
+#
+#  _run_step() {      # usage: _run_step <target_pct> <label> <cmd...>
+#    local target_pct="$1"; shift
+#    local label="$1"; shift
+#    _gauge_update "$((target_pct-1))" "$label..."
+#    { "$@" >>"$LOGFILE" 2>&1; } || return 1
+#    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+#  }
+#
+#  # Dynamic pacing: faster early, slower near target
+#  _run_long_step() { # usage: _run_long_step <start_pct> <target_pct> <label> <cmd...>
+#    local start_pct="$1"; local target_pct="$2"; shift 2
+#    local label="$1"; shift
+#    _gauge_update "$start_pct" "$label (running)..."
+#
+#    { "$@" >>"$LOGFILE" 2>&1 & }
+#    local pid=$!
+#    local pct="$start_pct"
+#
+#    while kill -0 "$pid" >/dev/null 2>&1; do
+#      pct=$((pct + 1))
+#      if (( pct >= target_pct )); then pct=$((target_pct-1)); fi
+#
+#      if   (( pct <= 60 )); then sleep 1
+#      elif (( pct <= 70 )); then sleep 5
+#      else                       sleep 2
+#      fi
+#
+#      _gauge_update "$pct" "$label (running)..."
+#    done
+#
+#    wait "$pid" || return 1
+#    _gauge_update "$target_pct" "$label...done"; sleep 0.3
+#  }
+#
+#  # ---- Run the build with a single gauge ----
+#  {
+#    _gauge_update 1 "Starting Python ${PYVER} setup (Rocky ${OSMAJOR})..."; sleep 0.4
+#
+#    _run_step 5  "Preparing /root working directory" bash -lc 'cd /root' || exit 1
+#    _run_step 10 "Downloading ${PYTGZ}"             bash -lc "cd /root && wget -q https://www.python.org/ftp/python/${PYVER}/${PYTGZ}" || exit 1
+#    _run_step 15 "Extracting ${PYTGZ}"              bash -lc "cd /root && tar xzf ${PYTGZ}" || exit 1
+#    _run_step 25 "Configuring (enable optimizations)" bash -lc "cd /root/${PYSRC} && ./configure --enable-optimizations" || exit 1
+#
+#    local JOBS; JOBS="$(nproc 2>/dev/null || echo 4)"
+#    _run_long_step 25 80 "Compiling (make -j ${JOBS})" bash -lc "cd /root/${PYSRC} && make -j ${JOBS}" || exit 1
+#
+#    _run_step 85 "Installing (make altinstall)"     bash -lc "cd /root/${PYSRC} && make altinstall" || exit 1
+#    _run_step 88 "Bootstrapping pip (ensurepip)"    /usr/local/bin/python3.10 -m ensurepip --upgrade || true
+#    _run_long_step 90 93 "Upgrading pip/setuptools/wheel" /usr/local/bin/python3.10 -m pip install --upgrade pip setuptools wheel || exit 1
+#    _run_long_step 93 96 "Installing meraki & requests"  /usr/local/bin/python3.10 -m pip install -U meraki requests || exit 1
+#    _run_step 97 "Relocating sources to /opt/${PYSRC}" bash -lc "mv -f /root/${PYSRC}/ /opt/" || exit 1
+#    _run_step 99 "Cleaning /root artifacts"         bash -lc "rm -f /root/Python* 2>/dev/null || true" || exit 1
+#    _gauge_update 100 "Finalizing..."; sleep 0.5
+#  } | dialog --backtitle "$BACKTITLE" --title "Building Python ${PYVER}" \
+#             --gauge "Initializing..." 18 90 0
+#
+#  # ---- Post-check & summary ----
+#  if ! command -v /usr/local/bin/python3.10 >/dev/null 2>&1; then
+#    dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+#"Python 3.10 installation appears to have failed.
+#See log: $LOGFILE" 8 70
+#    sleep 2; return 1
+#  fi
+#
+#  local PYBIN="/usr/local/bin/python3.10"
+#  local PYV="$("$PYBIN" -V 2>&1 || true)"
+#  local PIPV="$("$PYBIN" -m pip --version 2>&1 || true)"
+#  local MERAKI_V="$("$PYBIN" -m pip show meraki 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+#  local REQ_V="$("$PYBIN" -m pip show requests 2>/dev/null | awk -F': ' '/^Version/{print $2}')"
+#
+#  local REPORT="Python setup complete.
+#
+#${PYV}
+#${PIPV}
+#meraki:  ${MERAKI_V:-not installed}
+#requests: ${REQ_V:-not installed}
+#
+#Binary: /usr/local/bin/python3.10
+#Sources: /opt/${PYSRC}
+#Log: ${LOGFILE}
+#
+#Continuing..."
+#  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox "$REPORT" 14 78
+#  sleep 2
+#  return 0
+#}
 #===========TFTP Server Setup=============
 tftp_setup_module() {
   local TITLE="TFTP Server Configuration"
@@ -2775,7 +2913,8 @@ update_and_install_packages
 vm_detection
 configure_firewall
 update_issue_file
-python310_setup_module
+python312_setup_module
+#python310_setup_module
 tftp_setup_module
 http_repo_setup_module
 create_iosxe_symlink_module
