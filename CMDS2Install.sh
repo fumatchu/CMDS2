@@ -23,31 +23,42 @@ else
 fi
 
 # =========================
-# Checking for version information (Rocky 9 or newer)
+# Checking for version information (Rocky 10.1 or newer)
 # =========================
+OSVER_RAW=""
 if [[ -f /etc/os-release ]]; then
-  # Extract only the numeric part of VERSION_ID (e.g., "9", "10", "11")
-  OSVER=$(grep -oP '(?<=VERSION_ID=")[0-9]+' /etc/os-release 2>/dev/null)
+  # VERSION_ID is typically like: "10.1"
+  OSVER_RAW=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release 2>/dev/null)
 elif [[ -f /etc/redhat-release ]]; then
-  OSVER=$(grep -oE '[0-9]+' /etc/redhat-release | head -1)
-else
-  OSVER=0
+  # Fallback: try to capture something like 10.1, else just 10
+  OSVER_RAW=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -1)
 fi
 
 # Sanity check
-if ! [[ "$OSVER" =~ ^[0-9]+$ ]]; then
+if [[ -z "$OSVER_RAW" ]]; then
   echo -e "[${RED}ERROR${TEXTRESET}] Unable to detect a valid Rocky Linux version."
   echo "Exiting..."
   exit 1
 fi
 
-# Compare numerically (works for 9, 10, 11, etc.)
-if (( OSVER >= 9 )); then
-  echo -e "[${GREEN}SUCCESS${TEXTRESET}] Detected compatible OS version: Rocky ${OSVER}.x or greater"
+# Split into major/minor (minor defaults to 0 if absent)
+OSVER_MAJOR=$(echo "$OSVER_RAW" | awk -F. '{print $1}')
+OSVER_MINOR=$(echo "$OSVER_RAW" | awk -F. '{print ($2==""?0:$2)}')
+
+# Validate numeric
+if ! [[ "$OSVER_MAJOR" =~ ^[0-9]+$ && "$OSVER_MINOR" =~ ^[0-9]+$ ]]; then
+  echo -e "[${RED}ERROR${TEXTRESET}] Unable to parse Rocky Linux version from: ${OSVER_RAW}"
+  echo "Exiting..."
+  exit 1
+fi
+
+# Require >= 10.1
+if (( OSVER_MAJOR > 10 || (OSVER_MAJOR == 10 && OSVER_MINOR >= 1) )); then
+  echo -e "[${GREEN}SUCCESS${TEXTRESET}] Detected compatible OS version: Rocky ${OSVER_MAJOR}.${OSVER_MINOR} or greater"
   sleep 2
 else
-  echo -e "[${RED}ERROR${TEXTRESET}] Sorry, this installer only supports Rocky 9.x or newer."
-  echo -e "Please upgrade to ${GREEN}Rocky 9.x${TEXTRESET} or later."
+  echo -e "[${RED}ERROR${TEXTRESET}] Sorry, this installer only supports Rocky 10.1 or newer."
+  echo -e "Detected: Rocky ${OSVER_MAJOR}.${OSVER_MINOR} — Please upgrade to ${GREEN}Rocky 10.1${TEXTRESET} or later."
   echo "Exiting..."
   exit 1
 fi
