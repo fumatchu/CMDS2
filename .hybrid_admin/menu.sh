@@ -58,6 +58,7 @@ declare -A HELP_RAW=(
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
   ["Utilities"]="Utility tools for monitoring and quick checks."
   ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
+  ["Advanced IOS-XE deployment"]="Advanced IOS-XE image deployment module (manual, no guardrails)."
   ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
   ["CLI Updater"]="Run ad-hoc CLI command packs on selected switches."
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
@@ -228,7 +229,15 @@ submenu_utilities(){
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # 2) IOS-XE Image Management
+    # 2) Advanced IOS-XE deployment (NEW)
+    local lbl_adv="Advanced IOS-XE deployment"
+    local path_adv="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_manual_main.sh"
+    MENU_ITEMS+=("$i" "$lbl_adv" "$(color_help "Advanced IOS-XE image deployment module (manual, no guardrails).")")
+    PATH_BY_TAG["$i"]="$path_adv"
+    LABEL_BY_TAG["$i"]="$lbl_adv"
+    ((i++))
+
+    # 3) IOS-XE Image Management
     local lbl2="IOS-XE Image Management"
     local path2="/root/.hybrid_admin/image_management.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
@@ -236,7 +245,7 @@ submenu_utilities(){
     LABEL_BY_TAG["$i"]="$lbl2"
     ((i++))
 
-    # 3) CLI Updater
+    # 4) CLI Updater
     local lbl3="CLI Updater"
     local path3="/root/.hybrid_admin/cli_updater.sh"
     MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
@@ -244,7 +253,7 @@ submenu_utilities(){
     LABEL_BY_TAG["$i"]="$lbl3"
     ((i++))
 
-    # 4) Backup Config Viewer
+    # 5) Backup Config Viewer
     local lbl4="Backup Config Viewer"
     local path4="/root/.hybrid_admin/back_config_viewer.sh"
     MENU_ITEMS+=("$i" "$lbl4" "$(color_help "Browse and search saved switch backup configs.")")
