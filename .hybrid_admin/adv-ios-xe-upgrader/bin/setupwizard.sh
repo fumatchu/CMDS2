@@ -2,20 +2,20 @@
 # discovery_prompt.sh — IOS-XE Upgrade-only wizard
 # POSIX /bin/sh; dialog UI; writes PROJECT_ROOT/meraki_discovery.env by default
 #
-# CHANGE REQUEST IMPLEMENTED:
-#  - If an existing env file is found, DO NOT say “we found X file”.
-#  - Instead: “Pre-existing data was found.”
-#  - Display the actual data:
-#      • scan range(s) OR ip list
-#      • SSH username
-#      • SSH password (masked)
-#      • ENABLE password (masked)
-#  - If user says YES: import ALL fields and continue walking through wizard (as before).
+# CHANGE REQUEST IMPLEMENTED (UPDATED):
+#  - Support TWO optional pre-existing env sources, shown SEQUENTIALLY:
+#      1) Meraki Migration script env:   /root/.hybrid_admin/meraki_discovery.env
+#      2) Advanced IOS-XE module env:    /root/.hybrid_admin/adv-ios-xe-upgrader/meraki_discovery.env
+#  - UX is "old way": preview creds/targets first, ask YES/NO.
+#      - If user says YES to the first preview -> import and continue wizard.
+#      - If NO -> show second preview (if present).
+#      - If NO to both -> continue wizard with a fresh/cleared setup (no prefill).
+#  - Do NOT say “we found X file”; say “Pre-existing data was found.”
+#  - Show where the data came from (Meraki Migration vs Advanced IOS-XE module).
 #
 # NOTE:
-#  - Passwords are displayed masked (never plaintext).
-#  - We still pre-fill dialog password boxes when possible; if dialog won’t prefill,
-#    user can press OK with blank to KEEP the imported password.
+#  - Passwords are displayed in the preview in PLAINTEXT (per earlier request in your script).
+#  - Password input boxes still allow "blank == keep imported" behavior.
 
 TITLE="CMDS Switch Upgrade — Setup"
 BACKTITLE="Meraki Migration Toolkit — IOS-XE Upgrade"
@@ -207,9 +207,10 @@ MAX_WELCOME_H=$((TERM_LINES - 4))
 [ "$WELCOME_H" -lt 10 ] && WELCOME_H=10
 
 ###############################################################################
-# Import support (prefill defaults)
+# Import support (prefill defaults) — TWO SOURCES, SEQUENTIAL PREVIEW
 ###############################################################################
-IMPORT_ENV="/root/.hybrid_admin/meraki_discovery.env"
+IMPORT_ENV_MIG="/root/.hybrid_admin/meraki_discovery.env"
+IMPORT_ENV_ADV="/root/.hybrid_admin/adv-ios-xe-upgrader/meraki_discovery.env"
 IMPORTED="0"
 
 # Defaults that may be prefilled
@@ -259,6 +260,137 @@ mask() {
   [ "$n" -gt 0 ] && { i=1; out=""; while [ "$i" -le "$n" ]; do out="${out}*"; i=$((i+1)); done; printf '%s' "$out"; } || printf "(empty)"
 }
 
+clear_import_defaults() {
+  MODE_DEFAULT=""
+  NETS_PREV_DEFAULT=""
+  IPS_PREV_DEFAULT=""
+  SSH_USERNAME_DEFAULT=""
+  SSH_PASSWORD_DEFAULT=""
+  SSH_TEST_IP_DEFAULT=""
+  ENABLE_PASSWORD_DEFAULT=""
+  HTTP_CLIENT_VLAN_ID_DEFAULT=""
+  FW_CAT9K_FILE_DEFAULT=""
+  FW_CAT9K_LITE_FILE_DEFAULT=""
+  IMPORTED="0"
+}
+
+offer_import_from_env() {
+  _env="$1"
+  _label="$2"
+
+  [ -f "$_env" ] || return 1
+
+  PRE_MODE=""; PRE_NETS=""; PRE_IPS=""; PRE_USER=""; PRE_PASS=""; PRE_ENPASS=""
+
+  if safe_source_env "$_env"; then
+    PRE_MODE="$(trim "${DISCOVERY_MODE:-}")"
+    [ -n "$PRE_MODE" ] || PRE_MODE="$(trim "${MODE:-}")"
+    PRE_NETS="$(trim "${DISCOVERY_NETWORKS:-}")"
+    PRE_IPS="$(trim "${DISCOVERY_IPS:-}")"
+    PRE_USER="$(trim "${SSH_USERNAME:-}")"
+    PRE_PASS="${SSH_PASSWORD:-}"
+    PRE_ENPASS="${ENABLE_PASSWORD:-}"
+  else
+    PRE_MODE=""
+  fi
+
+  PRE_TARGETS_BLOCK=""
+  if [ "$PRE_MODE" = "scan" ] && [ -n "$PRE_NETS" ]; then
+    PRE_TARGETS_BLOCK="Scan ranges (CIDR), one per line:
+$(env_to_lines_networks "$PRE_NETS")"
+  elif [ "$PRE_MODE" = "list" ] && [ -n "$PRE_IPS" ]; then
+    PRE_TARGETS_BLOCK="IP list, one per line:
+$(env_to_lines_ips "$PRE_IPS")"
+  else
+    if [ -n "$PRE_NETS" ]; then
+      PRE_TARGETS_BLOCK="Scan ranges (CIDR), one per line:
+$(env_to_lines_networks "$PRE_NETS")"
+    elif [ -n "$PRE_IPS" ]; then
+      PRE_TARGETS_BLOCK="IP list, one per line:
+$(env_to_lines_ips "$PRE_IPS")"
+    else
+      PRE_TARGETS_BLOCK="Targets:
+(none)"
+    fi
+  fi
+
+  PRE_USER_SHOW="${PRE_USER:-}";     [ -n "$PRE_USER_SHOW" ]   || PRE_USER_SHOW="(empty)"
+  PRE_PASS_SHOW="${PRE_PASS:-}";     [ -n "$PRE_PASS_SHOW" ]   || PRE_PASS_SHOW="(empty)"
+  PRE_ENPASS_SHOW="${PRE_ENPASS:-}"; [ -n "$PRE_ENPASS_SHOW" ] || PRE_ENPASS_SHOW="(empty)"
+
+  dialog --no-shadow --backtitle "$BACKTITLE" --title "Import existing data?" --yesno \
+"Pre-existing data was found.
+
+Source:
+  ${_label}
+
+${PRE_TARGETS_BLOCK}
+
+Switch SSH username (one line):
+${PRE_USER_SHOW}
+
+Switch SSH password (PLAINTEXT):
+${PRE_PASS_SHOW}
+
+Enable password (PLAINTEXT):
+${PRE_ENPASS_SHOW}
+
+Do you want to import this data and continue the wizard?" \
+  28 100
+
+  [ $? -eq 0 ] || return 1
+
+  if safe_source_env "$_env"; then
+    MODE_DEFAULT="$(trim "${DISCOVERY_MODE:-}")"
+    [ -n "$MODE_DEFAULT" ] || MODE_DEFAULT="$(trim "${MODE:-}")"
+
+    SSH_USERNAME_DEFAULT="$(trim "${SSH_USERNAME:-}")"
+    SSH_PASSWORD_DEFAULT="${SSH_PASSWORD:-}"
+    SSH_TEST_IP_DEFAULT="$(trim "${SSH_TEST_IP:-}")"
+    ENABLE_PASSWORD_DEFAULT="${ENABLE_PASSWORD:-}"
+
+    HTTP_CLIENT_VLAN_ID_DEFAULT="$(trim "${HTTP_CLIENT_VLAN_ID:-}")"
+
+    if [ "$MODE_DEFAULT" = "scan" ]; then
+      nets="${DISCOVERY_NETWORKS:-}"
+      NETS_PREV_DEFAULT="# Paste or type CIDR networks (one per line).
+# Lines starting with '#' and blank lines are ignored."
+      if [ -n "$nets" ]; then
+        NETS_PREV_DEFAULT="${NETS_PREV_DEFAULT}
+$(env_to_lines_networks "$nets")"
+      else
+        NETS_PREV_DEFAULT="${NETS_PREV_DEFAULT}
+10.0.0.0/24"
+      fi
+    elif [ "$MODE_DEFAULT" = "list" ]; then
+      ips="${DISCOVERY_IPS:-}"
+      IPS_PREV_DEFAULT="# Paste or type one IP per line.
+# Lines starting with '#' and blank lines are ignored."
+      if [ -n "$ips" ]; then
+        IPS_PREV_DEFAULT="${IPS_PREV_DEFAULT}
+$(env_to_lines_ips "$ips")"
+      else
+        IPS_PREV_DEFAULT="${IPS_PREV_DEFAULT}
+192.168.1.10
+192.168.1.11"
+      fi
+    fi
+
+    FW_CAT9K_FILE_DEFAULT="$(trim "${FW_CAT9K_FILE:-}")"
+    FW_CAT9K_LITE_FILE_DEFAULT="$(trim "${FW_CAT9K_LITE_FILE:-}")"
+
+    IMPORTED="1"
+    log "Imported settings from: $_env"
+    return 0
+  fi
+
+  dialog --no-shadow --backtitle "$BACKTITLE" --title "Import failed" --msgbox \
+"Pre-existing data could not be imported safely.
+
+We will continue without importing." 10 70
+  return 1
+}
+
 ###############################################################################
 # 0) WELCOME — Upgrade-only
 ###############################################################################
@@ -283,127 +415,24 @@ Have these ready:
   "$WELCOME_H" "$WELCOME_W" || { clear; exit 1; }
 
 ###############################################################################
-# 0a) Import pre-existing config (AFTER welcome)
-#     UX:
-#       - Do NOT mention path
-#       - Say "Pre-existing data was found."
-#       - Display actual data one-per-line, INCLUDING passwords (plaintext)
+# 0a) Import pre-existing config (AFTER welcome) — sequential previews
 ###############################################################################
-if [ -f "$IMPORT_ENV" ]; then
-  # Gather display-only values without modifying wizard defaults yet
-  PRE_MODE=""; PRE_NETS=""; PRE_IPS=""; PRE_USER=""; PRE_PASS=""; PRE_ENPASS=""
+imported_now=0
 
-  if safe_source_env "$IMPORT_ENV"; then
-    PRE_MODE="$(trim "${DISCOVERY_MODE:-}")"
-    [ -n "$PRE_MODE" ] || PRE_MODE="$(trim "${MODE:-}")"
-    PRE_NETS="$(trim "${DISCOVERY_NETWORKS:-}")"
-    PRE_IPS="$(trim "${DISCOVERY_IPS:-}")"
-    PRE_USER="$(trim "${SSH_USERNAME:-}")"
-    PRE_PASS="${SSH_PASSWORD:-}"
-    PRE_ENPASS="${ENABLE_PASSWORD:-}"
-  else
-    PRE_MODE=""
+if [ -f "$IMPORT_ENV_MIG" ]; then
+  if offer_import_from_env "$IMPORT_ENV_MIG" "Meraki Migration script (/root/.hybrid_admin)"; then
+    imported_now=1
   fi
+fi
 
-  # Build targets text, one per line
-  PRE_TARGETS_BLOCK=""
-  if [ "$PRE_MODE" = "scan" ] && [ -n "$PRE_NETS" ]; then
-    PRE_TARGETS_BLOCK="Scan ranges (CIDR), one per line:
-$(env_to_lines_networks "$PRE_NETS")"
-  elif [ "$PRE_MODE" = "list" ] && [ -n "$PRE_IPS" ]; then
-    PRE_TARGETS_BLOCK="IP list, one per line:
-$(env_to_lines_ips "$PRE_IPS")"
-  else
-    if [ -n "$PRE_NETS" ]; then
-      PRE_TARGETS_BLOCK="Scan ranges (CIDR), one per line:
-$(env_to_lines_networks "$PRE_NETS")"
-    elif [ -n "$PRE_IPS" ]; then
-      PRE_TARGETS_BLOCK="IP list, one per line:
-$(env_to_lines_ips "$PRE_IPS")"
-    else
-      PRE_TARGETS_BLOCK="Targets:
-(none)"
-    fi
+if [ "$imported_now" -eq 0 ] && [ -f "$IMPORT_ENV_ADV" ]; then
+  if offer_import_from_env "$IMPORT_ENV_ADV" "Advanced IOS-XE Upgrader module (/root/.hybrid_admin/adv-ios-xe-upgrader)"; then
+    imported_now=1
   fi
+fi
 
-  # One-per-line credential display (PASSWORDS SHOWN PLAINTEXT per request)
-  PRE_USER_SHOW="${PRE_USER:-}"
-  PRE_PASS_SHOW="${PRE_PASS:-}"
-  PRE_ENPASS_SHOW="${PRE_ENPASS:-}"
-
-  [ -n "$PRE_USER_SHOW" ]  || PRE_USER_SHOW="(empty)"
-  [ -n "$PRE_PASS_SHOW" ]  || PRE_PASS_SHOW="(empty)"
-  [ -n "$PRE_ENPASS_SHOW" ] || PRE_ENPASS_SHOW="(empty)"
-
-  dialog --no-shadow --backtitle "$BACKTITLE" --title "Import existing data?" --yesno \
-"Pre-existing data was found.
-
-${PRE_TARGETS_BLOCK}
-
-Switch SSH username (one line):
-${PRE_USER_SHOW}
-
-Switch SSH password (PLAINTEXT):
-${PRE_PASS_SHOW}
-
-Enable password (PLAINTEXT):
-${PRE_ENPASS_SHOW}
-
-Do you want to import this data and continue the wizard?" \
-  26 96
-
-  if [ $? -eq 0 ]; then
-    # Import for real (and prefill ALL fields)
-    if safe_source_env "$IMPORT_ENV"; then
-      MODE_DEFAULT="$(trim "${DISCOVERY_MODE:-}")"
-      [ -n "$MODE_DEFAULT" ] || MODE_DEFAULT="$(trim "${MODE:-}")"
-
-      SSH_USERNAME_DEFAULT="$(trim "${SSH_USERNAME:-}")"
-      SSH_PASSWORD_DEFAULT="${SSH_PASSWORD:-}"
-      SSH_TEST_IP_DEFAULT="$(trim "${SSH_TEST_IP:-}")"
-      ENABLE_PASSWORD_DEFAULT="${ENABLE_PASSWORD:-}"
-
-      HTTP_CLIENT_VLAN_ID_DEFAULT="$(trim "${HTTP_CLIENT_VLAN_ID:-}")"
-
-      # Targets
-      if [ "$MODE_DEFAULT" = "scan" ]; then
-        nets="${DISCOVERY_NETWORKS:-}"
-        NETS_PREV_DEFAULT="# Paste or type CIDR networks (one per line).
-# Lines starting with '#' and blank lines are ignored."
-        if [ -n "$nets" ]; then
-          NETS_PREV_DEFAULT="${NETS_PREV_DEFAULT}
-$(env_to_lines_networks "$nets")"
-        else
-          NETS_PREV_DEFAULT="${NETS_PREV_DEFAULT}
-10.0.0.0/24"
-        fi
-      elif [ "$MODE_DEFAULT" = "list" ]; then
-        ips="${DISCOVERY_IPS:-}"
-        IPS_PREV_DEFAULT="# Paste or type one IP per line.
-# Lines starting with '#' and blank lines are ignored."
-        if [ -n "$ips" ]; then
-          IPS_PREV_DEFAULT="${IPS_PREV_DEFAULT}
-$(env_to_lines_ips "$ips")"
-        else
-          IPS_PREV_DEFAULT="${IPS_PREV_DEFAULT}
-192.168.1.10
-192.168.1.11"
-        fi
-      fi
-
-      # Firmware picks (only used as defaults if still present in FIRMWARE_DIR)
-      FW_CAT9K_FILE_DEFAULT="$(trim "${FW_CAT9K_FILE:-}")"
-      FW_CAT9K_LITE_FILE_DEFAULT="$(trim "${FW_CAT9K_LITE_FILE:-}")"
-
-      IMPORTED="1"
-      log "Imported settings (plaintext display was shown in import UI)"
-    else
-      dialog --no-shadow --backtitle "$BACKTITLE" --title "Import failed" --msgbox \
-"Pre-existing data could not be imported safely.
-
-We will continue without importing." 10 70
-    fi
-  fi
+if [ "$imported_now" -eq 0 ]; then
+  clear_import_defaults
 fi
 
 ###############################################################################

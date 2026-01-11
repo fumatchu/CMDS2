@@ -58,7 +58,10 @@ declare -A HELP_RAW=(
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
   ["Utilities"]="Utility tools for monitoring and quick checks."
   ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
-  ["Advanced IOS-XE deployment"]="Advanced IOS-XE image deployment module (manual, no guardrails)."
+  ["Advanced IOS-XE deployment"]="Advanced IOS-XE deployment tools (interactive, scheduled, and schedule viewer)."
+  ["Advanced IOS-XE Deployment (Interactive)"]="Run the advanced IOS-XE deployment interactively (manual, no guardrails)."
+  ["Advanced IOS-XE Deployment (Scheduled)"]="Schedule the advanced IOS-XE deployment workflow."
+  ["View Advanced Schedules"]="View scheduled advanced IOS-XE jobs and related logs."
   ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
   ["CLI Updater"]="Run ad-hoc CLI command packs on selected switches."
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
@@ -215,6 +218,52 @@ submenu_utilities(){
 
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
+  # ---- Advanced IOS-XE submenu ----
+  submenu_adv_iosxe(){
+    local SUB2_TITLE="Advanced IOS-XE Deployment"
+    while true; do
+      local MENU_ITEMS=()
+      local -A PATH_BY_TAG=()
+      local -A LABEL_BY_TAG=()
+      local i=1
+
+      local lbl1="Advanced IOS-XE Deployment (Interactive)"
+      local path1="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_manual_main.sh"
+      MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]}")")
+      PATH_BY_TAG["$i"]="$path1"
+      LABEL_BY_TAG["$i"]="$lbl1"
+      ((i++))
+
+      local lbl2="Advanced IOS-XE Deployment (Scheduled)"
+      local path2="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_schedule_main.sh"
+      MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]}")")
+      PATH_BY_TAG["$i"]="$path2"
+      LABEL_BY_TAG["$i"]="$lbl2"
+      ((i++))
+
+      local lbl3="View Advanced Schedules"
+      local path3="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/view_schedule.sh"
+      MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]}")")
+      PATH_BY_TAG["$i"]="$path3"
+      LABEL_BY_TAG["$i"]="$lbl3"
+      ((i++))
+
+      MENU_ITEMS+=("0" "Back" "$(color_help "Return to Utilities")")
+
+      local CHOICE=$(
+        dialog --no-shadow --colors --item-help \
+          --backtitle "$BACKTITLE" \
+          --title "$SUB2_TITLE" \
+          --menu "Select an option:" 16 86 10 \
+          "${MENU_ITEMS[@]}" \
+          3>&1 1>&2 2>&3
+      ) || return 0
+
+      [[ "$CHOICE" == "0" ]] && return 0
+      run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+    done
+  }
+
   while true; do
     local MENU_ITEMS=()
     local -A PATH_BY_TAG=()
@@ -229,11 +278,10 @@ submenu_utilities(){
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # 2) Advanced IOS-XE deployment (NEW)
+    # 2) Advanced IOS-XE deployment (submenu)
     local lbl_adv="Advanced IOS-XE deployment"
-    local path_adv="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_manual_main.sh"
-    MENU_ITEMS+=("$i" "$lbl_adv" "$(color_help "Advanced IOS-XE image deployment module (manual, no guardrails).")")
-    PATH_BY_TAG["$i"]="$path_adv"
+    MENU_ITEMS+=("$i" "$lbl_adv" "$(color_help "${HELP_RAW[$lbl_adv]}")")
+    PATH_BY_TAG["$i"]=""  # handled specially below
     LABEL_BY_TAG["$i"]="$lbl_adv"
     ((i++))
 
@@ -274,6 +322,13 @@ submenu_utilities(){
     ) || return 0
 
     [[ "$CHOICE" == "0" ]] && return 0
+
+    # Special handling for Advanced IOS-XE submenu
+    if [[ "${LABEL_BY_TAG[$CHOICE]}" == "Advanced IOS-XE deployment" ]]; then
+      submenu_adv_iosxe
+      continue
+    fi
+
     run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
   done
 }

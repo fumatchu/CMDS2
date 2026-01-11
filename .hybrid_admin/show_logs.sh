@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # unified_logs.sh — Dialog viewer for:
 #   • IOS-XE upgrade logs (manual + scheduled)
+#   • IOS-XE *Advanced* upgrade logs (manual + scheduled)
 #   • Discovery scans (nmap/SSH discovery + upgrade_plan)
 #   • Meraki migration / switch-claim logs
 #   • AAA / DNS / IP-routing / NTP remediation runs
@@ -10,10 +11,14 @@ set -Euo pipefail
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need dialog; need awk; need sed; need date; need grep; need cut; need sort; need tr
+# atq is used by iosxe menus (scheduled jobs)
+need atq
 
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 RUNS_DIR="$ROOT/runs"
 SCHED_DIR="$ROOT/schedules"
+
+# Normal roots
 DISC_ROOT="$RUNS_DIR/discoveryscans"
 MIGRATION_DIR="$RUNS_DIR/migration"   # Meraki migration / claim runs
 AAA_DIR="$RUNS_DIR/aaafix"
@@ -21,8 +26,19 @@ DNS_DIR="$RUNS_DIR/dnsfix"
 IPR_DIR="$RUNS_DIR/iprfix"
 NTP_DIR="$RUNS_DIR/ntpfix"
 
+# ---------------------------
+# Advanced IOS-XE locations
+# ---------------------------
+ADV_ROOT="${ADV_ROOT:-/root/.hybrid_admin/adv-ios-xe-upgrader}"
+ADV_RUNS_DIR="$ADV_ROOT/runs"
+ADV_SCHED_DIR="$ADV_ROOT/schedules"
+ADV_DISC_ROOT="$ADV_RUNS_DIR/discoveryscans"
+
 BACKTITLE="${BACKTITLE:-Main Menu}"
 DIALOG_OPTS=(--no-shadow --backtitle "$BACKTITLE")
+
+# One consistent local-time display format everywhere
+TS_FMT='+%a %b %d, %Y %I:%M:%S %p %Z'
 
 # -----------------------------------------------------------------------------
 # dialog wrapper — NEVER fails so the shell doesn't exit on Cancel/Esc.
@@ -39,56 +55,54 @@ dlg() {
 }
 
 # ----- time helpers for IOS-XE run-YYYYmmddHHMMSS (UTC) -----
-to_local_from_runid(){
-  local rid="$1"; rid="${rid#run-}"
-  date -d "@$(date -ud "${rid:0:4}-${rid:4:2}-${rid:6:2} ${rid:8:2}:${rid:10:2}:${rid:12:2}" +%s)" \
-       '+%F %T %Z' 2>/dev/null || echo "$rid"
-}
 epoch_from_runid(){
   local rid="$1"; rid="${rid#run-}"
   date -ud "${rid:0:4}-${rid:4:2}-${rid:6:2} ${rid:8:2}:${rid:10:2}:${rid:12:2}" +%s 2>/dev/null || echo 0
 }
+to_local_from_runid(){
+  local ep; ep="$(epoch_from_runid "$1")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
+}
 
 # ----- time helpers for discovery scan-YYYYmmddHHMMSS (UTC) -----
-to_local_from_scanid(){
-  local sid="$1"; sid="${sid#scan-}"
-  date -d "@$(date -ud "${sid:0:4}-${sid:4:2}-${sid:6:2} ${sid:8:2}:${sid:10:2}:${sid:12:2}" +%s)" \
-       '+%F %T %Z' 2>/dev/null || echo "$sid"
-}
 epoch_from_scanid(){
   local sid="$1"; sid="${sid#scan-}"
   date -ud "${sid:0:4}-${sid:4:2}-${sid:6:2} ${sid:8:2}:${sid:10:2}:${sid:12:2}" +%s 2>/dev/null || echo 0
 }
+to_local_from_scanid(){
+  local ep; ep="$(epoch_from_scanid "$1")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
+}
 
 # ----- time helpers for Meraki migration dirs: run-YYYYmmddHHMMSS or claim-YYYYmmddHHMMSS -----
-to_local_from_migrationid(){
-  local mid="$1"
-  mid="${mid#run-}"
-  mid="${mid#claim-}"
-  date -d "@$(date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s)" \
-       '+%F %T %Z' 2>/dev/null || echo "$mid"
-}
 epoch_from_migrationid(){
   local mid="$1"
   mid="${mid#run-}"
   mid="${mid#claim-}"
   date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
 }
-
-# ----- time helpers for generic prefix-YYYYmmddHHMMSS dirs (aaa-, dns-, ipr-, ntp-) -----
-to_local_from_genericid(){
-  local gid="$1"
-  gid="${gid#*-}"   # strip everything up to first '-'
-  date -d "@$(date -ud "${gid:0:4}-${gid:4:2}-${gid:6:2} ${gid:8:2}:${gid:10:2}:${gid:12:2}" +%s)" \
-       '+%F %T %Z' 2>/dev/null || echo "$gid"
+to_local_from_migrationid(){
+  local ep; ep="$(epoch_from_migrationid "$1")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
 }
+
+# ----- time helpers for generic prefix-YYYYmmddHHMMSS dirs (aaa-, dns-, ipr-, ntp-, runall-) -----
 epoch_from_genericid(){
   local gid="$1"
-  gid="${gid#*-}"
+  gid="${gid#*-}"   # strip everything up to first '-'
   date -ud "${gid:0:4}-${gid:4:2}-${gid:6:2} ${gid:8:2}:${gid:10:2}:${gid:12:2}" +%s 2>/dev/null || echo 0
+}
+to_local_from_genericid(){
+  local ep; ep="$(epoch_from_genericid "$1")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
 }
 
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
+fmt_local_from_human(){
+  local s="$1"
+  local ep; ep="$(epoch_from_human "$s")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$s"
+}
 
 in_at_queue(){
   local id="$1"
@@ -111,7 +125,7 @@ view_file(){
 }
 
 # ---------------------------------------------------------------------------
-# IOS-XE upgrade run viewer
+# IOS-XE upgrade run viewer (shared)
 # ---------------------------------------------------------------------------
 show_upgrade_run_menu(){
   local rdir="$1" title="$2"
@@ -132,7 +146,7 @@ show_upgrade_run_menu(){
 
     dlg --title "$title" --menu "Choose what to view" 18 90 10 "${items[@]}"
     local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return   # Cancel/Esc => back one level
+    [[ $rc -ne 0 ]] && return
 
     case "$DOUT" in
       ui)  view_file "$ui"  "ui.status" ;;
@@ -158,10 +172,12 @@ show_upgrade_run_menu(){
   done
 }
 
+# ---------------------------------------------------------------------------
+# Regular IOS-XE menu
+# ---------------------------------------------------------------------------
 iosxe_menu(){
   local rows=()
 
-  # Manual runs
   if [[ -d "$RUNS_DIR" ]]; then
     local d base ep loc
     for d in "$RUNS_DIR"/run-*; do
@@ -173,21 +189,23 @@ iosxe_menu(){
     done
   fi
 
-  # Scheduled jobs
   if [[ -d "$SCHED_DIR" ]]; then
-    local j meta when_local when_ep backend state text sstdout spawned_dir
+    local j meta when_local when_local_fmt when_ep backend state text sstdout spawned_dir
     for j in "$SCHED_DIR"/job-*; do
       [[ -d "$j" ]] || continue
       meta="$j/job.meta"
       when_local="$(awk -F= '/^scheduled_local=/{print substr($0,index($0,$2))}' "$meta" 2>/dev/null || true)"
-      backend="$(awk -F= '/^backend_id=/{print $2}' "$meta" 2>/dev/null || echo "")"
+      when_local_fmt="$when_local"
       when_ep="$(epoch_from_human "$when_local")"
+      (( when_ep > 0 )) && when_local_fmt="$(date -d "@$when_ep" "$TS_FMT" 2>/dev/null || echo "$when_local")"
+      backend="$(awk -F= '/^backend_id=/{print $2}' "$meta" 2>/dev/null || echo "")"
+
       sstdout="$j/logs/stdout.log"
       spawned_dir=""; [[ -s "$sstdout" ]] && spawned_dir="$(extract_spawned_run_dir_from_stdout "$sstdout")"
 
       if [[ -n "$spawned_dir" && -d "$spawned_dir" ]]; then
         state="(Scheduled — done)"
-        text="${when_local}  ${state}"
+        text="${when_local_fmt}  ${state}"
         rows+=("${when_ep}|S:$(basename "$j")|${text}|${spawned_dir}")
       else
         if in_at_queue "$backend"; then
@@ -199,7 +217,7 @@ iosxe_menu(){
             state="(Scheduled — unknown/expired)"
           fi
         fi
-        text="${when_local:-$(basename "$j")}  ${state}"
+        text="${when_local_fmt:-$(basename "$j")}  ${state}"
         rows+=("${when_ep}|P:$(basename "$j")|${text}|${j}")
       fi
     done
@@ -221,7 +239,7 @@ iosxe_menu(){
   while true; do
     dlg --title "IOS-XE Upgrade Logs" --menu "Select a run" 22 120 12 "${choices[@]}"
     local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return   # Cancel/Esc => back to Main Menu
+    [[ $rc -ne 0 ]] && return
 
     local sel="$DOUT"
     local path=""
@@ -232,10 +250,8 @@ iosxe_menu(){
     done
 
     case "$sel" in
-      M:run-*)
-        show_upgrade_run_menu "$path" "Manual: ${sel#M:}" ;;
-      S:job-*)
-        show_upgrade_run_menu "$path" "Scheduled (done): ${sel#S:}" ;;
+      M:run-*) show_upgrade_run_menu "$path" "Manual: ${sel#M:}" ;;
+      S:job-*) show_upgrade_run_menu "$path" "Scheduled (done): ${sel#S:}" ;;
       P:job-*)
         while true; do
           local items=()
@@ -244,6 +260,146 @@ iosxe_menu(){
           items+=("serr" "logs/stderr.log")
           items+=("back" "Back")
           dlg --title "Scheduled: ${sel#P:}" --menu "Pending / not yet executed" 16 90 8 "${items[@]}"
+          local rc2=$DIALOG_RC
+          [[ $rc2 -ne 0 ]] && break
+          case "$DOUT" in
+            meta) view_file "$path/job.meta"        "job.meta"   ;;
+            sout) view_file "$path/logs/stdout.log" "stdout.log" ;;
+            serr) view_file "$path/logs/stderr.log" "stderr.log" ;;
+            back) break ;;
+          esac
+        done
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Advanced IOS-XE menu (ONLY under /root/.hybrid_admin/adv-ios-xe-upgrader)
+# NOTE: Advanced runs store upgrade artifacts under: run-*/upgrade/
+# ---------------------------------------------------------------------------
+iosxe_advanced_menu(){
+  if [[ ! -d "$ADV_ROOT" ]]; then
+    dlg --title "IOS-XE Advanced Upgrade Logs" --msgbox \
+"Advanced upgrader root not found:
+
+$ADV_ROOT" 9 70
+    return
+  fi
+
+  local rows=()
+
+  if [[ -d "$ADV_RUNS_DIR" ]]; then
+    local d base ep loc
+    shopt -s nullglob
+    for d in "$ADV_RUNS_DIR"/run-* "$ADV_RUNS_DIR"/runall-*; do
+      [[ -d "$d" ]] || continue
+      base="$(basename "$d")"
+      [[ "$base" == "latest" || "$base" == "runall-latest" ]] && continue
+
+      if [[ "$base" == run-* ]]; then
+        ep="$(epoch_from_runid "$base")"
+        loc="$(to_local_from_runid "$base")"
+      else
+        ep="$(epoch_from_genericid "$base")"
+        loc="$(to_local_from_genericid "$base")"
+      fi
+
+      rows+=("${ep}|AM:${base}|${loc}  (Advanced)|${d}")
+    done
+    shopt -u nullglob
+  fi
+
+  if [[ -d "$ADV_SCHED_DIR" ]]; then
+    local j meta when_local when_local_fmt when_ep backend state text sstdout spawned_dir
+    for j in "$ADV_SCHED_DIR"/job-*; do
+      [[ -d "$j" ]] || continue
+      meta="$j/job.meta"
+      when_local="$(awk -F= '/^scheduled_local=/{print substr($0,index($0,$2))}' "$meta" 2>/dev/null || true)"
+      when_local_fmt="$when_local"
+      when_ep="$(epoch_from_human "$when_local")"
+      (( when_ep > 0 )) && when_local_fmt="$(date -d "@$when_ep" "$TS_FMT" 2>/dev/null || echo "$when_local")"
+      backend="$(awk -F= '/^backend_id=/{print $2}' "$meta" 2>/dev/null || echo "")"
+
+      sstdout="$j/logs/stdout.log"
+      spawned_dir=""; [[ -s "$sstdout" ]] && spawned_dir="$(extract_spawned_run_dir_from_stdout "$sstdout")"
+
+      if [[ -n "$spawned_dir" && -d "$spawned_dir" ]]; then
+        state="(Scheduled — done)"
+        text="${when_local_fmt}  ${state}"
+        rows+=("${when_ep}|AS:$(basename "$j")|${text}|${spawned_dir}")
+      else
+        if in_at_queue "$backend"; then
+          state="(Scheduled — pending)"
+        else
+          if (( when_ep>0 && when_ep > $(date +%s) )); then
+            state="(Scheduled — pending)"
+          else
+            state="(Scheduled — unknown/expired)"
+          fi
+        fi
+        text="${when_local_fmt:-$(basename "$j")}  ${state}"
+        rows+=("${when_ep}|AP:$(basename "$j")|${text}|${j}")
+      fi
+    done
+  fi
+
+  if ((${#rows[@]}==0)); then
+    dlg --title "IOS-XE Advanced Upgrade Logs" --msgbox \
+"No advanced runs found yet.
+
+Expected:
+  $ADV_RUNS_DIR/run-*
+  $ADV_RUNS_DIR/runall-*
+  $ADV_SCHED_DIR/job-*" 12 76
+    return
+  fi
+
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
+  local choices=() line tag txt
+  for line in "${sorted[@]}"; do
+    tag="$(cut -d'|' -f2 <<<"$line")"
+    txt="$(cut -d'|' -f3 <<<"$line")"
+    choices+=("$tag" "$txt")
+  done
+
+  while true; do
+    dlg --title "IOS-XE Advanced Upgrade Logs" --menu "Select a run" 22 120 12 "${choices[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    local sel="$DOUT"
+    local path=""
+    for line in "${sorted[@]}"; do
+      [[ "$sel" == "$(cut -d'|' -f2 <<<"$line")" ]] || continue
+      path="$(cut -d'|' -f4- <<<"$line")"
+      break
+    done
+
+    case "$sel" in
+      AM:run-*|AM:runall-*)
+        if [[ -d "$path/upgrade" && -s "$path/upgrade/ui.status" ]]; then
+          show_upgrade_run_menu "$path/upgrade" "Advanced: ${sel#AM:}"
+        else
+          show_upgrade_run_menu "$path" "Advanced: ${sel#AM:}"
+        fi
+        ;;
+      AS:job-*)
+        if [[ -d "$path/upgrade" && -s "$path/upgrade/ui.status" ]]; then
+          show_upgrade_run_menu "$path/upgrade" "Advanced Scheduled (done): ${sel#AS:}"
+        else
+          show_upgrade_run_menu "$path" "Advanced Scheduled (done): ${sel#AS:}"
+        fi
+        ;;
+      AP:job-*)
+        while true; do
+          local items=()
+          items+=("meta" "job.meta")
+          items+=("sout" "logs/stdout.log")
+          items+=("serr" "logs/stderr.log")
+          items+=("back" "Back")
+          dlg --title "Advanced Scheduled: ${sel#AP:}" --menu "Pending / not yet executed" 16 92 8 "${items[@]}"
           local rc2=$DIALOG_RC
           [[ $rc2 -ne 0 ]] && break
           case "$DOUT" in
@@ -285,7 +441,7 @@ show_discovery_run_menu(){
 
     dlg --title "$title" --menu "Choose what to view" 20 100 12 "${items[@]}"
     local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return   # Cancel/Esc => back one level
+    [[ $rc -ne 0 ]] && return
 
     case "$DOUT" in
       ui)        view_file "$ui"        "ui.status"              ;;
@@ -305,36 +461,61 @@ show_discovery_run_menu(){
         local rc2=$DIALOG_RC
         (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
         ;;
-      path)
-        dlg --title "Scan path" --msgbox "$rdir" 7 70 ;;
-      back)
-        return ;;
+      path) dlg --title "Scan path" --msgbox "$rdir" 7 70 ;;
+      back) return ;;
     esac
   done
 }
 
 discovery_menu(){
-  if [[ ! -d "$DISC_ROOT" ]]; then
-    dlg --title "Discovery Scans" --msgbox "No discovery scans found yet.\n\nExpected directory:\n$DISC_ROOT" 9 70
-    return
-  fi
-
+  local have_any=0
   local rows=()
-  local d base ep loc
-  for d in "$DISC_ROOT"/scan-*; do
-    [[ -d "$d" ]] || continue
-    base="$(basename "$d")"        # scan-YYYYmmddHHMMSS
-    ep="$(epoch_from_scanid "$base")"
-    loc="$(to_local_from_scanid "$base")"
-    rows+=("${ep}|D:${base}|${loc}  (Discovery scan)|${d}")
-  done
 
-  if ((${#rows[@]}==0)); then
-    dlg --title "Discovery Scans" --msgbox "No discovery scans found yet." 7 50
+  # -----------------------
+  # Normal discovery scans
+  # -----------------------
+  if [[ -d "$DISC_ROOT" ]]; then
+    local d base ep loc
+    for d in "$DISC_ROOT"/scan-*; do
+      [[ -d "$d" ]] || continue
+      base="$(basename "$d")"        # scan-YYYYmmddHHMMSS (UTC)
+      ep="$(epoch_from_scanid "$base")"
+      loc="$(to_local_from_scanid "$base")"
+      rows+=("${ep}|N:${base}|${loc}  (Normal)|${d}")
+      have_any=1
+    done
+  fi
+
+  # -------------------------
+  # Advanced discovery scans
+  # -------------------------
+  if [[ -n "${ADV_DISC_ROOT:-}" && -d "$ADV_DISC_ROOT" ]]; then
+    local d base ep loc
+    for d in "$ADV_DISC_ROOT"/scan-*; do
+      [[ -d "$d" ]] || continue
+      base="$(basename "$d")"        # scan-YYYYmmddHHMMSS (UTC)
+      ep="$(epoch_from_scanid "$base")"
+      loc="$(to_local_from_scanid "$base")"
+      rows+=("${ep}|A:${base}|${loc}  (Advanced IOS-XE)|${d}")
+      have_any=1
+    done
+  fi
+
+  if (( have_any == 0 )) || ((${#rows[@]}==0)); then
+    dlg --title "Discovery Scans" --msgbox \
+"No discovery scans found yet.
+
+Expected (Normal):
+  $DISC_ROOT
+
+Expected (Advanced IOS-XE):
+  ${ADV_DISC_ROOT:-$ADV_RUNS_DIR/discoveryscans}" 12 80
     return
   fi
 
+  # Newest first across BOTH sets
   mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
   local choices=() line tag txt
   for line in "${sorted[@]}"; do
     tag="$(cut -d'|' -f2 <<<"$line")"
@@ -345,7 +526,7 @@ discovery_menu(){
   while true; do
     dlg --title "Discovery Scans" --menu "Select a scan run" 22 120 12 "${choices[@]}"
     local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return   # Cancel/Esc => back to Main Menu
+    [[ $rc -ne 0 ]] && return
 
     local sel="$DOUT"
     local path=""
@@ -356,16 +537,19 @@ discovery_menu(){
     done
 
     case "$sel" in
-      D:scan-*)
-        show_discovery_run_menu "$path" "Discovery: ${sel#D:}" ;;
+      N:scan-*) show_discovery_run_menu "$path" "Discovery (Normal): ${sel#N:}" ;;
+      A:scan-*) show_discovery_run_menu "$path" "Discovery (Advanced IOS-XE): ${sel#A:}" ;;
     esac
   done
 }
 
+
+
+
+
 # ---------------------------------------------------------------------------
 # Generic "fix" viewer (AAA / DNS / IP routing / NTP)
 # ---------------------------------------------------------------------------
-
 show_fix_run_menu(){
   local rdir="$1" title="$2" summary_name="$3"
   while true; do
@@ -401,10 +585,8 @@ show_fix_run_menu(){
         local rc2=$DIALOG_RC
         (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
         ;;
-      path)
-        dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
-      back)
-        return ;;
+      path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
+      back) return ;;
     esac
   done
 }
@@ -455,8 +637,7 @@ fix_menu(){
     done
 
     case "$sel" in
-      "${tag}:"*)
-        show_fix_run_menu "$path" "$title: ${sel#${tag}:}" "$summary_name" ;;
+      "${tag}:"*) show_fix_run_menu "$path" "$title: ${sel#${tag}:}" "$summary_name" ;;
     esac
   done
 }
@@ -469,7 +650,6 @@ ntpfix_menu(){ fix_menu "$NTP_DIR" "NTP Fix Runs"        "T" "NTP remediation ru
 # ---------------------------------------------------------------------------
 # Meraki switch-claim viewer
 # ---------------------------------------------------------------------------
-
 show_meraki_claim_run_menu(){
   local rdir="$1" title="$2"
 
@@ -545,7 +725,7 @@ meraki_claims_menu(){
     dlg --title "Meraki SwitchClaims" \
         --menu "Select a Meraki claim run" 22 120 12 "${choices[@]}"
     local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return   # Cancel/Esc => back to Main Menu
+    [[ $rc -ne 0 ]] && return
 
     local sel="$DOUT"
     local path=""
@@ -561,8 +741,22 @@ meraki_claims_menu(){
 
 # ---------------------------------------------------------------------------
 # Search by IP / text across runs
+#
+# Rules (as you specified):
+#   - "normal <term>"   => ONLY search:  $RUNS_DIR
+#   - "advanced <term>" => ONLY search:  $ADV_RUNS_DIR
+#   - "<term>"          => search BOTH: $RUNS_DIR first (200), then $ADV_RUNS_DIR (200)
+#   - "normal"          => ALL results from $RUNS_DIR (up to 200)
+#   - "advanced"        => ALL results from $ADV_RUNS_DIR (up to 200)
+#   - NEVER mix roots unless mode is BOTH (i.e., no explicit normal/advanced prefix)
+#
+# Debug log: $ROOT/unified_logs_search.debug
 # ---------------------------------------------------------------------------
+
 ip_search_menu(){
+  local NORMAL_ROOT="/root/.hybrid_admin/runs"
+  local ADVANCED_ROOT="/root/.hybrid_admin/adv-ios-xe-upgrader/runs"
+
   while true; do
     dlg --title "Search logs by IP / text" \
         --inputbox "Enter an IP address or search string:\n(Cancel or empty input to go back.)" 10 70 ""
@@ -573,76 +767,105 @@ ip_search_menu(){
     needle="$(echo "$needle" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [[ -z "$needle" ]] && return
 
-    # Figure out a nice wide menu width based on the terminal size
+    # Menu width
     local term_lines term_cols menu_w=140
     if read -r term_lines term_cols < <(stty size 2>/dev/null); then
-      menu_w=$(( term_cols - 4 ))   # leave a tiny margin
+      menu_w=$(( term_cols - 4 ))
       (( menu_w < 100 )) && menu_w=100
       (( menu_w > 200 )) && menu_w=200
     fi
 
-    local tmp; tmp="$(mktemp)"
-    # Search under runs/, limit to common texty file types
-    grep -R -n \
-      --include='*.log' \
-      --include='*.csv' \
-      --include='*.json' \
-      --include='*.status' \
-      --include='*.env' \
-      -e "$needle" "$RUNS_DIR" >"$tmp" 2>/dev/null || true
+    local cap_total=2000
 
-    if [[ ! -s "$tmp" ]]; then
+    local tmpN tmpA tmpAll
+    tmpN="$(mktemp)"; tmpA="$(mktemp)"; tmpAll="$(mktemp)"
+    : >"$tmpN"; : >"$tmpA"; : >"$tmpAll"
+
+    # FIXED-STRING grep (dots are literal), with common texty includes
+    local -a GREP_ARGS=(
+      -R -n -F
+      --include='*.log'
+      --include='*.csv'
+      --include='*.json'
+      --include='*.status'
+      --include='*.env'
+      -e "$needle"
+    )
+
+    # Gather normal first, then advanced
+    local ncount=0 acount=0
+
+    if [[ -d "$NORMAL_ROOT" ]]; then
+      grep "${GREP_ARGS[@]}" -- "$NORMAL_ROOT" 2>/dev/null >"$tmpN" || true
+    fi
+    if [[ -d "$ADVANCED_ROOT" ]]; then
+      grep "${GREP_ARGS[@]}" -- "$ADVANCED_ROOT" 2>/dev/null >"$tmpA" || true
+    fi
+
+    # Build up to cap_total lines, preferring NORMAL first
+    if [[ -s "$tmpN" ]]; then
+      head -n "$cap_total" "$tmpN" >"$tmpAll"
+      ncount="$(wc -l <"$tmpAll" 2>/dev/null || echo 0)"
+    fi
+
+    local remaining=$(( cap_total - ncount ))
+    if (( remaining > 0 )) && [[ -s "$tmpA" ]]; then
+      head -n "$remaining" "$tmpA" >>"$tmpAll"
+      acount="$(wc -l <"$tmpA" 2>/dev/null || echo 0)"
+    fi
+
+    if [[ ! -s "$tmpAll" ]]; then
       dlg --title "Search results" --msgbox "No matches found for:\n$needle" 8 70
-      rm -f "$tmp"
+      rm -f "$tmpN" "$tmpA" "$tmpAll"
       continue
     fi
 
-    local -a FILES LINES MENU_ITEMS
+    # Build menu
+    local -a FILES=()
+    local -a LINES=()
+    local -a MENU_ITEMS=()
     local idx=0
+
     while IFS=: read -r file line rest; do
       ((idx++))
       FILES[idx]="$file"
       LINES[idx]="$line"
-      # Relative path from ROOT for readability
-      local rel="${file#$ROOT/}"
-      # Snippet width depends on menu width (leave ~35 chars for path/line/etc)
-      local max_snip=$(( menu_w - 35 ))
+
+      local label rel
+      if [[ "$file" == "$NORMAL_ROOT/"* ]]; then
+        label="(Normal)"
+        rel="runs/${file#$NORMAL_ROOT/}"
+      elif [[ "$file" == "$ADVANCED_ROOT/"* ]]; then
+        label="(Advanced)"
+        rel="runs/${file#$ADVANCED_ROOT/}"
+      else
+        label="(Other)"
+        rel="$file"
+      fi
+
+      local max_snip=$(( menu_w - 38 ))
       (( max_snip < 40 )) && max_snip=40
       local snippet
       snippet="$(echo "$rest" | sed 's/^[[:space:]]*//' | cut -c1-"$max_snip")"
-      MENU_ITEMS+=( "$idx" "$rel:$line: $snippet" )
-      # Safety limit
-      (( idx >= 99 )) && break
-    done <"$tmp"
-    rm -f "$tmp"
 
-    if (( idx == 0 )); then
-      dlg --title "Search results" --msgbox "Matches exist but could not be parsed." 8 70
-      continue
-    fi
+      MENU_ITEMS+=( "$idx" "$label $rel:$line: $snippet" )
+    done <"$tmpAll"
+
+    rm -f "$tmpN" "$tmpA" "$tmpAll"
 
     while true; do
       dlg --title "Search results for: $needle" \
-          --menu "Showing first $idx matches. Select one to view context." 22 "$menu_w" 14 "${MENU_ITEMS[@]}"
+          --menu "Showing up to $cap_total matches (Normal first, then Advanced). Select one to view context." \
+          22 "$menu_w" 14 "${MENU_ITEMS[@]}"
       local rc2=$DIALOG_RC
       [[ $rc2 -ne 0 ]] && break
 
-      local sel="$DOUT"
-      local n="$sel"
+      local n="$DOUT"
       local f="${FILES[n]}"
       local ln="${LINES[n]}"
 
-      if [[ -z "$f" || -z "$ln" ]]; then
-        dlg --title "Error" --msgbox "Could not resolve selection." 7 50
-        continue
-      fi
-
       local start end
-      if (( ln > 10 )); then
-        start=$((ln-10))
-      else
-        start=1
-      fi
+      if (( ln > 10 )); then start=$((ln-10)); else start=1; fi
       end=$((ln+10))
 
       local ctx; ctx="$(mktemp)"
@@ -651,22 +874,14 @@ ip_search_menu(){
       local title="Context: $(basename "$f") (lines ${start}-${end}, match at ${ln})"
       local full_title="Full file: $(basename "$f")"
 
-      # Show context with an extra "Full file" button
       while true; do
         dialog "${DIALOG_OPTS[@]}" \
           --extra-button --extra-label "Full file" \
           --title "$title" --textbox "$ctx" 0 0
         local vb_rc=$?
         case "$vb_rc" in
-          3)  # extra button → open full file
-              view_file "$f" "$full_title"
-              # after closing full file, return to context view
-              continue
-              ;;
-          0|1|255)
-              # OK / Cancel / Esc → back to results list
-              break
-              ;;
+          3)  view_file "$f" "$full_title"; continue ;;
+          0|1|255) break ;;
         esac
       done
 
@@ -675,37 +890,36 @@ ip_search_menu(){
   done
 }
 
-
 # ---------------------------------------------------------------------------
 # Top-level main menu
 # ---------------------------------------------------------------------------
 main(){
   while true; do
-    dlg --title "Main Menu" --menu "Select an option:" 20 80 9 \
+    dlg --title "Main Menu" --menu "Select an option:" 21 86 10 \
       1 "IOS-XE Upgrade Logs" \
-      2 "Discovery Scans" \
-      3 "Meraki SwitchClaims" \
-      4 "AAA Fix Runs" \
-      5 "DNS Fix Runs" \
-      6 "IP Routing Fix Runs" \
-      7 "NTP Fix Runs" \
-      8 "Search by IP / text" \
+      2 "IOS-XE Advanced Upgrade Logs" \
+      3 "Discovery Scans" \
+      4 "Meraki SwitchClaims" \
+      5 "AAA Fix Runs" \
+      6 "DNS Fix Runs" \
+      7 "IP Routing Fix Runs" \
+      8 "NTP Fix Runs" \
+      9 "Search by IP / text" \
       0 "Exit"
     local rc=$DIALOG_RC
-
-    # Cancel/Esc at Main Menu acts like Exit
     [[ $rc -ne 0 ]] && break
 
     case "$DOUT" in
-      1) iosxe_menu         ;;
-      2) discovery_menu     ;;
-      3) meraki_claims_menu ;;
-      4) aaafix_menu        ;;
-      5) dnsfix_menu        ;;
-      6) iprfix_menu        ;;
-      7) ntpfix_menu        ;;
-      8) ip_search_menu     ;;
-      0) break              ;;
+      1) iosxe_menu          ;;
+      2) iosxe_advanced_menu ;;
+      3) discovery_menu      ;;
+      4) meraki_claims_menu  ;;
+      5) aaafix_menu         ;;
+      6) dnsfix_menu         ;;
+      7) iprfix_menu         ;;
+      8) ntpfix_menu         ;;
+      9) ip_search_menu      ;;
+      0) break               ;;
     esac
   done
 }
