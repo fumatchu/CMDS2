@@ -3,9 +3,9 @@ Date: Mon Jan 12 09:51:05 AM EST 2026
 
 Summary:
 This is an add-on for the Advanced IOS-XE modules under Utilities menu. 
-This provides and Administrator the capabilities to now choose any
-formware needed for the switches. The intent is to remove the 
-"guardrails" ith 17.15.03 being the needed version. This is for testing 
+This provides nd Administrator the capabilities to now choose any
+firmware needed for the switches. The intent is to remove the 
+"guardrails" with 17.15.03 being the needed version. This is for testing 
 of newer IOS-XE firmware as needed in a dev environment. 
 This Module should not be used for production switches. But does allow 
 the System to push whatever firmware version you want to the switches. 
