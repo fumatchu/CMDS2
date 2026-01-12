@@ -65,6 +65,7 @@ declare -A HELP_RAW=(
   ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
   ["CLI Updater"]="Run ad-hoc CLI command packs on selected switches."
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
+  ["CMDS Updater"]="Download and apply CMDS updates from GitHub (with dry-run and patch history logging)."
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
   ["README"]="View CMDS hybrid README / usage guide."
@@ -309,6 +310,14 @@ submenu_utilities(){
     LABEL_BY_TAG["$i"]="$lbl4"
     ((i++))
 
+    # 6) CMDS Updater (NEW)
+    local lbl5="CMDS Updater"
+    local path5="/root/.server_admin/cmds_updater.sh"
+    MENU_ITEMS+=("$i" "$lbl5" "$(color_help "${HELP_RAW[$lbl5]}")")
+    PATH_BY_TAG["$i"]="$path5"
+    LABEL_BY_TAG["$i"]="$lbl5"
+    ((i++))
+
     # Back
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
 
@@ -316,7 +325,7 @@ submenu_utilities(){
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
-        --menu "Select a utility:" 16 78 10 \
+        --menu "Select a utility:" 17 84 12 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || return 0
