@@ -1,0 +1,36 @@
+CMDS Update Notes - v0.1
+Date: Mon Jan 12 09:51:05 AM EST 2026
+
+Summary:
+This is an add-on for the Advanced IOS-XE modules under Utilities menu. 
+This provides and Administrator the capabilities to now choose any
+formware needed for the switches. The intent is to remove the 
+"guardrails" ith 17.15.03 being the needed version. This is for testing 
+of newer IOS-XE firmware as needed in a dev environment. 
+This Module should not be used for production switches. But does allow 
+the System to push whatever firmware version you want to the switches. 
+
+Changes:
+Added the following from .hybrid_admin
+
+adv-ios-xe-upgrader/
+└── bin/
+    ├── adv_image_manual_main.sh
+    ├── adv_image_schedule_main.sh
+    ├── at_image_upgrade.sh
+    ├── discoverswitches.sh
+    ├── image_upgrade.sh
+    ├── scheduler.sh
+    ├── setupwizard.sh
+    └── view_schedule.sh
+
+Fixes:
+None
+
+Notes / Known Issues:
+Main menu for hybrid deployments under utilities now incldues three new options 
+Advanced IOS-XE deployment (Interactive)
+Advanced IOS-XE Deployment (Scheduled) - For shceduled image deployment 
+View Advanced Schedules
+
+- 
