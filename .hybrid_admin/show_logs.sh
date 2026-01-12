@@ -27,6 +27,12 @@ IPR_DIR="$RUNS_DIR/iprfix"
 NTP_DIR="$RUNS_DIR/ntpfix"
 
 # ---------------------------
+# CMDS Patch/Update logs (server)
+# ---------------------------
+SERVER_ADMIN_ROOT="/root/.server_admin"
+CMDS_UPDATE_ROOT="$SERVER_ADMIN_ROOT/runs/cmds-update"
+
+# ---------------------------
 # Advanced IOS-XE locations
 # ---------------------------
 ADV_ROOT="${ADV_ROOT:-/root/.hybrid_admin/adv-ios-xe-upgrader}"
@@ -222,7 +228,6 @@ iosxe_menu(){
       fi
     done
   fi
-
   if ((${#rows[@]}==0)); then
     dlg --title "IOS-XE Upgrade Logs" --msgbox "No runs found yet." 7 50
     return
@@ -889,13 +894,130 @@ ip_search_menu(){
     done
   done
 }
+# ---------------------------------------------------------------------------
+# CMDS Patch/Updates viewer (server logs)
+#   Root: /root/.server_admin/runs/cmds-update
+#     - patch_history.log
+#     - run-YYYYmmddHHMMSS/{cmds_updater.log,stdout.log,stderr.log}
+# ---------------------------------------------------------------------------
 
+epoch_from_cmdsupdate_runid(){
+  local rid="$1"; rid="${rid#run-}"
+  date -d "${rid:0:4}-${rid:4:2}-${rid:6:2} ${rid:8:2}:${rid:10:2}:${rid:12:2}" +%s 2>/dev/null || echo 0
+}
+to_local_from_cmdsupdate_runid(){
+  local ep; ep="$(epoch_from_cmdsupdate_runid "$1")"
+  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
+}
+
+show_cmds_update_run_menu(){
+  local rdir="$1" title="$2"
+  while true; do
+    local items=()
+    local ulog="$rdir/cmds_updater.log"
+    local sout="$rdir/stdout.log"
+    local serr="$rdir/stderr.log"
+
+    items+=("ulog" "cmds_updater.log")
+    items+=("sout" "stdout.log")
+    items+=("serr" "stderr.log")
+    items+=("path" "Show run folder path")
+    items+=("back" "Back")
+
+    dlg --title "$title" --menu "Choose what to view" 16 80 8 "${items[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    case "$DOUT" in
+      ulog) view_file "$ulog" "cmds_updater.log" ;;
+      sout) view_file "$sout" "stdout.log" ;;
+      serr) view_file "$serr" "stderr.log" ;;
+      path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
+      back) return ;;
+    esac
+  done
+}
+
+cmds_updates_menu(){
+  if [[ ! -d "$CMDS_UPDATE_ROOT" ]]; then
+    dlg --title "CMDS Patch/Updates" --msgbox \
+"No CMDS update logs found.
+
+Expected:
+  $CMDS_UPDATE_ROOT" 10 76
+    return
+  fi
+
+  local rows=()
+  local d base ep loc
+
+  shopt -s nullglob
+  for d in "$CMDS_UPDATE_ROOT"/run-*; do
+    [[ -d "$d" ]] || continue
+    base="$(basename "$d")"
+    ep="$(epoch_from_cmdsupdate_runid "$base")"
+    loc="$(to_local_from_cmdsupdate_runid "$base")"
+    rows+=("${ep}|R:${base}|${loc}|${d}")
+  done
+  shopt -u nullglob
+
+  while true; do
+    local choices=()
+
+    # Top entry: patch history
+    if [[ -s "$CMDS_UPDATE_ROOT/patch_history.log" ]]; then
+      choices+=("HISTORY" "patch_history.log")
+    else
+      choices+=("HISTORY" "patch_history.log (missing/empty)")
+    fi
+
+    # Separator line (dialog "tag/desc" needs tag to be unique; we just ignore it)
+    choices+=("__SEP__" "------------- Server Logs -----------")
+
+    if ((${#rows[@]}==0)); then
+      choices+=("NONE" "(No run-* folders found)")
+    else
+      mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+      local line tag txt path
+      for line in "${sorted[@]}"; do
+        tag="$(cut -d'|' -f2 <<<"$line")"      # R:run-...
+        txt="$(cut -d'|' -f3 <<<"$line")"
+        path="$(cut -d'|' -f4- <<<"$line")"
+        choices+=("$tag" "$txt")
+      done
+    fi
+
+    choices+=("BACK" "Back")
+
+    dlg --title "CMDS Patch/Updates" --menu "Select an option:" 22 90 14 "${choices[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    case "$DOUT" in
+      HISTORY) view_file "$CMDS_UPDATE_ROOT/patch_history.log" "patch_history.log" ;;
+      __SEP__) continue ;;  # ignore the separator
+      NONE) continue ;;
+      BACK) return ;;
+      R:run-*)
+        # Find selected path
+        local sel="$DOUT" path=""
+        local line2
+        for line2 in "${sorted[@]:-}"; do
+          [[ "$sel" == "$(cut -d'|' -f2 <<<"$line2")" ]] || continue
+          path="$(cut -d'|' -f4- <<<"$line2")"
+          break
+        done
+        [[ -n "$path" ]] && show_cmds_update_run_menu "$path" "CMDS Update: ${sel#R:}"
+        ;;
+    esac
+  done
+}
 # ---------------------------------------------------------------------------
 # Top-level main menu
 # ---------------------------------------------------------------------------
 main(){
   while true; do
-    dlg --title "Main Menu" --menu "Select an option:" 21 86 10 \
+        dlg --title "Main Menu" --menu "Select an option:" 22 90 12 \
       1 "IOS-XE Upgrade Logs" \
       2 "IOS-XE Advanced Upgrade Logs" \
       3 "Discovery Scans" \
@@ -905,11 +1027,13 @@ main(){
       7 "IP Routing Fix Runs" \
       8 "NTP Fix Runs" \
       9 "Search by IP / text" \
+      10 "------------- Server Logs -----------" \
+      11 "CMDS Patch/Updates" \
       0 "Exit"
     local rc=$DIALOG_RC
     [[ $rc -ne 0 ]] && break
 
-    case "$DOUT" in
+        case "$DOUT" in
       1) iosxe_menu          ;;
       2) iosxe_advanced_menu ;;
       3) discovery_menu      ;;
@@ -919,6 +1043,8 @@ main(){
       7) iprfix_menu         ;;
       8) ntpfix_menu         ;;
       9) ip_search_menu      ;;
+      10) : ;;               # header line: do nothing
+      11) cmds_updates_menu  ;;
       0) break               ;;
     esac
   done
