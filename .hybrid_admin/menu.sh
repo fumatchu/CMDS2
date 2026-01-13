@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # /root/.hybrid_admin/menu.sh
 # Hybrid (Device Local) menu with dynamic help, completion checkmarks, and submenus.
+# Behavior:
+#   - Cancel/Esc in submenus => return to main menu (do NOT exit menu.sh)
+#   - Cancel/Esc in main menu => exit menu.sh (return to parent launcher)
 
 set -Eeuo pipefail
+
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need dialog
 
@@ -14,13 +18,34 @@ HELP_COLOR_PREFIX="${HELP_COLOR_PREFIX:-\Zb\Z3}"  # bold yellow
 HELP_COLOR_RESET="${HELP_COLOR_RESET:-\Zn}"
 MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 
+DIALOG_OPTS=(--no-shadow --colors --item-help --backtitle "$BACKTITLE")
+
+cleanup(){ clear; }
+trap cleanup EXIT
+
+# -----------------------------------------------------------------------------
+# dialog wrapper — renders to tty; captures selection from stdout
+# Populates:
+#   DIALOG_RC : 0=OK, 1=Cancel, 255=Esc
+#   DOUT      : selected tag
+# -----------------------------------------------------------------------------
+dlg() {
+  local out rc
+  set +e
+  out="$(dialog "${DIALOG_OPTS[@]}" --stdout "$@")"
+  rc=$?
+  set -e
+  DIALOG_RC=$rc
+  DOUT="$out"
+  return 0
+}
+
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/preflight_validated.flag"
-  # For migration, we use a symlink to the latest claim log
-  ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"
+  ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"   # symlink to latest claim log
 )
 
 # Items: label -> script path
@@ -28,13 +53,13 @@ declare -A ITEMS=(
   ["Setup Wizard"]="/root/.hybrid_admin/setupwizard.sh"
   ["Switch Discovery"]="/root/.hybrid_admin/discoverswitches.sh"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/meraki_preflight.sh"
-  ["IOS-XE Upgrade"]=""  # handled by submenu
+  ["IOS-XE Upgrade"]=""  # submenu
   ["Migrate Switches"]="/root/.hybrid_admin/migration.sh"
   ["Logging"]="/root/.hybrid_admin/show_logs.sh"
   ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
-  ["Utilities"]=""  # handled by submenu
-  ["Server Management"]=""  # header / separator, not an actual script
-  ["Server Service Control"]=""  # handled by submenu
+  ["Utilities"]=""  # submenu
+  ["Server Management"]=""  # header/separator
+  ["Server Service Control"]=""  # submenu
   ["README"]="/root/.hybrid_admin/readme.sh"
 )
 
@@ -86,31 +111,20 @@ ORDER=(
   "README"
 )
 
-cleanup(){ clear; }
-trap cleanup EXIT
-
 is_done(){  # $1=label -> returns 0 if artifact indicates completion
   local lbl="$1" f="${DONE_FILE[$lbl]:-}"
-
   [[ -n "$f" ]] || return 1
 
   if [[ "$lbl" == "Migrate Switches" ]]; then
-    # Presence of symlink marks completion; optionally fail if underlying log has "FAILED"
     if [[ -L "$f" ]]; then
       local tgt; tgt="$(readlink -f -- "$f" 2>/dev/null || true)"
-      if [[ -n "$tgt" && -e "$tgt" ]]; then
-        if grep -q "FAILED" "$tgt" 2>/dev/null; then
-          return 1
-        else
-          return 0
-        fi
-      fi
-      return 1
+      [[ -n "$tgt" && -e "$tgt" ]] || return 1
+      grep -q "FAILED" "$tgt" 2>/dev/null && return 1
+      return 0
     fi
     return 1
   fi
 
-  # Default: must be a non-empty file
   [[ -s "$f" ]]
 }
 
@@ -122,23 +136,20 @@ colorize_help(){  # $1=label
   printf '%b%s%b%b' "$HELP_COLOR_PREFIX" "${HELP_RAW[$lbl]:-Run $lbl}" "$HELP_COLOR_RESET" "$extra"
 }
 
-display_label(){  # $1=label -> returns label with green check and submenu marker if applicable
+display_label(){  # $1=label -> prints label with green check / submenu marker
   local lbl="$1" text
 
-  # Section header formatting
   if [[ "$lbl" == "Server Management" ]]; then
     printf "%s" "---------------- Server Management ----------------"
     return
   fi
 
-  # Base label with optional green check
   if is_done "$lbl"; then
     text="$lbl  $MARK_CHECK"
   else
     text="$lbl"
   fi
 
-  # Submenu marker
   if [[ -n "${SUBMENU_FN[$lbl]:-}" ]]; then
     text="$text  >"
   fi
@@ -149,35 +160,31 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
 run_target(){
   local script="$1" label="$2"
 
-  # Section header? do nothing.
   if [[ "$label" == "Server Management" ]]; then
-    return
+    return 0
   fi
 
-  # Submenu?
   if [[ -n "${SUBMENU_FN[$label]:-}" ]]; then
     "${SUBMENU_FN[$label]}"
-    return
+    return 0
   fi
 
   clear
   if [[ -n "$script" && -f "$script" ]]; then
-    # Run child and capture status without letting -e kill us
     set +e
     bash "$script"
     local rc=$?
     set -e
 
     case "$rc" in
-      0) : ;;                            # success
-      1|255|130|143) return 0 ;;         # dialog Cancel/Esc/Ctrl-C → not an error
-      *)  dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
-                --msgbox "Script exited with status $rc.\n\n$script" 8 72 ;;
+      0) : ;;
+      1|255|130|143) return 0 ;;  # Cancel/Esc/Ctrl-C -> not an error
+      *) dlg --title "$label" --msgbox "Script exited with status $rc.\n\n$script" 8 72 ;;
     esac
   else
-    dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
-           --msgbox "Cannot find:\n${script:-<none>}" 7 60
+    dlg --title "Not Found" --msgbox "Cannot find:\n${script:-<none>}" 7 60
   fi
+  return 0
 }
 
 # ---------- IOS-XE Upgrade submenu ----------
@@ -199,27 +206,21 @@ submenu_iosxe(){
 
     MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to main menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
 
-    local CHOICE=$(
-      dialog --no-shadow --colors --item-help \
-        --backtitle "$BACKTITLE" \
-        --title "$SUB_TITLE" \
-        --menu "Select an option:" 18 78 10 \
-        "${MENU_ITEMS[@]}" \
-        3>&1 1>&2 2>&3
-    ) || return 0
+    dlg --title "$SUB_TITLE" --menu "Select an option:" 18 78 10 "${MENU_ITEMS[@]}"
 
-    [[ "$CHOICE" == "0" ]] && return 0
-    run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+    # Cancel/Esc -> return to menu.sh main (NOT exit)
+    [[ $DIALOG_RC -ne 0 ]] && return 0
+    [[ "$DOUT" == "0" ]] && return 0
+
+    run_target "${PATH_BY_TAG[$DOUT]}" "${LABEL_BY_TAG[$DOUT]}"
   done
 }
 
 # ---------- Utilities submenu ----------
 submenu_utilities(){
   local SUB_TITLE="Utilities"
+  local color_help; color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
-  color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
-
-  # ---- Advanced IOS-XE submenu ----
   submenu_adv_iosxe(){
     local SUB2_TITLE="Advanced IOS-XE Deployment"
     while true; do
@@ -230,38 +231,23 @@ submenu_utilities(){
 
       local lbl1="Advanced IOS-XE Deployment (Interactive)"
       local path1="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_manual_main.sh"
-      MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]}")")
-      PATH_BY_TAG["$i"]="$path1"
-      LABEL_BY_TAG["$i"]="$lbl1"
-      ((i++))
+      MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]}")"); PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
 
       local lbl2="Advanced IOS-XE Deployment (Scheduled)"
       local path2="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/adv_image_schedule_main.sh"
-      MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]}")")
-      PATH_BY_TAG["$i"]="$path2"
-      LABEL_BY_TAG["$i"]="$lbl2"
-      ((i++))
+      MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]}")"); PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
       local lbl3="View Advanced Schedules"
       local path3="/root/.hybrid_admin/adv-ios-xe-upgrader/bin/view_schedule.sh"
-      MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]}")")
-      PATH_BY_TAG["$i"]="$path3"
-      LABEL_BY_TAG["$i"]="$lbl3"
-      ((i++))
+      MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]}")"); PATH_BY_TAG["$i"]="$path3"; LABEL_BY_TAG["$i"]="$lbl3"; ((i++))
 
       MENU_ITEMS+=("0" "Back" "$(color_help "Return to Utilities")")
 
-      local CHOICE=$(
-        dialog --no-shadow --colors --item-help \
-          --backtitle "$BACKTITLE" \
-          --title "$SUB2_TITLE" \
-          --menu "Select an option:" 16 86 10 \
-          "${MENU_ITEMS[@]}" \
-          3>&1 1>&2 2>&3
-      ) || return 0
+      dlg --title "$SUB2_TITLE" --menu "Select an option:" 16 86 10 "${MENU_ITEMS[@]}"
+      [[ $DIALOG_RC -ne 0 ]] && return 0
+      [[ "$DOUT" == "0" ]] && return 0
 
-      [[ "$CHOICE" == "0" ]] && return 0
-      run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+      run_target "${PATH_BY_TAG[$DOUT]}" "${LABEL_BY_TAG[$DOUT]}"
     done
   }
 
@@ -271,82 +257,54 @@ submenu_utilities(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # 1) Switch UP/Down Status (ping monitor)
     local lbl1="Switch UP/Down Status"
     local path1="/root/.hybrid_admin/ping.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Continuous ping monitor for selected switches (UP/DOWN).")")
-    PATH_BY_TAG["$i"]="$path1"
-    LABEL_BY_TAG["$i"]="$lbl1"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
 
-    # 2) Advanced IOS-XE deployment (submenu)
     local lbl_adv="Advanced IOS-XE deployment"
     MENU_ITEMS+=("$i" "$lbl_adv" "$(color_help "${HELP_RAW[$lbl_adv]}")")
-    PATH_BY_TAG["$i"]=""  # handled specially below
-    LABEL_BY_TAG["$i"]="$lbl_adv"
-    ((i++))
+    PATH_BY_TAG["$i"]="" ; LABEL_BY_TAG["$i"]="$lbl_adv"; ((i++))
 
-    # 3) IOS-XE Image Management
     local lbl2="IOS-XE Image Management"
     local path2="/root/.hybrid_admin/image_management.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
-    PATH_BY_TAG["$i"]="$path2"
-    LABEL_BY_TAG["$i"]="$lbl2"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
-    # 4) CLI Updater
     local lbl3="CLI Updater"
     local path3="/root/.hybrid_admin/cli_updater.sh"
     MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
-    PATH_BY_TAG["$i"]="$path3"
-    LABEL_BY_TAG["$i"]="$lbl3"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path3"; LABEL_BY_TAG["$i"]="$lbl3"; ((i++))
 
-    # 5) Backup Config Viewer
     local lbl4="Backup Config Viewer"
     local path4="/root/.hybrid_admin/back_config_viewer.sh"
     MENU_ITEMS+=("$i" "$lbl4" "$(color_help "Browse and search saved switch backup configs.")")
-    PATH_BY_TAG["$i"]="$path4"
-    LABEL_BY_TAG["$i"]="$lbl4"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path4"; LABEL_BY_TAG["$i"]="$lbl4"; ((i++))
 
-    # 6) CMDS Updater (NEW)
     local lbl5="CMDS Updater"
     local path5="/root/.server_admin/cmds_updater.sh"
     MENU_ITEMS+=("$i" "$lbl5" "$(color_help "${HELP_RAW[$lbl5]}")")
-    PATH_BY_TAG["$i"]="$path5"
-    LABEL_BY_TAG["$i"]="$lbl5"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path5"; LABEL_BY_TAG["$i"]="$lbl5"; ((i++))
 
-    # Back
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
 
-    local CHOICE=$(
-      dialog --no-shadow --colors --item-help \
-        --backtitle "$BACKTITLE" \
-        --title "$SUB_TITLE" \
-        --menu "Select a utility:" 17 84 12 \
-        "${MENU_ITEMS[@]}" \
-        3>&1 1>&2 2>&3
-    ) || return 0
+    dlg --title "$SUB_TITLE" --menu "Select a utility:" 17 84 12 "${MENU_ITEMS[@]}"
+    [[ $DIALOG_RC -ne 0 ]] && return 0
+    [[ "$DOUT" == "0" ]] && return 0
 
-    [[ "$CHOICE" == "0" ]] && return 0
-
-    # Special handling for Advanced IOS-XE submenu
-    if [[ "${LABEL_BY_TAG[$CHOICE]}" == "Advanced IOS-XE deployment" ]]; then
+    if [[ "${LABEL_BY_TAG[$DOUT]}" == "Advanced IOS-XE deployment" ]]; then
       submenu_adv_iosxe
       continue
     fi
 
-    run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+    run_target "${PATH_BY_TAG[$DOUT]}" "${LABEL_BY_TAG[$DOUT]}"
   done
 }
 
 # ---------- Server Service Control submenu ----------
 submenu_server_services(){
   local SUB_TITLE="Server Service Control"
-
-  color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+  local color_help; color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
   while true; do
     local MENU_ITEMS=()
@@ -354,68 +312,48 @@ submenu_server_services(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # Option 1: manage services
     local lbl1="Manage CMDS Services"
     local path1="/root/.server_admin/service_control.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Start/stop/restart CMDS services via dialog.")")
-    PATH_BY_TAG["$i"]="$path1"
-    LABEL_BY_TAG["$i"]="$lbl1"
-    ((i++))
+    PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
 
-    # OPTIONAL: DHCP Administration (only if Kea config exists)
     if [[ -f /etc/kea/kea-dhcp4.conf ]]; then
       local lbl_dhcp="DHCP Administration"
       local path_dhcp="/root/.server_admin/dhcp_admin.sh"
       MENU_ITEMS+=("$i" "$lbl_dhcp" "$(color_help "Administer Kea DHCP configuration and leases.")")
-      PATH_BY_TAG["$i"]="$path_dhcp"
-      LABEL_BY_TAG["$i"]="$lbl_dhcp"
-      ((i++))
+      PATH_BY_TAG["$i"]="$path_dhcp"; LABEL_BY_TAG["$i"]="$lbl_dhcp"; ((i++))
     fi
 
-    # Reboot server
     local lbl2="Reboot Server"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Safely reboot this server (confirmation required).")")
-    PATH_BY_TAG["$i"]=""          # handled specially below
-    LABEL_BY_TAG["$i"]="$lbl2"
-    ((i++))
+    PATH_BY_TAG["$i"]="" ; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
-    # Back
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
 
-    local CHOICE=$(
-      dialog --no-shadow --colors --item-help \
-        --backtitle "$BACKTITLE" \
-        --title "$SUB_TITLE" \
-        --menu "Select an option:" 14 78 8 \
-        "${MENU_ITEMS[@]}" \
-        3>&1 1>&2 2>&3
-    ) || return 0
+    dlg --title "$SUB_TITLE" --menu "Select an option:" 14 78 8 "${MENU_ITEMS[@]}"
+    [[ $DIALOG_RC -ne 0 ]] && return 0
+    [[ "$DOUT" == "0" ]] && return 0
 
-    [[ "$CHOICE" == "0" ]] && return 0
-
-    local label="${LABEL_BY_TAG[$CHOICE]}"
-
-    # Special handling for reboot; everything else goes through run_target
+    local label="${LABEL_BY_TAG[$DOUT]}"
     if [[ "$label" == "Reboot Server" ]]; then
       if [[ $EUID -ne 0 ]]; then
-        dialog --no-shadow --backtitle "$BACKTITLE" --title "Permission required" \
-               --msgbox "Reboot requires root privileges." 7 60
+        dlg --title "Permission required" --msgbox "Reboot requires root privileges." 7 60
         continue
       fi
+      set +e
       dialog --no-shadow --backtitle "$BACKTITLE" --title "Confirm Reboot" --yesno \
 "Are you sure you want to reboot this server now?
 
 Active tasks or SSH sessions may be interrupted." 10 70
-      if (( $? == 0 )); then
-        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 3 seconds…" 5 40; sleep 1
-        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 2 seconds…" 5 40; sleep 1
-        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 1 second…" 5 40; sleep 1
+      local yn=$?
+      set -e
+      if (( yn == 0 )); then
         clear
         systemctl reboot || reboot || shutdown -r now
         exit 0
       fi
     else
-      run_target "${PATH_BY_TAG[$CHOICE]}" "$label"
+      run_target "${PATH_BY_TAG[$DOUT]}" "$label"
     fi
   done
 }
@@ -436,15 +374,11 @@ while true; do
   done
   MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to previous menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
 
-  CHOICE=$(
-    dialog --no-shadow --colors --item-help \
-      --backtitle "$BACKTITLE" \
-      --title "$TITLE" \
-      --menu "Select an option:" 22 78 10 \
-      "${MENU_ITEMS[@]}" \
-      3>&1 1>&2 2>&3
-  ) || exit 0
+  dlg --title "$TITLE" --menu "Select an option:" 22 78 10 "${MENU_ITEMS[@]}"
 
-  [[ "$CHOICE" == "0" ]] && exit 0
-  run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+  # Cancel/Esc in MAIN menu exits menu.sh (returns to parent launcher)
+  [[ $DIALOG_RC -ne 0 ]] && exit 0
+
+  [[ "$DOUT" == "0" ]] && exit 0
+  run_target "${PATH_BY_TAG[$DOUT]}" "${LABEL_BY_TAG[$DOUT]}"
 done

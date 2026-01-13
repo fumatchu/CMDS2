@@ -19,6 +19,8 @@ cleanup(){ clear; }
 trap cleanup EXIT
 
 while true; do
+  # dialog returns non-zero for Cancel/Esc; do NOT let set -e kill the script here
+  set +e
   CHOICE=$(
     dialog --no-shadow --colors --item-help \
       --backtitle "$BACKTITLE" \
@@ -31,9 +33,13 @@ while true; do
       3>&1 1>&2 2>&3
   )
   rc=$?
+  set -e
 
-  # ESC or Cancel -> exit
-  if [[ $rc -ne 0 ]]; then clear; exit 0; fi
+  # ESC or Cancel -> exit cleanly
+  if [[ $rc -ne 0 ]]; then
+    clear
+    exit 0
+  fi
 
   case "$CHOICE" in
     1)
@@ -43,19 +49,30 @@ while true; do
         export HYBRID_HOME="$HYBRID_DIR"   # optional: available to child scripts
 
         # Run the menu FROM its directory so all relative paths write to /root/.hybrid_admin
+        set +e
         (
           cd "$HYBRID_DIR" || exit 1
           exec bash "./$(basename "$HYBRID_MENU")"
-        ) || {
-          dialog --no-shadow --backtitle "$BACKTITLE" --title "Hybrid Menu" \
-                 --msgbox "The script returned a non-zero status.\n\nPath: $HYBRID_MENU" 9 70
-        }
+        )
+        hybrid_rc=$?
+        set -e
+
+        # Treat dialog-style exits as normal: 0=OK, 1=Cancel/No, 255=Esc
+        case "$hybrid_rc" in
+          0|1|255) : ;;  # normal return to main menu
+          *)
+            dialog --no-shadow --backtitle "$BACKTITLE" --title "Hybrid Menu" \
+                   --msgbox "The script returned a non-zero status ($hybrid_rc).\n\nPath: $HYBRID_MENU" 9 70
+            ;;
+        esac
       else
         dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
                --msgbox "Cannot find:\n$HYBRID_MENU" 7 60
       fi
       ;;
     0)
-      clear; exit 0 ;;
+      clear
+      exit 0
+      ;;
   esac
 done
