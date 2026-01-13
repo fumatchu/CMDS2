@@ -4,26 +4,93 @@
 # - Builds upgrade plan (JSON/CSV)
 # - Dialog checklist to pick switches to upgrade; writes selected_upgrade.{json,csv,env}
 # - The final screen is the selection summary (no upgrade-plan display)
+#
+# Fix: If Setup Wizard wasn't run and meraki_discovery.env is missing/invalid,
+#      show a dialog msgbox (not CLI), then exit 0 so menu doesn't "blink".
 
 set -Euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 
-# ===== ENV autodetect =====
+# -----------------------------
+# Early UI helpers (dialog-safe)
+# -----------------------------
+UI_MODE="${UI_MODE:-dialog}"  # dialog|plain
+DIALOG_AVAILABLE=0
+if [[ "$UI_MODE" == "dialog" ]] && command -v dialog >/dev/null 2>&1; then
+  # dialog must have a tty
+  if [[ -t 1 || -t 2 ]]; then
+    DIALOG_AVAILABLE=1
+  fi
+fi
+
+msgbox() {  # $1=title, $2+=message
+  local title="${1:-Notice}"; shift || true
+  local msg="${*:-}"
+  if (( DIALOG_AVAILABLE )); then
+    dialog --no-shadow --backtitle "CMDS-Deployment Server" --title "$title" --msgbox "$msg" 15 72
+  else
+    echo "[$title] $msg" >&2
+  fi
+}
+
+die() {  # $1=title, $2+=message (exits 0 so parent menu stays clean)
+  local title="${1:-Error}"; shift || true
+  msgbox "$title" "$*"
+  exit 0
+}
+
+# -----------------------------
+# ENV autodetect (Wizard required)
+# -----------------------------
+DEFAULT_ENV="/root/.hybrid_admin/meraki_discovery.env"
+
 if [[ -n "${1:-}" ]]; then
   ENV_FILE="$1"
 else
-  CANDIDATES=("$SCRIPT_DIR/ENV" "$SCRIPT_DIR/.env" "$SCRIPT_DIR/meraki_discovery.env" "$SCRIPT_DIR/meraki.env")
-  while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*.env 2>/dev/null || true)
-  while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*ENV 2>/dev/null || true)
-  while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*.ENV 2>/dev/null || true)
-  ENV_FILE=""
-  for f in "${CANDIDATES[@]}"; do
-    [[ -f "$f" && -r "$f" ]] || continue
-    if grep -Eq '(^|\s)(export\s+)?(MERAKI_API_KEY|SSH_USERNAME)=' "$f"; then ENV_FILE="$f"; break; fi
-  done
+  # Prefer the wizard-produced env file first
+  if [[ -r "$DEFAULT_ENV" ]]; then
+    ENV_FILE="$DEFAULT_ENV"
+  else
+    # Fallback to legacy discovery in script dir
+    CANDIDATES=("$SCRIPT_DIR/ENV" "$SCRIPT_DIR/.env" "$SCRIPT_DIR/meraki_discovery.env" "$SCRIPT_DIR/meraki.env")
+    while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*.env 2>/dev/null || true)
+    while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*ENV 2>/dev/null || true)
+    while IFS= read -r f; do CANDIDATES+=("$f"); done < <(compgen -G "$SCRIPT_DIR"/*.ENV 2>/dev/null || true)
+    ENV_FILE=""
+    for f in "${CANDIDATES[@]}"; do
+      [[ -f "$f" && -r "$f" ]] || continue
+      if grep -Eq '(^|\s)(export\s+)?(MERAKI_API_KEY|SSH_USERNAME)=' "$f"; then
+        ENV_FILE="$f"
+        break
+      fi
+    done
+  fi
 fi
-[[ -n "${ENV_FILE:-}" ]] || { echo "No ENV found in $SCRIPT_DIR; pass path explicitly."; exit 1; }
-echo "Using ENV file: $ENV_FILE" >&2
+
+# If env missing -> dialog + clean exit (no CLI spew, no non-zero)
+if [[ -z "${ENV_FILE:-}" || ! -r "${ENV_FILE:-}" ]]; then
+  die "Setup Wizard required" \
+"Cannot find the required environment file:
+
+  $DEFAULT_ENV
+
+This file is created by the Setup Wizard.
+Please run:
+
+  Setup Wizard  →  then  Switch Discovery"
+fi
+
+# Validate contents look sane (wizard may have been interrupted)
+if ! grep -Eq '(^|\s)(export\s+)?(MERAKI_API_KEY|SSH_USERNAME)=' "$ENV_FILE" 2>/dev/null; then
+  die "Invalid environment file" \
+"Environment file exists but does not look valid:
+
+  $ENV_FILE
+
+It must contain at least MERAKI_API_KEY and/or SSH_USERNAME.
+Please re-run the Setup Wizard."
+fi
+
 set +H
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -87,9 +154,19 @@ if [[ -z "$TFTP_BASE" ]]; then
   fi
 fi
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
+need() {  # dialog-friendly dependency check
+  command -v "$1" >/dev/null 2>&1 || die "Missing dependency" \
+"Missing required command: $1
+
+Install it and try again."
+}
+
 need nmap; need jq; need awk; need sed
-command -v sshpass >/dev/null 2>/dev/null || echo "NOTE: sshpass not found; password auth disabled unless SSH_KEY_PATH is set."
+command -v sshpass >/dev/null 2>/dev/null || msgbox "Notice" \
+"sshpass not found.
+
+Password auth will be disabled unless SSH_KEY_PATH is set."
+
 
 OUT_DIR="$(dirname "$ENV_FILE")"
 JSON_OUT="$OUT_DIR/discovery_results.json"
