@@ -2126,7 +2126,8 @@ install_server_admin_module() (
   sleep "$STEP_PAUSE"
 
   dialog --no-shadow --backtitle "$BACKTITLE" --title "Completed" \
-         --msgbox "Server Administration module has been installed to:\n$DEST_SA" 8 70
+       --infobox "Server Administration module has been installed to:\n$DEST_SA" 8 70
+  sleep 1
 )
 
 #===========SERVICE CHECK & ENABLE PROGRESS=============
