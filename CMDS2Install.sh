@@ -512,7 +512,7 @@ update_and_install_packages() {
     libffi-devel zlib-devel nano rsync sshpass openldap-clients fail2ban tuned
     cockpit tftp-server cockpit-storaged cockpit-files net-tools dmidecode ipcalc
     bind-utils iotop zip yum-utils curl wget git dnf-automatic dnf-plugins-core
-    util-linux htop expect iptraf-ng mc httpd python3 python3-pip
+    util-linux htop expect iptraf-ng mc httpd python3 python3-pip pv
   )
 
   local TOTAL_REQ=${#REQUIRED_PKGS[@]}
