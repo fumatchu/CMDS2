@@ -25,13 +25,11 @@ Fixes:
 
 
 Notes / Known Issues:
+*If you installed CMDS after Jan 14, 2026, these fixes are already included*
 
 -THIS IS A CUMULATIVE PATCH
 You do not need to install 0.1 as all fixes are included in 0.2
 These are cosmetic changes/fixes and do not affect the operation of the software
-
-
-*If you installed CMDS after Jan 14, 2026, these fixes are already included*
 
 If you installed before the above date, please run this patch to alleviate the issues.
 Always make sure you exit out of the meraki migration program fully to CLI and run

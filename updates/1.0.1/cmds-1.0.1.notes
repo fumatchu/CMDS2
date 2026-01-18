@@ -28,9 +28,10 @@ Fixes:
 None-First Release
 
 Notes / Known Issues:
+*If you installed CMDS after Jan 12 2026, these modules are already included*
 Main menu for hybrid deployments under utilities now incldues three new options 
 Advanced IOS-XE deployment (Interactive)
 Advanced IOS-XE Deployment (Scheduled) - For shceduled image deployment 
 View Advanced Schedules
-*IF you installed CMDS after Jan 12 2026, these modules are already included
+
 - 

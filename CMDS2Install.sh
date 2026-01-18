@@ -2879,6 +2879,19 @@ Continuing..." 14 80
   sleep 2
   return 0
 }
+CMDS_VERSION="1.0.0"
+
+write_cmds_version() {
+  local dir="/root/.server_admin"
+
+  mkdir -p "$dir"
+
+  echo "VERSION=${CMDS_VERSION}" > "$dir/CMDS_VERSION"
+  echo "INSTALLED_AT='$(date '+%Y-%m-%d %H:%M:%S %Z')'" > "$dir/CMDS_INSTALL_DATE"
+
+  chmod 600 "$dir/CMDS_VERSION" "$dir/CMDS_INSTALL_DATE" 2>/dev/null || true
+}
+
 # ========= MAIN =========
 detect_active_interface
 prompt_static_ip_if_dhcp
@@ -2925,6 +2938,7 @@ configure_dnf_automatic
 remove_home_mapper
 install_hybrid_admin_module
 install_server_admin_module
+write_cmds_vers
 check_and_enable_services
 cleanup_installer_files
 prompt_reboot_now

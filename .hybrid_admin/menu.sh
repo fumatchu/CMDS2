@@ -59,6 +59,7 @@ declare -A ITEMS=(
   ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
   ["Utilities"]=""  # submenu
   ["Server Management"]=""  # header/separator
+  ["Backup & Restore"]=""   # submenu   <<< NEW
   ["Server Service Control"]=""  # submenu
   ["README"]="/root/.hybrid_admin/readme.sh"
 )
@@ -67,6 +68,7 @@ declare -A ITEMS=(
 declare -A SUBMENU_FN=(
   ["IOS-XE Upgrade"]="submenu_iosxe"
   ["Utilities"]="submenu_utilities"
+  ["Backup & Restore"]="submenu_backup_restore"     # <<< NEW
   ["Server Service Control"]="submenu_server_services"
 )
 
@@ -92,6 +94,10 @@ declare -A HELP_RAW=(
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
   ["CMDS Updater"]="Download and apply CMDS updates from GitHub (with dry-run and patch history logging)."
   ["Server Management"]="Server management tools and utilities."
+  ["Backup & Restore"]="Backup, schedule, and restore CMDS data (local or remote)."     # <<< NEW
+  ["Backup (Local/Remote)"]="Run CMDS backups (local and remote with SSH)"  # <<< NEW
+  ["Backup Scheduler"]="Schedule recurring backups"      # <<< NEW
+  ["Restore"]="Restore from local or remote (with SSH)"              # <<< NEW
   ["Server Service Control"]="Manage CMDS services or reboot the server."
   ["README"]="View CMDS hybrid README / usage guide."
 )
@@ -107,6 +113,7 @@ ORDER=(
   "Logging"
   "Utilities"
   "Server Management"
+  "Backup & Restore"            # <<< NEW (right above Server Service Control)
   "Server Service Control"
   "README"
 )
@@ -209,6 +216,44 @@ submenu_iosxe(){
     dlg --title "$SUB_TITLE" --menu "Select an option:" 18 78 10 "${MENU_ITEMS[@]}"
 
     # Cancel/Esc -> return to menu.sh main (NOT exit)
+    [[ $DIALOG_RC -ne 0 ]] && return 0
+    [[ "$DOUT" == "0" ]] && return 0
+
+    run_target "${PATH_BY_TAG[$DOUT]}" "${LABEL_BY_TAG[$DOUT]}"
+  done
+}
+
+# ---------- Backup & Restore submenu (NEW) ----------
+submenu_backup_restore(){
+  local SUB_TITLE="Backup & Restore"
+  local color_help; color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+
+  while true; do
+    local MENU_ITEMS=()
+    local -A PATH_BY_TAG=()
+    local -A LABEL_BY_TAG=()
+    local i=1
+
+    local lbl1="Backup (Local/Remote)"
+    local path1="/root/.server_admin/cmds_backup.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]:-Run CMDS backups (local/remote).}")")
+    PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
+
+    local lbl2="Backup Scheduler"
+    local path2="/root/.server_admin/cmds_backup_scheduler.sh"
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]:-Schedule recurring backups.}")")
+    PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
+
+    local lbl3="Restore"
+    local path3="/root/.server_admin/cmds_restore.sh"
+    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]:-Restore from local/remote backups.}")")
+    PATH_BY_TAG["$i"]="$path3"; LABEL_BY_TAG["$i"]="$lbl3"; ((i++))
+
+    MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
+
+    dlg --title "$SUB_TITLE" --menu "Select an option:" 14 84 8 "${MENU_ITEMS[@]}"
+
+    # Cancel/Esc -> return to main menu (NOT exit menu.sh)
     [[ $DIALOG_RC -ne 0 ]] && return 0
     [[ "$DOUT" == "0" ]] && return 0
 

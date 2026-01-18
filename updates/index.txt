@@ -1,2 +1,1 @@
-0.1|cmds-0.1.tar|cmds-0.1.notes|[IOS-XE Module Update]|sha256:d92634ca7bf48db24bef9c6996f13a7155886f8986696ab710311b339a94758e
-0.2|cmds-0.2.tar|cmds-0.2.notes|[Dialog Cosmetic fixes]|sha256:cdd43ead406f4fde9133f7a6b862912cdd2a89da684921d311e16ce0b9023ab6
+1.0.1|cmds-1.0.1.tar|cmds-1.0.1.notes|[Backup Module Added]|sha256:d92634ca7bf48db24bef9c6996f13a7155886f8986696ab710311b339a94758e
