@@ -2938,7 +2938,7 @@ configure_dnf_automatic
 remove_home_mapper
 install_hybrid_admin_module
 install_server_admin_module
-write_cmds_vers
+write_cmds_version
 check_and_enable_services
 cleanup_installer_files
 prompt_reboot_now
