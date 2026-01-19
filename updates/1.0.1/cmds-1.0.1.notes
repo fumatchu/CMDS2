@@ -1,7 +1,30 @@
 CMDS Update Notes - v0.1
-Date: Mon Jan 12 09:51:05 AM EST 2026
+Date: Mon Jan 18 09:51:05 AM EST 2026
 
 Summary:
+-This update consolidates some cosmetic bugs with Dialog and dlg 
+
+-Introduces the Advanced IOS-XE module for Image deployment
+
+-Introduces the Backup and restore functionality
+ -Backup local or over SSH 
+ -Schedule daily or weekly backups for the server
+ -Provides restore capabilities from a catastrophic event 
+
+-Updates meraki_migration command
+ -Check for Internet connectivity
+ -Checks that the server is running the latest update
+ -Allows user decision to update now, or wait
+
+
+
+
+Changes:
+-This update consolidates some cosmetic bugs with Dialog and dlg 
+Fixed issues with non-zero returns to the main menu 
+Updated dlg calls to stop UI from non-looping when pressing cancel button
+
+-Introduces the Advanced IOS-XE module for Image deployment
 This is an add-on for the Advanced IOS-XE modules under Utilities menu. 
 This provides an Administrator the capabilities to now choose any
 firmware needed for the switches. The intent is to remove the 
@@ -10,28 +33,31 @@ of newer IOS-XE firmware as needed in a dev environment.
 This Module should not be used for production switches. But does allow 
 the System to push whatever firmware version you want to the switches. 
 
-Changes:
-Added the following from .hybrid_admin
+This option can be seen at:
+Hybrid Menu--> Main Menu--> Utilities (8)--> Advanced IOS-XE deployment (2)
 
-adv-ios-xe-upgrader/
-└── bin/
-    ├── adv_image_manual_main.sh
-    ├── adv_image_schedule_main.sh
-    ├── at_image_upgrade.sh
-    ├── discoverswitches.sh
-    ├── image_upgrade.sh
-    ├── scheduler.sh
-    ├── setupwizard.sh
-    └── view_schedule.sh
+-Introduces the Backup and restore functionality
+This allows an admin to setup Local or remote backups (SSH suported)
+Allows daily or weekly schedules for automated backups 
+Provides an option to include/exclude IOS-Images if needed 
+Provides a restore module for the system to recover from catastrophic events. 
+Includes a new logging mdule under logging 
+
+This option can be seen at:
+Hybrid Menu--> Main Menu--> Backup and Retore (10)
+
+-Updates meraki_migration command
+-Introdcues Internet Connectivity awareness
+-Checks for updates and provides an option for the user to upgrade now or later
+If the user chooses to update they will transition to the updater tool where 
+updates will be listed the user should select the latest as they are cumulative.
+
+
+
 
 Fixes:
 None-First Release
 
 Notes / Known Issues:
-*If you installed CMDS after Jan 12 2026, these modules are already included*
-Main menu for hybrid deployments under utilities now incldues three new options 
-Advanced IOS-XE deployment (Interactive)
-Advanced IOS-XE Deployment (Scheduled) - For shceduled image deployment 
-View Advanced Schedules
+*If you installed CMDS after Jan 18 2026, these modules are already included*
 
-- 

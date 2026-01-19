@@ -96,10 +96,15 @@ passwordbox() {
 menu() {
   local title="$1"; local prompt="$2"; shift 2
   local out=""
+  # NOTE: dialog will scroll when there are more items than "menu height"
+  # Increase list-height so it's nicer (still scrolls).
+  local mh=15
+  local h=20
+  local w=110
   if have_dialog && fd9_ok; then
-    out="$("$DIALOG_BIN" --stdout --no-shadow --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" 18 92 10 "$@" <&9 2>&9)" || return 1
+    out="$("$DIALOG_BIN" --stdout --no-shadow --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" "$h" "$w" "$mh" "$@" <&9 2>&9)" || return 1
   else
-    out="$("$DIALOG_BIN" --stdout --no-shadow --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" 18 92 10 "$@")" || return 1
+    out="$("$DIALOG_BIN" --stdout --no-shadow --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" "$h" "$w" "$mh" "$@")" || return 1
   fi
   printf "%s" "$out"
 }
@@ -137,7 +142,11 @@ make_run_dir() {
 }
 
 is_backup_dir_name() {
-  [[ "$(basename "$1")" =~ ^cmds_cmds-backup-[0-9]{8}-[0-9]{6}$ ]]
+  # Accept any host/prefix with underscore, matching your real dirs:
+  #   cmds_cmds-backup-YYYYMMDD-HHMMSS
+  #   test1_cmds-backup-YYYYMMDD-HHMMSS
+  #   <anything>_cmds-backup-YYYYMMDD-HHMMSS
+  [[ "$(basename "$1")" =~ ^[A-Za-z0-9._-]+_cmds-backup-[0-9]{8}-[0-9]{6}$ ]]
 }
 
 pick_mode_local_remote() {
@@ -151,6 +160,7 @@ pick_restore_mode_full_selective() {
     "full"   "Restore everything in the backup (overwrite included paths)" \
     "select" "Restore selected areas/files only"
 }
+
 cleanup_archive_on_success() {
   # $1 = tarfile path
   local tarfile="${1:-}"
@@ -168,6 +178,7 @@ cleanup_archive_on_success() {
     rm -f -- "$tarfile" 2>/dev/null || true
   fi
 }
+
 # ---------- SAFE manifest parsing ----------
 manifest_get() {
   local key="$1" file="$2" line val
@@ -615,7 +626,8 @@ shopt -s nullglob
 root="${1:-/root/cmds-backups}"
 [[ -d "$root" ]] || exit 0
 
-for d in "$root"/cmds_cmds-backup-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]; do
+# Accept any prefix: <something>_cmds-backup-YYYYMMDD-HHMMSS
+for d in "$root"/*_cmds-backup-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]; do
   [[ -d "$d" ]] || continue
   [[ -f "$d/manifest.env" ]] || continue
   [[ -f "$d/sha256sums.txt" ]] || continue
@@ -884,7 +896,7 @@ main() {
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
     msgbox "No Backups Found" \
-"No valid backup sets found under:\n$base_dir\n\nLooking for dirs like:\ncmds_cmds-backup-YYYYMMDD-HHMMSS\nwith:\n- manifest.env\n- sha256sums.txt\n- *.tar.gz"
+"No valid backup sets found under:\n$base_dir\n\nLooking for dirs like:\n<host>_cmds-backup-YYYYMMDD-HHMMSS\nwith:\n- manifest.env\n- sha256sums.txt\n- *.tar.gz"
     exit 0
   fi
 
