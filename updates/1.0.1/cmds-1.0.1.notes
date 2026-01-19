@@ -37,19 +37,19 @@ This option can be seen at:
 Hybrid Menu--> Main Menu--> Utilities (8)--> Advanced IOS-XE deployment (2)
 
 -Introduces the Backup and restore functionality
-This allows an admin to setup Local or remote backups (SSH suported)
+This allows an admin to setup Local or remote backups (SSH supported)
 Allows daily or weekly schedules for automated backups 
 Provides an option to include/exclude IOS-Images if needed 
 Provides a restore module for the system to recover from catastrophic events. 
-Includes a new logging mdule under logging 
+Includes a new logging module under logging 
 
 This option can be seen at:
 Hybrid Menu--> Main Menu--> Backup and Retore (10)
 
 -Updates meraki_migration command
--Introdcues Internet Connectivity awareness
+-Introduces Internet Connectivity awareness
 -Checks for updates and provides an option for the user to upgrade now or later
-If the user chooses to update they will transition to the updater tool where 
+If the user chooses to update, they will transition to the updater tool where 
 updates will be listed the user should select the latest as they are cumulative.
 
 
