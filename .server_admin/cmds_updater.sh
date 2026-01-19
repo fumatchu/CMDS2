@@ -26,9 +26,11 @@
 # - Appends patch history here:
 #     /root/.server_admin/runs/cmds-update/patch_history.log
 #
-# NOTE ON DESCRIPTION DISPLAY:
-# - The UI ALWAYS shows the description wrapped in brackets: [Description]
-# - If the index already contains brackets, we normalize and still show [Description]
+# VERSIONING:
+# - Writes /root/.server_admin/CMDS_VERSION as: VERSION=<selected_version>
+# - Writes /root/.server_admin/CMDS_INSTALL_DATE as: INSTALLED_AT='<timestamp>'
+# - If CMDS_VERSION is missing/invalid, the updater auto-selects the latest version
+#   from INDEX (cumulative patches) and proceeds.
 
 set -Eeuo pipefail
 
@@ -108,6 +110,34 @@ run_cmd(){
   "$@" >>"$STDOUT_LOG" 2>>"$STDERR_LOG"
 }
 
+# ---------------- Local CMDS version tracking ----------------
+VERSION_FILE="${SERVER_DIR}/CMDS_VERSION"
+INSTALL_DATE_FILE="${SERVER_DIR}/CMDS_INSTALL_DATE"
+
+read_installed_version(){
+  # Expected file format: VERSION=1.0.0
+  local v=""
+  [[ -r "$VERSION_FILE" ]] || { echo ""; return 0; }
+  v="$(grep -m1 '^VERSION=' "$VERSION_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]] || v=""
+  printf "%s" "$v"
+}
+
+write_installed_version(){
+  # Writes VERSION=<ver> and INSTALLED_AT='<timestamp>'
+  local ver="${1:-}"
+  [[ -n "$ver" ]] || return 0
+  mkdir -p "$SERVER_DIR" 2>/dev/null || true
+  {
+    echo "VERSION=$ver"
+  } >"$VERSION_FILE"
+  {
+    echo "INSTALLED_AT='$(date '+%Y-%m-%d %H:%M:%S %Z')'"
+  } >"$INSTALL_DATE_FILE"
+  chmod 600 "$VERSION_FILE" "$INSTALL_DATE_FILE" 2>/dev/null || true
+  log "Wrote CMDS version files: $VERSION_FILE ($ver), $INSTALL_DATE_FILE"
+}
+
 # ---------------- Updater state ----------------
 INDEX_LINES=()
 INDEX_USED_URL=""
@@ -123,11 +153,8 @@ normalize_desc(){
   # Always show [Description] in UI.
   # If desc already contains brackets, strip outermost and re-wrap.
   local d="${1:-}"
-  # Trim CR
   d="${d//$'\r'/}"
-  # Strip leading/trailing whitespace
   d="$(printf '%s' "$d" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
-  # Strip a single pair of surrounding brackets if present
   if [[ "$d" =~ ^\[(.*)\]$ ]]; then
     d="${BASH_REMATCH[1]}"
     d="$(printf '%s' "$d" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
@@ -145,23 +172,18 @@ parse_index_line(){
   local ver="" tar="" notes="" desc="" sha=""
   IFS='|' read -r ver tar notes desc sha <<<"$line"
 
-  # If sha is empty but desc looks like sha256:..., it's 4-col and shifted
   if [[ -z "${sha:-}" && "${desc:-}" == sha256:* ]]; then
     sha="$desc"
     desc=""
   fi
 
-  # Some people accidentally do: ver|tar|desc|notes|sha  (wrong)
-  # If 4th field ends with .notes and 3rd does not, swap them.
   if [[ "${desc:-}" == *.notes && "${notes:-}" != *.notes ]]; then
     local tmp="$notes"
     notes="$desc"
     desc="$tmp"
   fi
 
-  # Defaults
   [[ -n "${notes:-}" ]] || notes="${ver}.notes"
-
   printf '%s|%s|%s|%s|%s\n' "${ver:-}" "${tar:-}" "${notes:-}" "${desc:-}" "${sha:-}"
 }
 
@@ -208,11 +230,33 @@ $LOG_FILE"
   log "Index entries: ${#INDEX_LINES[@]}"
 }
 
+latest_index_version(){
+  # Returns highest version from INDEX_LINES (semver-ish)
+  local ver
+  ver="$(
+    printf '%s\n' "${INDEX_LINES[@]}" \
+      | cut -d'|' -f1 \
+      | tr -d '\r' \
+      | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+      | grep -E '^[0-9]+(\.[0-9]+)*$' \
+      | sort -V \
+      | tail -n 1
+  )"
+  printf "%s" "${ver:-}"
+}
+
+auto_select_latest_version(){
+  local latest
+  latest="$(latest_index_version)"
+  [[ -n "${latest:-}" ]] || fail "Could not determine latest version from update index."
+  SELECTED_VERSION="$latest"
+  log "Auto-selected latest version (no/invalid local CMDS_VERSION): $SELECTED_VERSION"
+}
+
 pick_version_menu(){
   local -a MENU_ITEMS=()
   local line parsed ver tar notes desc sha
 
-  # Sort by version (descending). This is "best effort" for semver-like strings.
   mapfile -t sorted < <(printf '%s\n' "${INDEX_LINES[@]}" | sort -t'|' -k1,1Vr)
 
   for line in "${sorted[@]}"; do
@@ -220,11 +264,9 @@ pick_version_menu(){
     IFS='|' read -r ver tar notes desc sha <<<"$parsed"
     [[ -n "${ver:-}" && -n "${tar:-}" ]] || continue
 
-    # dialog --menu only supports TAG + ITEM. We'll pack tar + [desc] into ITEM.
     local shown_desc
     shown_desc="$(normalize_desc "$desc")"
 
-    # Make it readable in monospace; keep it simple and stable.
     local item
     item="$(printf '%-22s %-40s' "$tar" "$shown_desc")"
 
@@ -450,11 +492,17 @@ append_patch_history(){
 }
 
 finish_success(){
+  # Record the installed version BEFORE telling the user we're done.
+  write_installed_version "${SELECTED_VERSION}"
+
   append_patch_history
 
   dlg_msg "Update complete" "CMDS update v${SELECTED_VERSION} applied successfully.
 
 Description: $(normalize_desc "${SELECTED_DESC:-}")
+
+Version file written:
+  ${VERSION_FILE}
 
 Run ID: $RUN_ID
 Logs saved to:
@@ -463,7 +511,7 @@ $RUN_DIR
 Patch history:
 $PATCH_HISTORY
 
-Next: You'll be shown the update log." 16 92
+Next: You'll be shown the update log." 18 92
 
   show_logfile
 
@@ -484,16 +532,46 @@ main(){
   need sed
   need grep
   need sha256sum
+  need cut
+  need sort
+  need tr
 
   log "Starting CMDS updater. Repo=${REPO_OWNER}/${REPO_NAME} Branch=${BRANCH}"
   log "RAW_BASE=${RAW_BASE}"
 
   fetch_versions_raw
 
-  if ! pick_version_menu; then
-    log "User cancelled at version selection."
+  # ---- Version logic ----
+  local installed latest
+  installed="$(read_installed_version)"
+  latest="$(latest_index_version)"
+
+  # If we have a valid local version and it matches latest -> exit cleanly
+  if [[ -n "${installed:-}" && -n "${latest:-}" && "$installed" == "$latest" ]]; then
+    log "Already up to date: installed=$installed latest=$latest"
+    dlg_msg "Up to date" "This system is already up to date.
+
+Installed: $installed
+Latest:    $latest" 10 60
     exit 0
   fi
+
+  # If no version file / invalid version -> auto-pick latest
+  if [[ -z "${installed:-}" ]]; then
+    dlg_msg "Version not found" "This system does not have a local CMDS_VERSION recorded yet.
+
+We'll assume this is an unknown install state and prepare the latest update.
+
+Latest available: ${latest:-<unknown>}" 12 70
+    auto_select_latest_version
+  else
+    # Normal behavior: user selects which version (cumulative patches supported)
+    if ! pick_version_menu; then
+      log "User cancelled at version selection."
+      exit 0
+    fi
+  fi
+  # ------------------------
 
   local meta
   meta="$(get_meta_for_version "$SELECTED_VERSION")" || fail "Selected version not found in index."
