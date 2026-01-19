@@ -4,18 +4,19 @@
 #   /root/.hybrid_admin
 #   /root/.server_admin
 #
-# Excludes: runs/, *.env, *.csv, *.json, and anything non-executable.
+# Excludes: runs/, *.env, *.csv, *.json, *.log, *.status and anything non-executable.
 #
-# Output:
+# Output (all in /root):
 #   /root/cmds-<version>.tar.gz
 #   /root/cmds-<version>.notes  (template)
+#   /root/cmds-<version>.sha256 (sha256 line for the tar.gz)
 #
-# Requires: dialog, find, tar, gzip, awk, sed, sort, mktemp
+# Requires: dialog, find, tar, gzip, awk, sed, sort, mktemp, sha256sum
 
 set -Euo pipefail
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need dialog; need find; need tar; need gzip; need awk; need sed; need sort; need mktemp
+need dialog; need find; need tar; need gzip; need awk; need sed; need sort; need mktemp; need sha256sum
 
 BACKTITLE="${BACKTITLE:-CMDS Packager}"
 DIALOG_OPTS=(--no-shadow --backtitle "$BACKTITLE")
@@ -54,7 +55,6 @@ gather_exec_files() {
   local d
   for d in "${SRC_DIRS[@]}"; do
     if [[ ! -d "$ROOT_BASE/$d" ]]; then
-      # Not an error — you said .cloud_admin won't exist yet and that's fine.
       continue
     fi
 
@@ -112,11 +112,18 @@ build_tarball() {
 
   local out_tar="/root/cmds-${version}.tar.gz"
   local out_notes="/root/cmds-${version}.notes"
+  local out_sha="/root/cmds-${version}.sha256"
 
   # Build tar.gz from /root so paths stay relative and extract cleanly into /root
   (
     cd "$ROOT_BASE"
     tar -czf "$out_tar" -T "$filelist"
+  )
+
+  # Write sha256 file (single line, compatible with sha256sum -c)
+  (
+    cd "/root"
+    sha256sum "$(basename "$out_tar")" > "$(basename "$out_sha")"
   )
 
   # Notes template (if not already present)
@@ -126,42 +133,55 @@ CMDS Update Notes - v${version}
 Date: $(date)
 
 Summary:
-- 
+-
 
 Changes:
-- 
+-
 
 Fixes:
-- 
+-
 
 Notes / Known Issues:
-- 
+-
 EOF
   fi
+
+  local sha_line=""
+  sha_line="$(cat "$out_sha" 2>/dev/null || true)"
 
   dlg --title "Build complete" --msgbox \
 "Created:
 
   $out_tar
   $out_notes
+  $out_sha
+
+SHA256:
+  $sha_line
 
 Next:
-- Upload both into your repo under:
+- Upload files into your repo under:
   updates/${version}/
-  (e.g. cmds-${version}.tar.gz and ${version}.notes)
 
-Tip:
-- You can rename cmds-${version}.notes to ${version}.notes if you prefer.
-" 14 80
+Recommended naming in repo:
+  cmds-${version}.tar.gz
+  ${version}.notes
+  (optional) cmds-${version}.sha256
+
+Index entry tip:
+- If you include SHA in INDEX, use:
+    sha256:<hash>
+  where <hash> is the first field of the .sha256 file." 20 90
 }
 
 main() {
   dlg --title "CMDS Packager" --inputbox \
-"Enter version to package (example: 0.5)
+"Enter version to package (example: 1.0.2)
 
 This will build:
   /root/cmds-<version>.tar.gz
-  /root/cmds-<version>.notes" 12 70 ""
+  /root/cmds-<version>.notes
+  /root/cmds-<version>.sha256" 13 72 ""
   [[ $DIALOG_RC -ne 0 ]] && exit 0
 
   local ver
@@ -182,8 +202,9 @@ This will build:
 This will create:
   /root/cmds-${ver}.tar.gz
   /root/cmds-${ver}.notes
+  /root/cmds-${ver}.sha256
 
-Proceed?" 12 70
+Proceed?" 13 74
 
   if (( DIALOG_RC != 0 )); then
     rm -f "$listtmp"
