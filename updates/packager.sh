@@ -6,17 +6,16 @@
 #
 # Excludes: runs/, *.env, *.csv, *.json, *.log, *.status and anything non-executable.
 #
-# Output (all in /root):
-#   /root/cmds-<version>.tar
+# Output:
+#   /root/cmds-<version>.tar.gz
 #   /root/cmds-<version>.notes  (template)
-#   /root/cmds-<version>.sha256 (sha256 line for the tar)
 #
-# Requires: dialog, find, tar, awk, sed, sort, mktemp, sha256sum
+# Requires: dialog, find, tar, gzip, awk, sed, sort, mktemp
 
 set -Euo pipefail
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need dialog; need find; need tar; need awk; need sed; need sort; need mktemp; need sha256sum
+need dialog; need find; need tar; need gzip; need awk; need sed; need sort; need mktemp
 
 BACKTITLE="${BACKTITLE:-CMDS Packager}"
 DIALOG_OPTS=(--no-shadow --backtitle "$BACKTITLE")
@@ -126,6 +125,12 @@ build_tarball() {
     sha256sum "$(basename "$out_tar")" > "$(basename "$out_sha")"
   )
 
+  # Write sha256 file (single line, compatible with sha256sum -c)
+  (
+    cd "/root"
+    sha256sum "$(basename "$out_tar")" > "$(basename "$out_sha")"
+  )
+
   # Notes template (if not already present)
   if [[ ! -f "$out_notes" ]]; then
     cat >"$out_notes" <<EOF
@@ -162,16 +167,11 @@ SHA256:
 Next:
 - Upload files into your repo under:
   updates/${version}/
+  (e.g. cmds-${version}.tar.gz and ${version}.notes)
 
-Recommended naming in repo:
-  cmds-${version}.tar
-  ${version}.notes
-  (optional) cmds-${version}.sha256
-
-Index entry tip:
-- If you include SHA in INDEX, use:
-    sha256:<hash>
-  where <hash> is the first field of the .sha256 file." 20 90
+Tip:
+- You can rename cmds-${version}.notes to ${version}.notes if you prefer.
+" 14 80
 }
 
 main() {
@@ -179,9 +179,8 @@ main() {
 "Enter version to package (example: 1.0.2)
 
 This will build:
-  /root/cmds-<version>.tar
-  /root/cmds-<version>.notes
-  /root/cmds-<version>.sha256" 13 72 ""
+  /root/cmds-<version>.tar.gz
+  /root/cmds-<version>.notes" 12 70 ""
   [[ $DIALOG_RC -ne 0 ]] && exit 0
 
   local ver
