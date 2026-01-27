@@ -2879,7 +2879,7 @@ Continuing..." 14 80
   sleep 2
   return 0
 }
-CMDS_VERSION="1.0.0"
+CMDS_VERSION="1.0.1"
 
 write_cmds_version() {
   local dir="/root/.server_admin"
