@@ -2038,6 +2038,88 @@ install_hybrid_admin_module() (
   log "=== Hybrid Admin install complete ==="
 )
 
+install_cloud_admin_module() (
+  set -Eeuo pipefail
+
+  # --- configurable (override before calling) ---
+  : "${STEP_PAUSE:=0.7}"
+  : "${BACKTITLE:=Installing Cloud Admin Module}"
+  : "${TITLE:=Cloud Admin Installer}"
+  : "${SRC_BASE:=/root/CMDS2Installer}"
+
+  # --- paths ---
+  LOG_FILE="/var/log/cloud-admin-install.log"
+  SRC_CA="${SRC_BASE}/.cloud_admin"
+  DEST_CA="/root/.cloud_admin"
+  SRC_MM="${SRC_BASE}/meraki_migration.sh"
+  DEST_MM="/usr/local/bin/meraki_migration.sh"
+
+  # --- deps ---
+  command -v dialog >/dev/null 2>&1 || { echo "Missing: dialog" >&2; exit 3; }
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log(){ printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"; }
+
+  # --- gauge plumbing ---
+  PIPE="" PROG_FD="" DIALOG_PID=""
+  cleanup() {
+    { [[ -n "${PROG_FD:-}" ]] && exec {PROG_FD}>&-; } 2>/dev/null || true
+    { [[ -n "${DIALOG_PID:-}" ]] && kill "$DIALOG_PID" 2>/dev/null; } || true
+    { [[ -n "${PIPE:-}" && -p "$PIPE" ]] && rm -f "$PIPE"; } || true
+    tput cnorm 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  start_gauge() {
+    PIPE="$(mktemp -u)"
+    mkfifo "$PIPE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" \
+           --gauge "Starting…" 10 70 0 < "$PIPE" & DIALOG_PID=$!
+    exec {PROG_FD}> "$PIPE"
+    rm -f "$PIPE"
+  }
+  gauge(){ local p="$1"; shift; local m="${*:-Working…}"; printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; }
+
+  # --- work ---
+  log "=== Cloud Admin install start ==="
+  start_gauge
+  gauge 1  "Initializing…"; sleep "$STEP_PAUSE"
+
+  # 1) Move/merge .cloud_admin → /root and chmod 700
+  gauge 10 "Staging Cloud Admin files…"; sleep "$STEP_PAUSE"
+  if [[ -d "$SRC_CA" ]]; then
+    if [[ -d "$DEST_CA" ]]; then
+      gauge 18 "Merging existing .cloud_admin…"; sleep "$STEP_PAUSE"
+      rsync -a "$SRC_CA"/ "$DEST_CA"/ >>"$LOG_FILE" 2>&1 || true
+      rm -rf "$SRC_CA"
+    else
+      gauge 18 "Moving .cloud_admin to /root…"; sleep "$STEP_PAUSE"
+      mv "$SRC_CA" "$DEST_CA" >>"$LOG_FILE" 2>&1
+    fi
+  fi
+  if [[ -d "$DEST_CA" ]]; then
+    chmod -R 700 "$DEST_CA" >>"$LOG_FILE" 2>&1 || true
+  fi
+
+  # 2) Install meraki_migration in PATH (used by Hybrid Admin)
+  gauge 35 "Installing meraki_migration into /usr/local/bin…"; sleep "$STEP_PAUSE"
+  if [[ -f "$SRC_MM" ]]; then
+    install -m 700 -o root -g root "$SRC_MM" "$DEST_MM" >>"$LOG_FILE" 2>&1
+  fi
+  if [[ ! -x "$DEST_MM" ]]; then
+    gauge 100 "Failed: meraki_migration not found/installed"; sleep 1
+    log "ERROR: $DEST_MM missing or not executable"
+    exit 2
+  fi
+
+  # 3) Verify
+  gauge 75 "Verifying installation…"; sleep "$STEP_PAUSE"
+  [[ -d "$DEST_CA" ]] && chmod -R 700 "$DEST_CA" >>"$LOG_FILE" 2>&1 || true
+
+  gauge 100 "Done! Cloud Admin Module installed."
+  sleep 1.2
+  log "=== Cloud Admin install complete ==="
+)
+
 install_server_admin_module() (
   set -Eeuo pipefail
 
@@ -2937,6 +3019,7 @@ configure_fail2ban
 configure_dnf_automatic
 remove_home_mapper
 install_hybrid_admin_module
+install_cloud_admin_module
 install_server_admin_module
 write_cmds_version
 check_and_enable_services
