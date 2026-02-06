@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# /root/.hybrid_admin/menu.sh
-# Hybrid (Device Local) menu with dynamic help, completion checkmarks, and submenus.
+# /root/.cloud_admin/menu.sh
+# Cloud (Device Local) menu with dynamic help, completion checkmarks, and submenus.
 
 set -Eeuo pipefail
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need dialog
 
 BACKTITLE="CMDS-Deployment Server"
-TITLE="Catalyst to Meraki (hybrid) (Device Local)"
+TITLE="Catalyst to Meraki (cloud) (Device Local)"
+
+# ---- Cloud support matrix viewer script (set to your actual file) ----
+CLOUD_MATRIX_SCRIPT="/root/.cloud_admin/cloud_support_matrix.sh"
 
 # Colors (dialog --colors)
 HELP_COLOR_PREFIX="${HELP_COLOR_PREFIX:-\Zb\Z3}"  # bold yellow
@@ -16,25 +19,38 @@ MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
-  ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
-  ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
-  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/preflight_validated.flag"
+  ["Cloud Support Matrix (Models ↔ IOS-XE)"]="/root/.cloud_admin/cloud_firmware_report.env"
+  ["Setup Wizard"]="/root/.cloud_admin/meraki_discovery.env"
+  ["Switch Discovery"]="/root/.cloud_admin/selected_upgrade.env"
+  ["Validate IOS-XE configuration"]="/root/.cloud_admin/preflight.ok"
   # For migration, we use a symlink to the latest claim log
-  ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"
+  ["Migrate Switches"]="/root/.cloud_admin/meraki_claim.log"
 )
 
 # Items: label -> script path
+# NOTE: Section headers are kept as empty paths and ignored by run_target().
 declare -A ITEMS=(
-  ["Setup Wizard"]="/root/.hybrid_admin/setupwizard.sh"
-  ["Switch Discovery"]="/root/.hybrid_admin/discoverswitches.sh"
-  ["Validate IOS-XE configuration"]="/root/.hybrid_admin/meraki_preflight.sh"
+  # Section headers (non-clickable)
+  ["Firmware & Compatibility"]=""
+  ["Deployment Workflow"]=""
+
+  # Firmware & Compatibility
+  ["Cloud Support Matrix (Models ↔ IOS-XE)"]="$CLOUD_MATRIX_SCRIPT"
+
+  # Deployment workflow
+  ["Setup Wizard"]="/root/.cloud_admin/setupwizard.sh"
+  ["Switch Discovery"]="/root/.cloud_admin/discoverswitches.sh"
+  ["Validate IOS-XE configuration"]="/root/.cloud_admin/meraki_preflight.sh"
   ["IOS-XE Upgrade"]=""  # handled by submenu
-  ["Migrate Switches"]="/root/.hybrid_admin/migration.sh"
-  ["Logging"]="/root/.hybrid_admin/show_logs.sh"
-  ["Clean Configuration (New Batch Deployment)"]="/root/.hybrid_admin/clean.sh"
+  ["Migrate Switches"]="/root/.cloud_admin/migration.sh"
+  ["Logging"]="/root/.cloud_admin/show_logs.sh"
+  ["Clean Configuration (New Batch Deployment)"]="/root/.cloud_admin/clean.sh"
   ["Utilities"]=""  # handled by submenu
+
+  # Server / docs
   ["Server Management"]=""  # header / separator, not an actual script
   ["Server Service Control"]=""  # handled by submenu
+  ["README"]="/root/.cloud_admin/readme.sh"
 )
 
 # Submenus: label -> function name
@@ -46,13 +62,16 @@ declare -A SUBMENU_FN=(
 
 # Per-item help (status line)
 declare -A HELP_RAW=(
-  ["Setup Wizard"]="Guided first-time setup: env, API keys, credentials, and paths."
+  ["Firmware & Compatibility"]="Reference tools for firmware ↔ model support and requirements."
+  ["Cloud Support Matrix (Models ↔ IOS-XE)"]="Searchable database for model + minimum IOS-XE requirements (informational)."
+  ["Deployment Workflow"]="Operational workflows for discovery, validation, upgrade, and cloud conversion."
+  ["Setup Wizard"]="Guided Setup: Always run between batches (API keys, credentials)"
   ["Switch Discovery"]="Discover live Catalyst switches, probe via SSH, and build the selection for upgrades."
   ["Validate IOS-XE configuration"]="Run preflight validation for selected switches and configuration before upgrade."
   ["IOS-XE Upgrade"]="Run IOS-XE install/activate/commit workflows and tools."
   ["Deploy IOS-XE"]="Copy image to flash, then install/activate/commit on selected switches."
   ["Schedule Image Upgrade"]="Schedule a future image upgrade (snapshots envs, uses 'at')."
-  ["Migrate Switches"]="Run the Catalyst-to-Meraki switch migration workflow and claim devices into Dashboard."
+  ["Migrate Switches"]="Run the Catalyst-to-Meraki cloud migration workflow and claim devices into Dashboard."
   ["Logging"]="View CMDS deployment and migration log files."
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
   ["Utilities"]="Utility tools for monitoring and quick checks."
@@ -62,20 +81,27 @@ declare -A HELP_RAW=(
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
+  ["README"]="View CMDS cloud README / usage guide."
 )
 
 # Display order (main menu)
 ORDER=(
+  "Firmware & Compatibility"
+  "Cloud Support Matrix (Models ↔ IOS-XE)"
+
+  "Deployment Workflow"
   "Setup Wizard"
   "Switch Discovery"
   "IOS-XE Upgrade"
   "Validate IOS-XE configuration"
   "Migrate Switches"
-  "Logging"
   "Clean Configuration (New Batch Deployment)"
+  "Logging"
   "Utilities"
+
   "Server Management"
   "Server Service Control"
+  "README"
 )
 
 cleanup(){ clear; }
@@ -118,10 +144,20 @@ display_label(){  # $1=label -> returns label with green check and submenu marke
   local lbl="$1" text
 
   # Section header formatting
-  if [[ "$lbl" == "Server Management" ]]; then
-    printf "%s" "---------------- Server Management ----------------"
-    return
-  fi
+  case "$lbl" in
+    "Firmware & Compatibility")
+      printf "%s" "--------- Firmware & Compatibility ---------"
+      return
+      ;;
+    "Deployment Workflow")
+      printf "%s" "------------ Deployment Workflow ------------"
+      return
+      ;;
+    "Server Management")
+      printf "%s" "---------------- Server Management ----------------"
+      return
+      ;;
+  esac
 
   # Base label with optional green check
   if is_done "$lbl"; then
@@ -142,7 +178,9 @@ run_target(){
   local script="$1" label="$2"
 
   # Section header? do nothing.
-  if [[ "$label" == "Server Management" ]]; then
+  if [[ "$label" == "Server Management" \
+     || "$label" == "Firmware & Compatibility" \
+     || "$label" == "Deployment Workflow" ]]; then
     return
   fi
 
@@ -182,11 +220,11 @@ submenu_iosxe(){
     local i=1
 
     local lbl1="Deploy IOS-XE"
-    local path1="/root/.hybrid_admin/image_upgrade.sh"
+    local path1="/root/.cloud_admin/image_upgrade.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(colorize_help "$lbl1")"); PATH_BY_TAG["$i"]="$path1"; LABEL_BY_TAG["$i"]="$lbl1"; ((i++))
 
     local lbl2="Schedule Image Upgrade"
-    local path2="/root/.hybrid_admin/scheduler.sh"
+    local path2="/root/.cloud_admin/scheduler.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(colorize_help "$lbl2")"); PATH_BY_TAG["$i"]="$path2"; LABEL_BY_TAG["$i"]="$lbl2"; ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(printf '%bReturn to main menu%b' "$HELP_COLOR_PREFIX" "$HELP_COLOR_RESET")")
@@ -208,7 +246,6 @@ submenu_iosxe(){
 # ---------- Utilities submenu ----------
 submenu_utilities(){
   local SUB_TITLE="Utilities"
-
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
   while true; do
@@ -217,39 +254,34 @@ submenu_utilities(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # 1) Switch UP/Down Status (ping monitor)
     local lbl1="Switch UP/Down Status"
-    local path1="/root/.hybrid_admin/ping.sh"
+    local path1="/root/.cloud_admin/ping.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Continuous ping monitor for selected switches (UP/DOWN).")")
     PATH_BY_TAG["$i"]="$path1"
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # 2) IOS-XE Image Management
     local lbl2="IOS-XE Image Management"
-    local path2="/root/.hybrid_admin/image_management.sh"
+    local path2="/root/.cloud_admin/image_management.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
     PATH_BY_TAG["$i"]="$path2"
     LABEL_BY_TAG["$i"]="$lbl2"
     ((i++))
 
-    # 3) CLI Updater
     local lbl3="CLI Updater"
-    local path3="/root/.hybrid_admin/cli_updater.sh"
+    local path3="/root/.cloud_admin/cli_updater.sh"
     MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
     PATH_BY_TAG["$i"]="$path3"
     LABEL_BY_TAG["$i"]="$lbl3"
     ((i++))
 
-    # 4) Backup Config Viewer
     local lbl4="Backup Config Viewer"
-    local path4="/root/.hybrid_admin/back_config_viewer.sh"
+    local path4="/root/.cloud_admin/back_config_viewer.sh"
     MENU_ITEMS+=("$i" "$lbl4" "$(color_help "Browse and search saved switch backup configs.")")
     PATH_BY_TAG["$i"]="$path4"
     LABEL_BY_TAG["$i"]="$lbl4"
     ((i++))
 
-    # Back
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
 
     local CHOICE=$(
@@ -269,7 +301,6 @@ submenu_utilities(){
 # ---------- Server Service Control submenu ----------
 submenu_server_services(){
   local SUB_TITLE="Server Service Control"
-
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
 
   while true; do
@@ -278,15 +309,22 @@ submenu_server_services(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # Option 1: manage services
     local lbl1="Manage CMDS Services"
-    local path1="/root/.hybrid_admin/service_control.sh"
+    local path1="/root/.server_admin/service_control.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Start/stop/restart CMDS services via dialog.")")
     PATH_BY_TAG["$i"]="$path1"
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # Option 2: reboot server
+    if [[ -f /etc/kea/kea-dhcp4.conf ]]; then
+      local lbl_dhcp="DHCP Administration"
+      local path_dhcp="/root/.server_admin/dhcp_admin.sh"
+      MENU_ITEMS+=("$i" "$lbl_dhcp" "$(color_help "Administer Kea DHCP configuration and leases.")")
+      PATH_BY_TAG["$i"]="$path_dhcp"
+      LABEL_BY_TAG["$i"]="$lbl_dhcp"
+      ((i++))
+    fi
+
     local lbl2="Reboot Server"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Safely reboot this server (confirmation required).")")
     PATH_BY_TAG["$i"]=""
@@ -304,29 +342,31 @@ submenu_server_services(){
         3>&1 1>&2 2>&3
     ) || return 0
 
-    case "$CHOICE" in
-      0) return 0 ;;
-      1) run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}" ;;
-      2)
-        if [[ $EUID -ne 0 ]]; then
-          dialog --no-shadow --backtitle "$BACKTITLE" --title "Permission required" \
-                 --msgbox "Reboot requires root privileges." 7 60
-          continue
-        fi
-        dialog --no-shadow --backtitle "$BACKTITLE" --title "Confirm Reboot" --yesno \
+    [[ "$CHOICE" == "0" ]] && return 0
+
+    local label="${LABEL_BY_TAG[$CHOICE]}"
+
+    if [[ "$label" == "Reboot Server" ]]; then
+      if [[ $EUID -ne 0 ]]; then
+        dialog --no-shadow --backtitle "$BACKTITLE" --title "Permission required" \
+               --msgbox "Reboot requires root privileges." 7 60
+        continue
+      fi
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Confirm Reboot" --yesno \
 "Are you sure you want to reboot this server now?
 
 Active tasks or SSH sessions may be interrupted." 10 70
-        if (( $? == 0 )); then
-          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 3 seconds…" 5 40; sleep 1
-          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 2 seconds…" 5 40; sleep 1
-          dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 1 second…" 5 40; sleep 1
-          clear
-          systemctl reboot || reboot || shutdown -r now
-          exit 0
-        fi
-        ;;
-    esac
+      if (( $? == 0 )); then
+        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 3 seconds…" 5 40; sleep 1
+        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 2 seconds…" 5 40; sleep 1
+        dialog --no-shadow --title "Rebooting…" --infobox "Rebooting in 1 second…" 5 40; sleep 1
+        clear
+        systemctl reboot || reboot || shutdown -r now
+        exit 0
+      fi
+    else
+      run_target "${PATH_BY_TAG[$CHOICE]}" "$label"
+    fi
   done
 }
 
@@ -350,7 +390,7 @@ while true; do
     dialog --no-shadow --colors --item-help \
       --backtitle "$BACKTITLE" \
       --title "$TITLE" \
-      --menu "Select an option:" 18 78 10 \
+      --menu "Select an option:" 22 78 10 \
       "${MENU_ITEMS[@]}" \
       3>&1 1>&2 2>&3
   ) || exit 0

@@ -1,0 +1,150 @@
+{
+  "meta": {
+    "source": "Meraki Documentation — Conversion from CLI-managed Catalyst (Cloud Config)",
+    "retrieved": "2025-01-01",
+    "notes": [
+      "Include both Meraki Cloud SKUs (-M) and corresponding standard Catalyst SKUs.",
+      "Minimum IOS-XE versions are required BEFORE enabling Cloud Management.",
+      "Update this file manually as Cisco expands Cloud-Managed support.",
+      "This file is the source of truth for minimum IOS-XE and required image train/type used by the firmware scanner + setup wizard."
+    ]
+  },
+
+  "image_trains": {
+    "UNIVERSAL": {
+      "train": "cat9k_iosxe",
+      "filename_regex": "^cat9k_iosxe.*\\.bin$"
+    },
+    "LITE": {
+      "train": "cat9k_lite_iosxe",
+      "filename_regex": "^cat9k_lite_iosxe.*\\.bin$"
+    }
+  },
+
+  "families": [
+
+    {
+      "family": "C9200L",
+      "min_iosxe": "17.15",
+      "image_type": "LITE",
+      "image_train": "cat9k_lite_iosxe",
+      "models": [
+        "C9200L-24T-4X",   "C9200L-24T-4X-M",
+        "C9200L-24P-4X",   "C9200L-24P-4X-M",
+        "C9200L-48T-4X",   "C9200L-48T-4X-M",
+        "C9200L-48P-4X",   "C9200L-48P-4X-M",
+        "C9200L-48PL-4X",  "C9200L-48PL-4X-M",
+        "C9200L-24PXG-4X", "C9200L-24PXG-4X-M",
+        "C9200L-48PXG-4X", "C9200L-48PXG-4X-M",
+        "C9200L-24UXG-2Y", "C9200L-24UXG-2Y-M",
+        "C9200L-48UXG-4X", "C9200L-48UXG-4X-M"
+      ]
+    },
+
+    {
+      "family": "C9300-M / C9300X-M / C9300L-M",
+      "min_iosxe": "17.15",
+      "image_type": "UNIVERSAL",
+      "image_train": "cat9k_iosxe",
+      "models": [
+        "C9300-24T",   "C9300-24T-M",
+        "C9300-24P",   "C9300-24P-M",
+        "C9300-24U",   "C9300-24U-M",
+        "C9300-24UX",  "C9300-24UX-M",
+        "C9300-48T",   "C9300-48T-M",
+        "C9300-48P",   "C9300-48P-M",
+        "C9300-48U",   "C9300-48U-M",
+        "C9300-48UXM", "C9300-48UXM-M",
+        "C9300-48UN",  "C9300-48UN-M",
+        "C9300-24S",   "C9300-24S-M",
+        "C9300-48S",   "C9300-48S-M",
+
+        "C9300X-12Y",     "C9300X-12Y-M",
+        "C9300X-24Y",     "C9300X-24Y-M",
+        "C9300X-48HXN",   "C9300X-48HXN-M",
+        "C9300X-24HX",    "C9300X-24HX-M",
+        "C9300X-48HX",    "C9300X-48HX-M",
+        "C9300X-48TX",    "C9300X-48TX-M",
+
+        "C9300L-24P-4X",   "C9300L-24P-4X-M",
+        "C9300L-24T-4X",   "C9300L-24T-4X-M",
+        "C9300L-24UXG-4X", "C9300L-24UXG-4X-M",
+        "C9300L-48P-4X",   "C9300L-48P-4X-M",
+        "C9300L-48PF-4X",  "C9300L-48PF-4X-M",
+        "C9300L-48T-4X",   "C9300L-48T-4X-M",
+        "C9300L-48UXG-4X", "C9300L-48UXG-4X-M"
+      ]
+    },
+
+    {
+      "family": "Remaining C9300 (non-M SKUs)",
+      "min_iosxe": "17.18",
+      "image_type": "UNIVERSAL",
+      "image_train": "cat9k_iosxe",
+      "models": [
+        "C9300-24UB",
+        "C9300-24UXB",
+        "C9300-48UB",
+        "C9300-24H",
+        "C9300-48H",
+        "C9300L-24T-4G",
+        "C9300L-48T-4G",
+        "C9300L-24P-4G",
+        "C9300L-48P-4G",
+        "C9300L-48PF-4G",
+        "C9300L-24UXG-2Q",
+        "C9300L-48UXG-2Q",
+        "C9300LM-48UX-4Y",
+        "C9300LM-48U-4Y",
+        "C9300LM-24U-4Y",
+        "C9300LM-48T-4Y"
+      ]
+    },
+
+    {
+      "family": "C9200",
+      "min_iosxe": "17.18",
+      "image_type": "LITE",
+      "image_train": "cat9k_lite_iosxe",
+      "models": [
+        "C9200-24T",
+        "C9200-24P",
+        "C9200-24PB",
+        "C9200-24PXG",
+        "C9200-48T",
+        "C9200-48P",
+        "C9200-48PL",
+        "C9200-48PB"
+      ]
+    },
+
+    {
+      "family": "C9200CX",
+      "min_iosxe": "17.18",
+      "image_type": "LITE",
+      "image_train": "cat9k_lite_iosxe",
+      "models": [
+        "C9200CX-12T-2X2G",
+        "C9200CX-12P-2X2G",
+        "C9200CX-8P-2X2G",
+        "C9200CX-8UXG-2X",
+        "C9200CX-12P-2XGH",
+        "C9200CX-8XGH-2XH"
+      ]
+    },
+
+    {
+      "family": "C9500H (High-performance w/ 100G Uplink)",
+      "min_iosxe": "17.15",
+      "image_type": "UNIVERSAL",
+      "image_train": "cat9k_iosxe",
+      "models": [
+        "C9500-48Y4C",
+        "C9500-24Y4C",
+        "C9500-32C",
+        "C9500-32QC"
+      ]
+    }
+
+  ]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# clean_rel_dir.sh — CMDS cleanup for migration artifacts
+# clean_rel_dir.sh — CMDS cleanup for migration/preflight artifacts
 # Usage: ./clean_rel_dir.sh [TARGET_DIR]   (default = .)
 
 set -euo pipefail
@@ -13,12 +13,21 @@ if ! command -v dialog >/dev/null 2>&1; then
 fi
 
 # Collect files (non-recursive; just the target directory)
+# NOTE: protect the "bible" manifest from deletion
 mapfile -d '' FILES < <(find "$TARGET_DIR" -maxdepth 1 -type f \
-  \( -name '*.csv' -o -name '*.env' -o -name '*.json' -o -name '*.flag' \) -print0)
+  \( -name '*.csv' -o -name '*.env' -o -name '*.json' -o -name '*.flag' \) \
+  ! -name 'cloud_models.json' \
+  -print0)
 
 # Also remove the meraki_claim.log symlink if present
 if [[ -L "$TARGET_DIR/meraki_claim.log" ]]; then
   FILES+=("$TARGET_DIR/meraki_claim.log")
+fi
+
+# Also remove preflight.ok so the main menu "Validate IOS-XE configuration"
+# checkmark is cleared for the next batch.
+if [[ -e "$TARGET_DIR/preflight.ok" ]]; then
+  FILES+=("$TARGET_DIR/preflight.ok")
 fi
 
 TOTAL="${#FILES[@]}"
@@ -26,20 +35,22 @@ if (( TOTAL == 0 )); then
   dialog --no-shadow --title "Cleanup" --msgbox \
 "Nothing to clean.
 
-No .csv/.env/.json files or Meraki claim log symlink were found in:
-$(readlink -f "$TARGET_DIR")" 10 70
+No .csv/.env/.json/.flag files, Meraki claim log symlink,
+or preflight.ok were found in:
+$(readlink -f "$TARGET_DIR")" 11 76
   clear
   exit 0
 fi
 
 # High-level confirmation (no file list)
 dialog --no-shadow --title "Prepare for next migration" --yesno \
-"This will clean up CMDS migration artifacts in:
+"This will clean up CMDS migration and preflight artifacts in:
 
 $(readlink -f "$TARGET_DIR")
 
 • Remove previous migration result/working files
 • Remove Meraki claim log symlink (if present)
+• Remove preflight.ok (clears preflight \"ready\" status)
 • Free up space and reset state
 
 Use this when you are finished with one batch of switches
@@ -48,7 +59,7 @@ and want to prepare the system for the NEXT migration.
 After cleanup, please run the Setup Wizard again
 before starting another migration.
 
-Do you want to continue?" 18 74
+Do you want to continue?" 20 74
 resp=$?
 clear
 if (( resp != 0 )); then
@@ -137,14 +148,14 @@ hr() {
 dialog --no-shadow --title "Configuration cleanup complete" --msgbox \
 "Cleanup finished successfully.
 
-Stale migration artifacts removed: $deleted
+Stale migration/preflight artifacts removed: $deleted
 Approximate space reclaimed: $(hr "$freed")
 
 System is now ready for the NEXT set of switches.
 
 IMPORTANT:
 Please run the Setup Wizard again before starting
-another migration batch." 15 74 || true
+another migration batch." 16 74 || true
 
 clear
 exit 0

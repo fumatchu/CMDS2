@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # upgrade_iosxe_safe.sh — parallel, dialog-safe.
-# Steps: PRECHECK → TFTP backup → install remove inactive → HTTP image fetch to flash → INSTALL.
-# Parallelization: auto-adjusted by latency (default 5; drop to 3 if any target avg RTT > 10ms).
+# Steps: PRECHECK → firmware rules check → TFTP backup → install remove inactive → HTTP image fetch to flash → INSTALL.
+# Policy: Enforce firmware rules (cloud_models.json). If required image missing / cannot meet min, SKIP device + log why.
+# Do NOT stop overall process.
 
 set -uo pipefail
 
@@ -17,6 +18,14 @@ command -v dialog  >/dev/null 2>&1 || true
 
 BASE_ENV="$SCRIPT_DIR/meraki_discovery.env"
 SEL_ENV="${1:-$SCRIPT_DIR/selected_upgrade.env}"
+DISC_JSON="$SCRIPT_DIR/discovery_results.json"
+
+# Firmware rules/manifest (source of truth)
+CLOUD_MODELS_JSON_DEFAULT="$SCRIPT_DIR/cloud_models.json"
+CLOUD_MODELS_JSON="${CLOUD_MODELS_JSON:-$CLOUD_MODELS_JSON_DEFAULT}"
+
+# Local directory that backs HTTP downloads (for percent fallback via stat)
+FIRMWARE_LOCAL_DIR="${FIRMWARE_LOCAL_DIR:-/var/lib/tftpboot/images}"
 
 err_box(){
   if command -v dialog >/dev/null 2>&1; then
@@ -29,6 +38,7 @@ err_box(){
 
 [[ -f "$BASE_ENV" ]] || { err_box "meraki_discovery.env not found. Run the Setup Wizard first."; exit 1; }
 [[ -f "$SEL_ENV"  ]] || { err_box "selected_upgrade.env not found. Run Discovery & Selection first."; exit 1; }
+[[ -f "$CLOUD_MODELS_JSON" ]] || { err_box "Firmware rules file not found: $CLOUD_MODELS_JSON\n(Set CLOUD_MODELS_JSON=/path/to/cloud_models.json)"; exit 1; }
 
 # Avoid history expansion on !
 set +H
@@ -52,14 +62,45 @@ if [[ -z "${SSH_KEY_PATH:-}" && -n "$SSH_PASSWORD" ]] && ! command -v sshpass >/
   exit 1
 fi
 
+# ───────────────── TARGET SELECTION (with discovery gating) ─────────────────
 TARGETS=()
+
 if [[ -n "$UPGRADE_SELECTED_IPS" ]]; then
   read -r -a TARGETS <<< "$UPGRADE_SELECTED_IPS"
 elif [[ -n "$UPGRADE_SELECTED_JSON" && -f "$UPGRADE_SELECTED_JSON" ]]; then
   mapfile -t TARGETS < <(jq -r '.[].ip' "$UPGRADE_SELECTED_JSON" | awk 'NF')
 fi
+
+if [[ -s "$DISC_JSON" && ${#TARGETS[@]} -gt 0 ]]; then
+  declare -A DISC_SSH DISC_LOGIN DISC_BL
+
+  while IFS=$'\t' read -r ip ssh login bl; do
+    DISC_SSH["$ip"]="$ssh"
+    DISC_LOGIN["$ip"]="$login"
+    DISC_BL["$ip"]="$bl"
+  done < <(jq -r '.[] |
+                 [
+                   .ip,
+                   (.ssh // false),
+                   (.login // false),
+                   (.blacklisted // false)
+                 ] | @tsv' "$DISC_JSON")
+
+  filtered=()
+  for ip in "${TARGETS[@]}"; do
+    if [[ -n "${DISC_SSH[$ip]+x}" ]]; then
+      if [[ "${DISC_SSH[$ip]}" == "true" && \
+            "${DISC_LOGIN[$ip]}" == "true" && \
+            "${DISC_BL[$ip]}" != "true" ]]; then
+        filtered+=("$ip")
+      fi
+    fi
+  done
+  TARGETS=("${filtered[@]}")
+fi
+
 TOTAL=${#TARGETS[@]}
-(( TOTAL > 0 )) || { err_box "No targets to run."; exit 1; }
+(( TOTAL > 0 )) || { err_box "No eligible targets to run (all filtered by discovery_results.json or none selected)."; exit 1; }
 
 detect_server_ip(){
   local ip=""
@@ -83,32 +124,24 @@ STATUS_FILE="$RUN_DIR/ui.status"; : > "$STATUS_FILE"
 SUMMARY_CSV="$RUN_DIR/summary.csv"; echo "ip,hostname,mode,confreg,precheck,result" > "$SUMMARY_CSV"
 ACTIONS_CSV="$RUN_DIR/actions.csv"; echo "ip,hostname,action,result,detail" > "$ACTIONS_CSV"
 
-# ----- CSV helpers with simple file locks -----
-add_action(){ # $1: line
-  { flock -x 200; echo "$1" >> "$ACTIONS_CSV"; } 200>"$ACTIONS_CSV.lock"
-}
-add_summary(){ # $1: line
-  { flock -x 201; echo "$1" >> "$SUMMARY_CSV"; } 201>"$SUMMARY_CSV.lock"
-}
+add_action(){ { flock -x 200; echo "$1" >> "$ACTIONS_CSV"; } 200>"$ACTIONS_CSV.lock"; }
+add_summary(){ { flock -x 201; echo "$1" >> "$SUMMARY_CSV"; } 201>"$SUMMARY_CSV.lock"; }
 
-# ===== Dialog UI (top/left margins so backtitle bar is visible) =====
+# ===== Dialog UI =====
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 PROG_PIPE=""; PROG_FD=""; DIALOG_PID=""
 UI_EXIT_HOLD_SEC="${UI_EXIT_HOLD_SEC:-4}"
-# Auto-concurrency defaults; can be overridden via env
 LOW_LATENCY_CONCURRENCY="${LOW_LATENCY_CONCURRENCY:-5}"
 HIGH_LATENCY_CONCURRENCY="${HIGH_LATENCY_CONCURRENCY:-3}"
 LATENCY_RTT_MS_THRESHOLD="${LATENCY_RTT_MS_THRESHOLD:-10}"
 AUTO_ADJUST_CONCURRENCY="${AUTO_ADJUST_CONCURRENCY:-1}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-$LOW_LATENCY_CONCURRENCY}"
-SPLAY_MS="${SPLAY_MS:-150}"   # tiny stagger between spawns to avoid thundering herd
-
-MAIN_PID=$$  # guard UI teardown to only main process
+SPLAY_MS="${SPLAY_MS:-150}"
+MAIN_PID=$$
 
 ui_calc(){
   local L=24 C=80
   read -r L C < <(stty size 2>/dev/null || echo "24 80")
-
   ((L<18))&&L=18
   ((C<80))&&C=80
 
@@ -116,14 +149,10 @@ ui_calc(){
   LEFT_MARGIN=${UI_LEFT_MARGIN:-2}
 
   GAUGE_H=6
-
-  # Make room for both widgets + a spacer line
   TAIL_H=$(( L - TOP_MARGIN - GAUGE_H - 3 ))
   ((TAIL_H<10)) && TAIL_H=10
-
   TAIL_W=$(( C - LEFT_MARGIN - 2 ))
   ((TAIL_W<70)) && TAIL_W=70
-
   GAUGE_ROW=$(( TOP_MARGIN + TAIL_H + 1 ))
   GAUGE_COL=$LEFT_MARGIN
 }
@@ -166,16 +195,12 @@ ui_stop(){
 ui_hold_end(){ (( DIALOG )) && (( UI_EXIT_HOLD_SEC>0 )) && { gauge 100 "Done. Closing in ${UI_EXIT_HOLD_SEC}s…"; sleep "$UI_EXIT_HOLD_SEC"; }; }
 trap 'ui_stop' EXIT
 
-# ===== Adaptive concurrency: ping each target; if any avg RTT > threshold → use HIGH latency limit =====
+# ===== Adaptive concurrency =====
 avg_rtt_ms_for_ip(){
-  # returns AVG RTT in ms (float) from 5 pings, or empty if unknown
   local ip="$1" avg=""
-  # -n numeric, -c 5 pings, -i 0.2s interval, -w 8s overall deadline
-  avg="$(ping -n -c 5 -i 0.2 -w 8 "$ip" 2>/dev/null | \
-         awk -F'/' '/rtt min\/avg\/max\/mdev/ {print $5}')"
+  avg="$(ping -n -c 5 -i 0.2 -w 8 "$ip" 2>/dev/null | awk -F'/' '/rtt min\/avg\/max\/mdev/ {print $5}')"
   [[ -n "$avg" ]] && printf '%s\n' "$avg" || echo ""
 }
-
 assess_latency_and_set_concurrency(){
   [[ "$AUTO_ADJUST_CONCURRENCY" == "1" ]] || { log "Auto-concurrency: disabled. Using MAX_CONCURRENCY=${MAX_CONCURRENCY}"; return; }
 
@@ -204,6 +229,7 @@ assess_latency_and_set_concurrency(){
     log "Auto-concurrency: all within threshold → using MAX_CONCURRENCY=${MAX_CONCURRENCY}"
   fi
 }
+
 # ===== SSH builder =====
 build_ssh_arr(){
   local ip="$1"
@@ -219,7 +245,6 @@ build_ssh_arr(){
   fi
 }
 
-# ---- Check privilege level (15 means we're already enabled) ----
 is_priv15_for_ip() {
   local ip="$1" raw out ok=1
   build_ssh_arr "$ip"
@@ -237,7 +262,6 @@ is_priv15_for_ip() {
   return $ok
 }
 
-# ---- Elevate only when needed ----
 emit_enable(){
   printf 'enable\r\n'
   sleep 0.2
@@ -250,7 +274,7 @@ emit_enable(){
   sleep 0.2
 }
 
-# ====== model / family helpers ======
+# ===== model helpers =====
 _extract_model_from_showver() {
   awk '
     BEGIN{IGNORECASE=1}
@@ -259,96 +283,99 @@ _extract_model_from_showver() {
     $0 ~ /^[[:space:]]*cisco[[:space:]]+C[0-9]+/                        {for(i=1;i<=NF;i++) if($i ~ /^C[0-9]+/) {print $i; exit}}
   ' | sed -E 's/[^A-Za-z0-9-].*$//'
 }
-_model_to_img_family() {
-  case "${1^^}" in
-    C9200* ) echo "LITE" ;;
-    *      ) echo "UNIVERSAL" ;;
-  esac
+
+# ===== Version compare (x.y.z) =====
+shortver_from_string(){ awk 'match($0,/[0-9]+\.[0-9]+\.[0-9]+/){print substr($0,RSTART,RLENGTH)}'; }
+ver_ge(){ # a >= b
+  awk -v A="$1" -v B="$2" '
+    function n(x){return (x==""?0:x)+0}
+    BEGIN{
+      split(A,a,"."); split(B,b,".");
+      for(i=1;i<=4;i++){
+        ai=n(a[i]); bi=n(b[i]);
+        if(ai>bi){exit 0}
+        if(ai<bi){exit 1}
+      }
+      exit 0
+    }'
 }
-_file_to_img_family() {
-  local b
-  b="$(basename -- "$1" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-  if   [[ "$b" =~ ^cat9k_lite_iosxe.*\.bin$ ]]; then echo "LITE"
-  elif [[ "$b" =~ ^cat9k_iosxe.*\.bin$       ]]; then echo "UNIVERSAL"
-  else echo "UNKNOWN"
-  fi
+
+# ===== Rules lookup (cloud_models.json) =====
+rules_for_model(){
+  # outputs: image_type|min_iosxe|image_train|family_name
+  local model="$1"
+  jq -r --arg m "$model" '
+    .families[]
+    | select(.models[]? == $m)
+    | [.image_type, .min_iosxe, (.image_train // ""), (.family // "")]
+    | @tsv
+  ' "$CLOUD_MODELS_JSON" | head -n1
 }
 
-# ===== helpers =====
-get_plan_field(){ local ip="$1" key="$2"; [[ -n "$UPGRADE_SELECTED_JSON" && -s "$UPGRADE_SELECTED_JSON" ]] || return 1; jq -r --arg ip "$ip" --arg k "$key" '.[] | select(.ip==$ip) | .[$k] // empty' "$UPGRADE_SELECTED_JSON"; }
-
-# Choose image matching device family (unless JSON explicitly set file)
-resolve_image_for_ip(){
-  local ip="$1" file="" size=""
-
-  if [[ -s "${UPGRADE_SELECTED_JSON:-}" ]]; then
-    file="$(get_plan_field "$ip" "target_file")"
-    size="$(get_plan_field "$ip" "target_size_bytes")"
-    if [[ -n "$file" ]]; then echo "${file}|${size}"; return; fi
-  fi
-
-  local fam="UNIVERSAL"
-  [[ -f "$RUN_DIR/imgfam.$ip" ]] && fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
-
-  if [[ "$fam" == "LITE" ]]; then
-    if [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
-      echo "${FW_CAT9K_LITE_FILE}|${FW_CAT9K_LITE_SIZE_BYTES:-}"; return
-    fi
-    if [[ -n "${FW_CAT9K_FILE:-}" ]]; then
-      log "[${ip}] WARN: LITE image not provided; falling back to UNIVERSAL."
-      echo "${FW_CAT9K_FILE}|${FW_CAT9K_SIZE_BYTES:-}"; return
+# ===== Firmware files from env (lists supported) =====
+get_files_for_type(){
+  local t="$1"
+  if [[ "$t" == "LITE" ]]; then
+    if [[ -n "${FW_CAT9K_LITE_FILES:-}" ]]; then
+      echo "$FW_CAT9K_LITE_FILES"
+    elif [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
+      echo "$FW_CAT9K_LITE_FILE"
+    else
+      echo ""
     fi
   else
-    if [[ -n "${FW_CAT9K_FILE:-}" ]]; then
-      echo "${FW_CAT9K_FILE}|${FW_CAT9K_SIZE_BYTES:-}"; return
-    fi
-    if [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
-      log "[${ip}] WARN: UNIVERSAL image not provided; falling back to LITE."
-      echo "${FW_CAT9K_LITE_FILE}|${FW_CAT9K_LITE_SIZE_BYTES:-}"; return
+    if [[ -n "${FW_CAT9K_FILES:-}" ]]; then
+      echo "$FW_CAT9K_FILES"
+    elif [[ -n "${FW_CAT9K_FILE:-}" ]]; then
+      echo "$FW_CAT9K_FILE"
+    else
+      echo ""
     fi
   fi
+}
 
-  echo "|"
+local_file_size_bytes(){
+  local base="$1"
+  local p="${FIRMWARE_LOCAL_DIR%/}/${base}"
+  [[ -f "$p" ]] || { echo ""; return 1; }
+  stat -c '%s' "$p" 2>/dev/null || echo ""
+}
+
+pick_best_file_meeting_min(){
+  local type="$1" min="$2"
+  local raw best="" bestv=""
+  raw="$(get_files_for_type "$type")"
+  [[ -n "$raw" ]] || { echo ""; return 1; }
+
+  # split on spaces
+  # shellcheck disable=SC2206
+  local files=( $raw )
+
+  for f in "${files[@]}"; do
+    local v; v="$(printf '%s\n' "$f" | shortver_from_string)"
+    [[ -n "$v" ]] || continue
+    if ver_ge "$v" "$min"; then
+      if [[ -z "$best" ]]; then
+        best="$f"; bestv="$v"
+      else
+        if ver_ge "$v" "$bestv"; then
+          best="$f"; bestv="$v"
+        fi
+      fi
+    fi
+  done
+
+  [[ -n "$best" ]] && echo "$best" || echo ""
 }
 
 fmt_bytes(){ awk -v b="${1:-0}" 'BEGIN{ if(b<1024)printf("%d B",b); else if(b<1048576)printf("%.1f KB",b/1024); else if(b<1073741824)printf("%.1f MB",b/1048576); else printf("%.2f GB",b/1073741824);}'; }
 flash_bytes_from_capture(){ local outfile="$1" base="$2"; awk -v f="$base" 'BEGIN{mx=-1;seen=0} index($0,f){seen=1;for(i=1;i<=NF;i++) if($i~/^[0-9]+$/){n=$i+0;if(n>mx)mx=n}} END{if(seen&&mx>=0)print mx}' "$outfile"; }
 flash_size_from(){ flash_bytes_from_capture "$@"; }
-shortver_from_string(){ awk 'match($0,/[0-9]+\.[0-9]+\.[0-9]+/){print substr($0,RSTART,RLENGTH)}'; }
 
-installed_short_version_for_ip(){
-  local ip="$1" raw norm v="" need_en=0
-  build_ssh_arr "$ip"; raw="$(mktemp)"; norm="$(mktemp)"
-  is_priv15_for_ip "$ip" || need_en=1
-  {
-    printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    (( need_en )) && emit_enable
-    printf 'show install summary\r\n'
-    printf 'exit\r\n'
-  } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
-  tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
-  v="$(awk 'BEGIN{IGNORECASE=1}/^IMG[[:space:]]+C[[:space:]]+/{print $NF; exit}' "$norm")"
-  [[ -z "$v" ]] && v="$(awk 'BEGIN{IGNORECASE=1}/^IMG[[:space:]]+U[[:space:]]+/{print $NF; exit}' "$norm")"
-  v="$(printf '%s\n' "$v" | shortver_from_string)"; rm -f "$raw" "$norm"; printf '%s' "$v"
-}
+# ===== plan helper =====
+get_plan_field(){ local ip="$1" key="$2"; [[ -n "$UPGRADE_SELECTED_JSON" && -s "$UPGRADE_SELECTED_JSON" ]] || return 1; jq -r --arg ip "$ip" --arg k "$key" '.[] | select(.ip==$ip) | .[$k] // empty' "$UPGRADE_SELECTED_JSON"; }
 
-skip_if_same_version_for_ip(){
-  local ip="$1" file size base target_short inst_short host
-  host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
-  IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
-  [[ -z "$file" ]] && { log "[${ip}] VERSION: no target image defined — cannot compare"; return 1; }
-  base="$(basename -- "$file")"; target_short="$(printf '%s\n' "$base" | shortver_from_string)"
-  [[ -z "$target_short" ]] && { log "[${ip}] VERSION: unable to parse target version from '$base'"; return 1; }
-  inst_short="$(installed_short_version_for_ip "$ip")"
-  if [[ -n "$inst_short" && "$inst_short" == "$target_short" ]]; then
-    log "[${ip}] VERSION: ${inst_short} already committed/active — SKIP copy/install"
-    add_action "$ip,${host},version_check,skip,same(${inst_short})"
-    return 0
-  fi
-  log "[${ip}] VERSION: target ${target_short}; installed ${inst_short:-unknown} — proceed"; return 1
-}
-
-# ===== PRECHECK (INSTALL mode only; confreg NOT gating) =====
+# ===== PRECHECK =====
 precheck_for_ip(){
   local ip="$1" raw out rc=0 need_en=0
   log "[${ip}] CONNECT…"; build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
@@ -362,44 +389,194 @@ precheck_for_ip(){
   } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || rc=$?
   tr -d '\r' < "$raw" > "$out"; cat "$out" >> "$RUN_DIR/devlogs/${ip}.session.log"
 
-  local hostname mode confreg model imgfam
+  local hostname mode confreg model
   hostname="$(awk '/^hostname[[:space:]]+/{print $2}' "$out" | tail -n1)"
   [[ -z "$hostname" ]] && hostname="$(grep -E '^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$' "$out" | tail -n1 | sed -E 's/[>#].*$//')"
   [[ -z "$hostname" ]] && hostname="$(awk '/ uptime is /{print $1; exit}' "$out")"
 
-  # INSTALL/BUNDLE mode
   mode="$(awk -F: 'BEGIN{IGNORECASE=1}/Running[[:space:]]+mode/{gsub(/^[ \t]+/,"",$2);print toupper($2);exit}' "$out")"
   [[ -z "$mode" ]] && mode="$(awk 'BEGIN{IGNORECASE=1;hdr=0}
     /^[[:space:]]*Switch[[:space:]]+Ports[[:space:]]+Model[[:space:]]+SW[[:space:]]+Version[[:space:]]+SW[[:space:]]+Image[[:space:]]+Mode/{hdr=1;next}
     hdr==1 && /^[[:space:]]*([*]|[0-9])/{m=toupper($NF);print m;exit}' "$out")"
   [[ -z "$mode" ]] && mode="$(grep -Eo '(INSTALL|BUNDLE)' "$out" | head -n1 | tr '[:lower:]' '[:upper:]')"
 
-  # Confreg (best-effort capture; NEVER gates success)
   confreg="$(grep -i 'Configuration register is' "$out" | tail -n1 | awk '{print $NF}' | tr 'A-Z' 'a-z' | tr -d '.,;')"
-
-  # model + image family
   model="$(_extract_model_from_showver < "$out")"
-  imgfam="$(_model_to_img_family "$model")"
-  echo "$model"  > "$RUN_DIR/model.$ip"
-  echo "$imgfam" > "$RUN_DIR/imgfam.$ip"
 
   local precheck="ok"; [[ "$mode" == "INSTALL" ]] || precheck="fail:mode"
 
   if [[ "$precheck" == "ok" ]]; then
-    log "[${ip}] PRECHECK OK (mode=${mode:-?}, model=${model:-?}, family=${imgfam}, confreg=${confreg:-n/a})"
+    log "[${ip}] PRECHECK OK (mode=${mode:-?}, model=${model:-?}, confreg=${confreg:-n/a})"
   else
-    log "[${ip}] PRECHECK FAIL (mode=${mode:-?}, model=${model:-?}, family=${imgfam}) => ${precheck}"
+    log "[${ip}] PRECHECK FAIL (mode=${mode:-?}, model=${model:-?}) => ${precheck}"
   fi
 
   echo "$hostname" > "$RUN_DIR/host.$ip"
   echo "$mode"     > "$RUN_DIR/mode.$ip"
   echo "$confreg"  > "$RUN_DIR/confreg.$ip"
+  echo "$model"    > "$RUN_DIR/model.$ip"
   echo "$precheck" > "$RUN_DIR/precheck.$ip"
   rm -f "$raw" "$out"
   [[ "$precheck" == "ok" ]]
 }
 
-# ===== TFTP backup (gated enable) =====
+# ===== Installed version =====
+installed_short_version_for_ip(){
+  local ip="$1" raw norm v="" need_en=0
+  build_ssh_arr "$ip"; raw="$(mktemp)"; norm="$(mktemp)"
+  is_priv15_for_ip "$ip" || need_en=1
+  {
+    printf '\r\nterminal length 0\r\nterminal width 511\r\n'
+    (( need_en )) && emit_enable
+    printf 'show install summary\r\n'
+    printf 'exit\r\n'
+  } | timeout -k 5s 60s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+  tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
+  v="$(awk 'BEGIN{IGNORECASE=1}/^IMG[[:space:]]+C[[:space:]]+/{print $NF; exit}' "$norm")"
+  [[ -z "$v" ]] && v="$(awk 'BEGIN{IGNORECASE=1}/^IMG[[:space:]]+U[[:space:]]+/{print $NF; exit}' "$norm")"
+  v="$(printf '%s\n' "$v" | shortver_from_string)"
+  rm -f "$raw" "$norm"
+  printf '%s' "$v"
+}
+
+# ===== Firmware rules check (sets req_type/min + eligible target_file) =====
+firmware_check_for_ip(){
+  local ip="$1" host model
+  host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
+  model="$(cat "$RUN_DIR/model.$ip" 2>/dev/null || true)"
+
+  [[ -n "$model" ]] || {
+    log "[${ip}] FIRMWARE: SKIP — could not determine model"
+    add_action "$ip,${host},firmware,skipped,no_model"
+    echo "skip" > "$RUN_DIR/firmware_ok.$ip"
+    return 1
+  }
+
+  local r; r="$(rules_for_model "$model")"
+  if [[ -z "$r" ]]; then
+    log "[${ip}] FIRMWARE: SKIP — model ${model} not found in rules file"
+    add_action "$ip,${host},firmware,skipped,model_not_in_rules(${model})"
+    echo "skip" > "$RUN_DIR/firmware_ok.$ip"
+    return 1
+  fi
+
+  local req_type req_min req_train famname
+  req_type="$(cut -f1 <<<"$r")"
+  req_min="$(cut -f2 <<<"$r")"
+  req_train="$(cut -f3 <<<"$r")"
+  famname="$(cut -f4 <<<"$r")"
+  echo "$req_type" > "$RUN_DIR/req_type.$ip"
+  echo "$req_min"  > "$RUN_DIR/req_min.$ip"
+  echo "$req_train" > "$RUN_DIR/req_train.$ip"
+  echo "$famname" > "$RUN_DIR/req_family.$ip"
+
+  # If the device is already >= min, we still allow "same version skip" later; this check is about availability + correctness.
+  local installed; installed="$(installed_short_version_for_ip "$ip")"
+
+  # If selection JSON pins a file, allow it (later steps will ensure file exists/copy/install).
+  local pinned=""; pinned="$(get_plan_field "$ip" "target_file" 2>/dev/null || true)"
+  if [[ -n "$pinned" ]]; then
+    log "[${ip}] FIRMWARE: OK — pinned file in plan for ${model} (min_iosxe=${req_min}, type=${req_type})"
+    add_action "$ip,${host},firmware,ok,pinned_file"
+    echo "ok" > "$RUN_DIR/firmware_ok.$ip"
+    return 0
+  fi
+
+  # Otherwise choose the best file meeting min from selected/env lists
+  local best; best="$(pick_best_file_meeting_min "$req_type" "$req_min" || true)"
+  if [[ -z "$best" ]]; then
+    log "[${ip}] FIRMWARE: SKIP — ${model} requires ${req_type}; min_iosxe=${req_min} (train=${req_train}); no selected file meets minimum"
+    add_action "$ip,${host},firmware,skipped,missing_required(${req_type}>=${req_min})"
+    echo "skip" > "$RUN_DIR/firmware_ok.$ip"
+    return 1
+  fi
+
+  # Determine size (from env if it matches the best file, otherwise stat)
+  local best_base best_sz=""
+  best_base="$(basename -- "$best")"
+
+  # Try to use already-exported SIZE_BYTES if best matches the primary selections
+  if [[ "${req_type}" == "UNIVERSAL" && "${FW_CAT9K_FILE:-}" == "$best_base" && -n "${FW_CAT9K_SIZE_BYTES:-}" ]]; then
+    best_sz="${FW_CAT9K_SIZE_BYTES}"
+  elif [[ "${req_type}" == "LITE" && "${FW_CAT9K_LITE_FILE:-}" == "$best_base" && -n "${FW_CAT9K_LITE_SIZE_BYTES:-}" ]]; then
+    best_sz="${FW_CAT9K_LITE_SIZE_BYTES}"
+  else
+    best_sz="$(local_file_size_bytes "$best_base" || true)"
+  fi
+
+  # Record chosen file+size for downstream steps
+  echo "$best_base" > "$RUN_DIR/chosen_file.$ip"
+  echo "$best_sz"   > "$RUN_DIR/chosen_size.$ip"
+
+  log "[${ip}] FIRMWARE: OK — PID=${model} requires ${req_type}; min_iosxe=${req_min} (train=${req_train}); selected=${best_base}; installed=${installed:-unknown}"
+  add_action "$ip,${host},firmware,ok,selected(${best_base})"
+  echo "ok" > "$RUN_DIR/firmware_ok.$ip"
+  return 0
+}
+
+# ===== Resolve image for ip (uses pinned plan OR chosen_file OR legacy env fallback) =====
+resolve_image_for_ip(){
+  local ip="$1" file="" size="" base=""
+
+  # Pinned in plan
+  if [[ -s "${UPGRADE_SELECTED_JSON:-}" ]]; then
+    file="$(get_plan_field "$ip" "target_file")"
+    size="$(get_plan_field "$ip" "target_size_bytes")"
+    if [[ -n "$file" ]]; then
+      base="$(basename -- "$file")"
+      [[ -n "$size" ]] || size="$(local_file_size_bytes "$base" || true)"
+      echo "${file}|${size}"
+      return
+    fi
+  fi
+
+  # Chosen by firmware check
+  if [[ -f "$RUN_DIR/chosen_file.$ip" ]]; then
+    base="$(cat "$RUN_DIR/chosen_file.$ip" 2>/dev/null || true)"
+    size="$(cat "$RUN_DIR/chosen_size.$ip" 2>/dev/null || true)"
+    [[ -n "$size" ]] || size="$(local_file_size_bytes "$base" || true)"
+    echo "${base}|${size}"
+    return
+  fi
+
+  # Legacy fallback (should rarely happen if firmware_check runs)
+  local req_type=""
+  req_type="$(cat "$RUN_DIR/req_type.$ip" 2>/dev/null || echo "")"
+  if [[ "$req_type" == "LITE" ]]; then
+    if [[ -n "${FW_CAT9K_LITE_FILE:-}" ]]; then
+      echo "${FW_CAT9K_LITE_FILE}|${FW_CAT9K_LITE_SIZE_BYTES:-}"
+      return
+    fi
+  else
+    if [[ -n "${FW_CAT9K_FILE:-}" ]]; then
+      echo "${FW_CAT9K_FILE}|${FW_CAT9K_SIZE_BYTES:-}"
+      return
+    fi
+  fi
+
+  echo "|"
+}
+
+# ===== Skip if same version already committed =====
+skip_if_same_version_for_ip(){
+  local ip="$1" file size base target_short inst_short host
+  host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
+  IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
+  [[ -z "$file" ]] && { log "[${ip}] VERSION: no target image defined — cannot compare"; return 1; }
+  base="$(basename -- "$file")"
+  target_short="$(printf '%s\n' "$base" | shortver_from_string)"
+  [[ -z "$target_short" ]] && { log "[${ip}] VERSION: unable to parse target version from '$base'"; return 1; }
+  inst_short="$(installed_short_version_for_ip "$ip")"
+  if [[ -n "$inst_short" && "$inst_short" == "$target_short" ]]; then
+    log "[${ip}] VERSION: ${inst_short} already committed/active — SKIP copy/install"
+    add_action "$ip,${host},version_check,skip,same(${inst_short})"
+    return 0
+  fi
+  log "[${ip}] VERSION: target ${target_short}; installed ${inst_short:-unknown} — proceed"
+  return 1
+}
+
+# ===== TFTP backup =====
 backup_for_ip(){
   local ip="$1" hn ts url raw rc=0 need_en=0
   hn="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"; [[ -n "$hn" ]] || hn="sw-${ip//./-}"
@@ -422,7 +599,7 @@ backup_for_ip(){
   mv -f "$raw" "$RUN_DIR/${ip}.backup.out"; return 1
 }
 
-# ===== Clean inactive (gated enable; stream & wait; auto-confirm y/n) =====
+# ===== Clean inactive =====
 clean_inactive_for_ip(){
   local ip="$1" host need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
@@ -486,23 +663,23 @@ clean_inactive_for_ip(){
   esac
 }
 
-# ===== HTTP fetch (gated enable everywhere) =====
+# ===== HTTP fetch (with percentage) =====
 http_fetch_image_for_ip(){
   local ip="$1" host file size url base
   local pre_raw pre_norm existing_bytes="" rc=0 need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
-  if [[ -z "$file" ]]; then log "[${ip}] HTTP: no target image defined."; add_action "$ip,${host},http_copy,skipped,no_image"; return 1; fi
-  base="$(basename -- "$file")"; url="${FIRMWARE_HTTP_BASE%/}/${base}"
+  if [[ -z "$file" ]]; then
+    log "[${ip}] HTTP: no target image defined."
+    add_action "$ip,${host},http_copy,skipped,no_image"
+    return 1
+  fi
+  base="$(basename -- "$file")"
+  url="${FIRMWARE_HTTP_BASE%/}/${base}"
 
-  # Guard: image family must match device family
-  local fam filefam
-  fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
-  filefam="$(_file_to_img_family "$base")"
-  if [[ "$filefam" != "UNKNOWN" && "$filefam" != "$fam" ]]; then
-    log "[${ip}] HTTP_COPY: SKIP — image family mismatch (device ${fam}, file ${filefam})"
-    add_action "$ip,${host},http_copy,skipped,family_mismatch(${fam}!=${filefam})"
-    return 2
+  # If size missing, try local stat for percent
+  if [[ -z "${size:-}" || ! "${size:-}" =~ ^[0-9]+$ ]]; then
+    size="$(local_file_size_bytes "$base" || true)"
   fi
 
   # Check existing
@@ -517,7 +694,9 @@ http_fetch_image_for_ip(){
   tr -d '\r' < "$pre_raw" > "$pre_norm"
   existing_bytes="$(flash_size_from "$pre_norm" "$base")"; rm -f "$pre_raw" "$pre_norm"
   if [[ -n "$size" && -n "$existing_bytes" && "$existing_bytes" == "$size" && "${HTTP_FORCE_COPY:-0}" != "1" ]]; then
-    log "[${ip}] HTTP: file exists — SKIP (bytes=${existing_bytes})"; add_action "$ip,${host},http_copy,ok,already_present(${existing_bytes})"; return 0
+    log "[${ip}] HTTP: file exists — SKIP (bytes=${existing_bytes})"
+    add_action "$ip,${host},http_copy,ok,already_present(${existing_bytes})"
+    return 0
   fi
 
   log "[${ip}] HTTP: copying ${url} -> flash:${base}"
@@ -535,7 +714,7 @@ http_fetch_image_for_ip(){
     } | timeout -k 30s 7200s "${COPY_SSH[@]}"
   ) >"$copy_raw" 2>&1 & COPY_PID=$!
 
-  # progress poller
+  # progress poller with percent when total known
   build_ssh_arr "$ip"; local POLL_SSH=( "${SSH_CMD[@]}" )
   (
     local last="" cur="" total="${size:-}" pct poll="${HTTP_PROGRESS_POLL_SEC:-10}"
@@ -545,11 +724,19 @@ http_fetch_image_for_ip(){
         printf '\r\nterminal length 0\r\nterminal width 511\r\n'
         (( need_en )) && emit_enable
         printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-      } | timeout -k 5s 30s "${POLL_SSH[@]}" >"$p_raw" 2>&1 || true
-      tr -d '\r' < "$p_raw" > "$p_norm"; cur="$(flash_size_from "$p_norm" "$base")"; rm -f "$p_raw" "$p_norm"
+      } | timeout -k 5s 30s "${POLL_SSH[@]}" >"$p_raw" 2>/dev/null || true
+      tr -d '\r' < "$p_raw" > "$p_norm"
+      cur="$(flash_size_from "$p_norm" "$base")"
+      rm -f "$p_raw" "$p_norm"
+
       if [[ -n "$cur" && "$cur" != "$last" ]]; then
-        if [[ -n "$total" && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then pct=$((100*cur/total)); ((pct>99 && cur<total))&&pct=99; log "[${ip}] HTTP: progress $(fmt_bytes "$cur") / $(fmt_bytes "$total") (${pct}%)"
-        else log "[${ip}] HTTP: progress $(fmt_bytes "$cur")"; fi
+        if [[ -n "$total" && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then
+          pct=$((100*cur/total))
+          ((pct>99 && cur<total)) && pct=99
+          log "[${ip}] HTTP: progress $(fmt_bytes "$cur") / $(fmt_bytes "$total") (${pct}%)"
+        else
+          log "[${ip}] HTTP: progress $(fmt_bytes "$cur")"
+        fi
         last="$cur"
       else
         log "[${ip}] HTTP: copying… (checking again in ${poll}s)"
@@ -568,22 +755,29 @@ http_fetch_image_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$post_raw" 2>&1 || true
+  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$post_raw" 2>/dev/null || true
   tr -d '\r' < "$post_raw" > "$post_norm"; post_bytes="$(flash_size_from "$post_norm" "$base")"; rm -f "$post_raw" "$post_norm"
 
   if grep -qiE '(bytes copied|copied in [0-9.]+ sec|Copy complete|copied successfully|\[OK -[[:space:]]*[0-9]+[[:space:]]*bytes\])' "$copy_norm" || [[ -n "$post_bytes" ]]; then
     if [[ -n "$post_bytes" ]]; then
-      log "[${ip}] HTTP: OK (bytes=${post_bytes})"; add_action "$ip,${host},http_copy,ok,bytes=${post_bytes}"
+      log "[${ip}] HTTP: OK (bytes=${post_bytes})"
+      add_action "$ip,${host},http_copy,ok,bytes=${post_bytes}"
     else
-      log "[${ip}] HTTP: OK"; add_action "$ip,${host},http_copy,ok,"
+      log "[${ip}] HTTP: OK"
+      add_action "$ip,${host},http_copy,ok,"
     fi
-    rm -f "$copy_raw" "$copy_norm"; return 0
+    rm -f "$copy_raw" "$copy_norm"
+    return 0
   fi
-  log "[${ip}] HTTP: FAILED"; add_action "$ip,${host},http_copy,failed,"
-  mv -f "$copy_norm" "$RUN_DIR/${ip}.http_copy.out"; rm -f "$copy_raw"; return 1
+
+  log "[${ip}] HTTP: FAILED"
+  add_action "$ip,${host},http_copy,failed,"
+  mv -f "$copy_norm" "$RUN_DIR/${ip}.http_copy.out"
+  rm -f "$copy_raw"
+  return 1
 }
 
-# ===== write memory (gated enable) =====
+# ===== write memory =====
 write_memory_for_ip(){
   local ip="$1" raw norm need_en=0
   build_ssh_arr "$ip"; is_priv15_for_ip "$ip" || need_en=1
@@ -593,29 +787,28 @@ write_memory_for_ip(){
     (( need_en )) && emit_enable
     printf 'write memory\r\n'
     printf 'exit\r\n'
-  } | timeout -k 8s 120s "${SSH_CMD[@]}" >"$raw" 2>&1 || true
+  } | timeout -k 8s 120s "${SSH_CMD[@]}" >"$raw" 2>/dev/null || true
   tr -d '\r' < "$raw" > "$norm"; cat "$norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
-  if grep -qiE '(\[OK\]|Copy complete|bytes copied|copied successfully)' "$norm"; then log "[${ip}] WR: OK"; rm -f "$raw" "$norm"; return 0; fi
-  log "[${ip}] WR: ambiguous — proceeding"; mv -f "$norm" "$RUN_DIR/${ip}.write_memory.out"; rm -f "$raw"; return 1
+  if grep -qiE '(\[OK\]|Copy complete|bytes copied|copied successfully)' "$norm"; then
+    log "[${ip}] WR: OK"; rm -f "$raw" "$norm"; return 0
+  fi
+  log "[${ip}] WR: ambiguous — proceeding"
+  mv -f "$norm" "$RUN_DIR/${ip}.write_memory.out"
+  rm -f "$raw"
+  return 1
 }
 
-# ===== INSTALL (gated enable before checks and command) =====
+# ===== INSTALL =====
 install_activate_image_for_ip(){
   local ip="$1" host file size base need_en=0
   host="$(cat "$RUN_DIR/host.$ip" 2>/dev/null || true)"
   IFS='|' read -r file size <<<"$(resolve_image_for_ip "$ip")"
-  if [[ -z "$file" ]]; then log "[${ip}] INSTALL: no image defined — SKIP"; add_action "$ip,${host},install,skipped,no_image"; return 2; fi
-  base="$(basename -- "$file")"
-
-  # Guard: verify image family matches device family
-  local fam filefam
-  fam="$(cat "$RUN_DIR/imgfam.$ip" 2>/dev/null || echo UNIVERSAL)"
-  filefam="$(_file_to_img_family "$base")"
-  if [[ "$filefam" != "UNKNOWN" && "$filefam" != "$fam" ]]; then
-    log "[${ip}] INSTALL: SKIP — image family mismatch (device ${fam}, file ${filefam})"
-    add_action "$ip,${host},install,skipped,family_mismatch(${fam}!=${filefam})"
+  if [[ -z "$file" ]]; then
+    log "[${ip}] INSTALL: no image defined — SKIP"
+    add_action "$ip,${host},install,skipped,no_image"
     return 2
   fi
+  base="$(basename -- "$file")"
 
   # Ensure present
   build_ssh_arr "$ip"; local chk_raw chk_norm have=""; chk_raw="$(mktemp)"; chk_norm="$(mktemp)"
@@ -624,18 +817,31 @@ install_activate_image_for_ip(){
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
     printf 'dir flash: | include %s\r\nexit\r\n' "$base"
-  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>&1 || true
-  tr -d '\r' < "$chk_raw" > "$chk_norm"; have="$(flash_size_from "$chk_norm" "$base")"; rm -f "$chk_raw" "$chk_norm"
-  if [[ -z "$have" ]]; then log "[${ip}] INSTALL: image not found on flash — SKIP"; add_action "$ip,${host},install,skipped,missing_image"; return 2; fi
-  if [[ -n "$size" && "$size" != "$have" ]]; then log "[${ip}] INSTALL: image size mismatch (have=${have}, want=${size}) — SKIP"; add_action "$ip,${host},install,skipped,size_mismatch"; return 2; fi
+  } | timeout -k 8s 60s "${SSH_CMD[@]}" >"$chk_raw" 2>/dev/null || true
+  tr -d '\r' < "$chk_raw" > "$chk_norm"
+  have="$(flash_size_from "$chk_norm" "$base")"
+  rm -f "$chk_raw" "$chk_norm"
+
+  if [[ -z "$have" ]]; then
+    log "[${ip}] INSTALL: image not found on flash — SKIP"
+    add_action "$ip,${host},install,skipped,missing_image"
+    return 2
+  fi
+
+  if [[ -n "$size" && "$size" =~ ^[0-9]+$ && "$size" != "$have" ]]; then
+    log "[${ip}] INSTALL: image size mismatch (have=${have}, want=${size}) — SKIP"
+    add_action "$ip,${host},install,skipped,size_mismatch"
+    return 2
+  fi
 
   write_memory_for_ip "$ip" || true
   is_priv15_for_ip "$ip" || need_en=1
 
   local cmd="install add file flash:${base} activate commit prompt-level none"
-  log "[${ip}] INSTALL: add+activate+commit (flash:${base})"; printf '%s\n' "$cmd" > "$RUN_DIR/cmds/${ip}.install.cmd"
+  log "[${ip}] INSTALL: add+activate+commit (flash:${base})"
+  printf '%s\n' "$cmd" > "$RUN_DIR/cmds/${ip}.install.cmd"
 
-  local inst_raw inst_norm state_file fifo FEED_PID="" STREAM_PID="" rc=0
+  local inst_raw inst_norm state_file fifo rc=0
   inst_raw="$(mktemp)"; inst_norm="$(mktemp)"; state_file="$(mktemp)"
   fifo="$(mktemp -u)"; mkfifo "$fifo"; build_ssh_arr "$ip"; local INST_SSH=( "${SSH_CMD[@]}" )
 
@@ -649,7 +855,7 @@ install_activate_image_for_ip(){
       sleep "${INSTALL_KEEPALIVE_GAP_SEC:-5}"
       printf '\r\n'
     done
-  ) >"$fifo" & local FEED_PID2=$!
+  ) >"$fifo" & local FEED_PID=$!
 
   (
     tail -n +1 -f "$inst_raw" 2>/dev/null | stdbuf -o0 tr -d '\r' | {
@@ -669,70 +875,76 @@ install_activate_image_for_ip(){
         esac
       done
     }
-  ) & STREAM_PID=$!
+  ) & local STREAM_PID=$!
 
   wait "$INST_PID" 2>/dev/null || rc=$?
-  kill "$FEED_PID2" 2>/dev/null || true
+  kill "$FEED_PID" 2>/dev/null || true
   kill "$STREAM_PID" 2>/dev/null || true
   rm -f "$fifo" 2>/dev/null || true
-  wait "$FEED_PID2" 2>/dev/null || true
+  wait "$FEED_PID" 2>/dev/null || true
   wait "$STREAM_PID" 2>/dev/null || true
 
-  tr -d '\r' < "$inst_raw" > "$inst_norm"; cat "$inst_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$inst_raw"
+  tr -d '\r' < "$inst_raw" > "$inst_norm"
+  cat "$inst_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"
+  rm -f "$inst_raw"
 
-  local state=""; [[ -s "$state_file" ]] && state="$(cat "$state_file" 2>/dev/null || true)"; rm -f "$state_file"
+  local state=""; [[ -s "$state_file" ]] && state="$(cat "$state_file" 2>/dev/null || true)"
+  rm -f "$state_file"
+
   if [[ "$state" == "success" ]]; then
-    log "[${ip}] INSTALL: complete"; add_action "$ip,${host},install,ok,success"; rm -f "$inst_norm"; return 0
+    log "[${ip}] INSTALL: complete"
+    add_action "$ip,${host},install,ok,success"
+    rm -f "$inst_norm"
+    return 0
   fi
-  if [[ "$state" == "failed" ]];  then
-    log "[${ip}] INSTALL: failed (see devlogs)"; add_action "$ip,${host},install,failed,"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"; return 1
+  if [[ "$state" == "failed" ]]; then
+    log "[${ip}] INSTALL: failed (see devlogs)"
+    add_action "$ip,${host},install,failed,"
+    mv -f "$inst_norm" "$RUN_DIR/${ip}.install.fail.out"
+    return 1
   fi
-  if [[ "$state" == "busy" ]];    then
-    log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."; add_action "$ip,${host},install,skipped,busy"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"; return 3
+  if [[ "$state" == "busy" ]]; then
+    log "[${ip}] INSTALL: busy/in-progress — recommend manual reboot, then re-run."
+    add_action "$ip,${host},install,skipped,busy"
+    mv -f "$inst_norm" "$RUN_DIR/${ip}.install.busy.out"
+    return 3
   fi
 
-  # fallback verify
-  local sum_raw sum_norm; build_ssh_arr "$ip"; need_en=0; sum_raw="$(mktemp)"; sum_norm="$(mktemp)"
-  is_priv15_for_ip "$ip" || need_en=1
-  {
-    printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-    (( need_en )) && emit_enable
-    printf 'show install summary\r\nexit\r\n'
-  } | timeout -k 5s 120s "${SSH_CMD[@]}" >"$sum_raw" 2>/dev/null || true
-  tr -d '\r' < "$sum_raw" > "$sum_norm"; cat "$sum_norm" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$sum_raw"
-  if grep -qiE 'Commit:[[:space:]]+Passed|Status:[[:space:]]+Committed|SUCCESS:[[:space:]]*install_add_activate_commit' "$sum_norm"; then
-    log "[${ip}] INSTALL: verified SUCCESS via summary"; add_action "$ip,${host},install,ok,verified"; rm -f "$sum_norm" "$inst_norm"; return 0
-  fi
-  if grep -qiE 'Operation in progress|in[- ]progress' "$sum_norm"; then
-    log "[${ip}] INSTALL: still in progress (device busy)"; add_action "$ip,${host},install,ok,in_progress"; rm -f "$sum_norm" "$inst_norm"; return 0
-  fi
-  log "[${ip}] INSTALL: uncertain/failed (no success markers)"; add_action "$ip,${host},install,failed,uncertain"; mv -f "$inst_norm" "$RUN_DIR/${ip}.install.uncertain.out"; rm -f "$sum_norm"; return 1
+  log "[${ip}] INSTALL: uncertain/failed (no success markers)"
+  add_action "$ip,${host},install,failed,uncertain"
+  mv -f "$inst_norm" "$RUN_DIR/${ip}.install.uncertain.out"
+  return 1
 }
 
-# ===== per-IP pipeline (to run in parallel) =====
+# ===== per-IP pipeline =====
 process_ip(){
   local ip="$1"
   local result="skipped"
   if precheck_for_ip "$ip"; then
-    if backup_for_ip "$ip"; then
-      clean_inactive_for_ip "$ip" || true
-      if skip_if_same_version_for_ip "$ip"; then
-        result="skipped(same_version)"
-      else
-        if http_fetch_image_for_ip "$ip"; then
-          local rc_install=0; install_activate_image_for_ip "$ip" || rc_install=$?
-          case "$rc_install" in
-            0) result="ok" ;;
-            2) result="skipped(install)" ;;
-            3) result="busy(reboot_suggested)" ;;
-            *) result="fail(install)" ;;
-          esac
+    # Firmware rules enforcement (skip device if cannot meet minimum)
+    if firmware_check_for_ip "$ip"; then
+      if backup_for_ip "$ip"; then
+        clean_inactive_for_ip "$ip" || true
+        if skip_if_same_version_for_ip "$ip"; then
+          result="skipped(same_version)"
         else
-          result="fail(http_copy)"
+          if http_fetch_image_for_ip "$ip"; then
+            local rc_install=0; install_activate_image_for_ip "$ip" || rc_install=$?
+            case "$rc_install" in
+              0) result="ok" ;;
+              2) result="skipped(install)" ;;
+              3) result="busy(reboot_suggested)" ;;
+              *) result="fail(install)" ;;
+            esac
+          else
+            result="fail(http_copy)"
+          fi
         fi
+      else
+        result="fail(backup)"
       fi
     else
-      result="fail(backup)"
+      result="skipped(firmware)"
     fi
   else
     result="skipped"
@@ -746,15 +958,19 @@ process_ip(){
   add_summary "$ip,${hn},${mode},${confreg},${precheck},${result}"
 }
 
-# ===== main (parallel) =====
+# ===== main =====
 ui_start
-log "Run ID: $RUN_ID"; log "Run dir: $RUN_DIR"
-log "User: ${SSH_USERNAME} (from env)"; log "Server TFTP: ${SERVER_IP}/hybrid"
+log "Run ID: $RUN_ID"
+log "Run dir: $RUN_DIR"
+log "User: ${SSH_USERNAME} (from env)"
+log "Server TFTP: ${SERVER_IP}/hybrid"
+log "Firmware HTTP base: ${FIRMWARE_HTTP_BASE}"
+log "Firmware rules: ${CLOUD_MODELS_JSON}"
+log "Firmware local dir (percent fallback): ${FIRMWARE_LOCAL_DIR}"
 log "Targets: ${TARGETS[*]}"
 assess_latency_and_set_concurrency
 gauge 1 "Starting… (up to ${MAX_CONCURRENCY} in parallel)"
 
-# Launch up to MAX_CONCURRENCY at once; update gauge as jobs finish
 ACTIVE=0
 DONE=0
 rand_ms(){ awk -v m="${SPLAY_MS}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}' ;}

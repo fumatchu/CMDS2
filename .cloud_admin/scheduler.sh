@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need dialog; need awk; need date; need at; need grep; need sed; need cut; need tr; need sort
+need dialog; need awk; need date; need at; need grep; need sed; need cut; need tr; need sort; need jq
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 cd "$SCRIPT_DIR"
@@ -18,7 +18,7 @@ pad4(){ printf '%04d' "$((10#${1:-0}))"; }
 dlg(){ local _t; _t="$(mktemp)"; dialog "${DIALOG_OPTS[@]}" "$@" 2>"$_t"; local rc=$?; DOUT=""
        [[ -s "$_t" ]] && DOUT="$(cat "$_t")"; rm -f "$_t"; return $rc; }
 
-view_file(){  # $1=file $2=title
+view_file(){
   local f="$1" t="${2:-File}"
   if [[ -s "$f" ]]; then dlg --title "$t" --textbox "$f" 0 0
   else dlg --title "$t" --msgbox "No content found:\n$f" 8 80; fi
@@ -26,32 +26,46 @@ view_file(){  # $1=file $2=title
 
 UPGRADER="$SCRIPT_DIR/at_image_upgrade.sh"
 
-# ---------- Helpers ----------
+DISC_JSON="$SCRIPT_DIR/discovery_results.json"
+declare -a ELIGIBLE_IPS=()
+ELIGIBILITY_BUILT=0
+
+build_eligibility(){
+  (( ELIGIBILITY_BUILT == 1 )) && return
+  ELIGIBILITY_BUILT=1
+  [[ -s "$DISC_JSON" ]] || return
+  mapfile -t ELIGIBLE_IPS < <(
+    jq -r '.[]
+      | select((.ssh // false) == true
+               and (.login // false) == true
+               and (.blacklisted // false) != true)
+      | .ip' "$DISC_JSON" 2>/dev/null | awk 'NF'
+  )
+}
+
+is_ip_eligible(){
+  local ip="$1"
+  build_eligibility
+  (( ${#ELIGIBLE_IPS[@]} == 0 )) && return 0
+  local e
+  for e in "${ELIGIBLE_IPS[@]}"; do [[ "$e" == "$ip" ]] && return 0; done
+  return 1
+}
+
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
 
 find_spawned_run_dir(){
-  # $1 = job dir
   local d="$1" p
   p="$(awk -F'Run dir:[[:space:]]*' '/Run dir:/ {print $2; exit}' "$d/logs/stdout.log" 2>/dev/null || true)"
   [[ -n "$p" && -d "$p" ]] && { echo "$p"; return; }
+
   shopt -s nullglob
   for p in "$d"/runs/run-*; do [[ -d "$p" ]] && { echo "$p"; return; }; done
   echo ""
 }
 
-# Read a KEY=value from an env snapshot (best-effort)
-read_env_kv(){ # $1=file $2=key -> prints value or empty
-  local f="$1" k="$2"
-  awk -F'=' -v k="$k" '
-    $1 ~ "^[[:space:]]*"k"[[:space:]]*$" {
-      sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2);
-      gsub(/^"|"$/, "", $2); gsub(/^'\''|'\''$/, "", $2);
-      print $2; exit
-    }' "$f" 2>/dev/null || true
-}
+at_has_job(){ atq 2>/dev/null | awk '{print $1}' | grep -qx -- "$1"; }
 
-# Extract friendly image/version from meraki_discovery.env
-# -> "17.15.03 / cat9k_iosxe.17.15.03.SPA.bin, cat9k_lite_iosxe.17.15.03.SPA.bin"
 extract_target_image_from_discovery() {
   local disc="$1" ver="" uni="" lite=""
   [[ -f "$disc" ]] || { echo "unknown"; return; }
@@ -76,8 +90,6 @@ extract_target_image_from_discovery() {
   fi
 }
 
-# Targets preview from selected_upgrade.env (IPs)
-# Show only the first IP; if more, append (+N)
 extract_targets_preview(){
   local sel="$1"
   [[ -f "$sel" ]] || { echo "<none>"; return; }
@@ -94,27 +106,45 @@ extract_targets_preview(){
     | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}'
   )
   if ((${#ips[@]}==0)); then echo "<none>"; return; fi
-  mapfile -t uniq < <(printf '%s\n' "${ips[@]}" | awk -F. '!seen[$0]++ { if ($4 != 0 && $4 != 255) print $0 }' | sort -V)
 
+  mapfile -t uniq < <(
+    printf '%s\n' "${ips[@]}" \
+      | awk -F. '!seen[$0]++ { if ($4 != 0 && $4 != 255) print $0 }' \
+      | sort -V
+  )
   local total=${#uniq[@]}
   (( total == 0 )) && { echo "<none>"; return; }
 
-  local first="${uniq[0]}"
-  if (( total == 1 )); then
-    echo "$first"
-  else
-    echo "$first (+$((total-1)))"
-  fi
+  build_eligibility
+  local eligible=() ip
+  for ip in "${uniq[@]}"; do
+    if is_ip_eligible "$ip"; then eligible+=("$ip"); fi
+  done
+
+  local etotal=${#eligible[@]}
+  if (( etotal == 0 )); then echo "<none (0 eligible by discovery)>"; return; fi
+
+  local first="${eligible[0]}"
+  (( etotal == 1 )) && echo "$first" || echo "$first (+$((etotal-1)))"
 }
 
-at_has_job(){ # $1=id -> 0 if present
-  atq 2>/dev/null | awk '{print $1}' | grep -qx -- "$1"
+# ---- NEW: run status from markers in spawned run dir ----
+run_dir_status(){
+  local run="$1"
+  [[ -z "$run" || ! -d "$run" ]] && { echo ""; return; }
+  if [[ -f "$run/RUNNING" ]]; then echo "running"; return; fi
+  if [[ -f "$run/DONE" ]]; then echo "done"; return; fi
+  echo "unknown"
 }
 
-# ---------- Friendly list ----------
-# Prints: jobdir|when|note|image|targets|status|atid
+run_dir_exit_code(){
+  local run="$1"
+  [[ -f "$run/EXIT_CODE" ]] && cat "$run/EXIT_CODE" 2>/dev/null || true
+}
+
+# Prints: jobdir|when|note|image|targets|status|atid|run_dir
 build_jobs_list(){
-  local meta dir when note atid img targets status when_ep now spawned
+  local meta dir when note atid img targets status when_ep now spawned rstat rc
   now="$(date +%s)"
   shopt -s nullglob
   for meta in "$SCRIPT_DIR"/schedules/job-*/job.meta; do
@@ -128,19 +158,26 @@ build_jobs_list(){
 
     spawned="$(find_spawned_run_dir "$dir")"
     when_ep="$(epoch_from_human "$when")"
+
     if [[ -n "$spawned" ]]; then
-      status="Scheduled — done"
+      rstat="$(run_dir_status "$spawned")"
+      case "$rstat" in
+        running) status="Scheduled — running" ;;
+        done)
+          rc="$(run_dir_exit_code "$spawned")"
+          [[ -n "$rc" ]] && status="Scheduled — done (rc=$rc)" || status="Scheduled — done"
+          ;;
+        *) status="Scheduled — started (state unknown)" ;;
+      esac
     elif [[ -n "$atid" ]] && at_has_job "$atid"; then
       status="Scheduled — pending"
     else
-      if (( when_ep > now )); then
-        status="Canceled / not queued"
-      else
-        status="Expired / missed"
-      fi
+      if (( when_ep > now )); then status="Canceled / not queued"
+      else status="Expired / missed"; fi
     fi
 
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$dir" "${when:-<unknown>}" "${note:-<none>}" "$img" "$targets" "$status" "${atid:-}"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$dir" "${when:-<unknown>}" "${note:-<none>}" "$img" "$targets" "$status" "${atid:-}" "${spawned:-}"
   done
 }
 
@@ -151,7 +188,7 @@ friendly_jobs_menu(){
     return
   fi
 
-  local choices=() r dir when note img targets status atid
+  local choices=() r dir when note img targets status atid run_dir
   for r in "${rows[@]}"; do
     dir="$(cut -d'|' -f1 <<<"$r")"
     when="$(cut -d'|' -f2 <<<"$r")"
@@ -165,7 +202,6 @@ friendly_jobs_menu(){
     choices+=("$tag" "$line")
   done
 
-  # width 240 is fine; reduce if you prefer (e.g., 200)
   while true; do
     dlg --title "Scheduled upgrades" --menu "Select a scheduled job" 20 240 10 "${choices[@]}" || return
     local sel="$DOUT" chosen=""
@@ -181,6 +217,7 @@ friendly_jobs_menu(){
     targets="$(cut -d'|' -f5 <<<"$chosen")"
     status="$(cut -d'|' -f6 <<<"$chosen")"
     atid="$(cut -d'|' -f7 <<<"$chosen")"
+    run_dir="$(cut -d'|' -f8 <<<"$chosen")"
 
     while true; do
       local items=()
@@ -189,12 +226,15 @@ friendly_jobs_menu(){
       items+=("path" "Show job folder path")
       items+=("sel"  "View selected_upgrade.env")
       items+=("disc" "View meraki_discovery.env")
+      if [[ -n "$run_dir" && -d "$run_dir" ]]; then
+        items+=("run"  "Open spawned run dir (ui.status)")
+      fi
       if [[ -n "$atid" && "$status" == "Scheduled — pending" ]]; then
         items+=("del"  "Delete from schedule (remove from queue)")
       fi
       items+=("back" "Back")
 
-      dlg --title "$sel" --menu "Choose an action" 16 90 10 "${items[@]}" || break
+      dlg --title "$sel" --menu "Choose an action" 18 95 11 "${items[@]}" || break
       case "$DOUT" in
         sum)
           dlg --title "Summary" --msgbox \
@@ -202,36 +242,24 @@ friendly_jobs_menu(){
 Status:  $status
 Image:   $img
 Targets: $targets
+Run dir: ${run_dir:-<not started>}
 
 Note:
-$note" 15 90
+$note" 17 95
           ;;
         note)  dlg --title "Job note" --msgbox "${note:-<none>}" 10 70 ;;
         path)  dlg --title "Job folder" --msgbox "$dir" 8 90 ;;
         sel)   view_file "$dir/selected_upgrade.env"  "selected_upgrade.env" ;;
         disc)  view_file "$dir/meraki_discovery.env"  "meraki_discovery.env" ;;
+        run)   view_file "$run_dir/ui.status" "ui.status (live)" ;;
         del)
           dlg --title "Confirm" --yesno "Remove this job from the 'at' queue?\n\nJob ID: ${atid}" 9 72 || continue
           if atrm "$atid" 2>/dev/null; then
-            # mark cancellation
             sed -i -e 's/^backend_id=.*/backend_id=/' "$dir/job.meta"
             echo "canceled_local=$(date '+%F %T %Z')" >> "$dir/job.meta"
             : > "$dir/CANCELED"
             dlg --title "Removed" --msgbox "Removed job ${atid} from the queue.\nMarked as canceled:\n$dir" 10 80
-            # refresh
             mapfile -t rows < <(build_jobs_list | sort -t'|' -k2)
-            choices=()
-            for r in "${rows[@]}"; do
-              _dir="$(cut -d'|' -f1 <<<"$r")"
-              _when="$(cut -d'|' -f2 <<<"$r")"
-              _note="$(cut -d'|' -f3 <<<"$r")"
-              _img="$(cut -d'|' -f4 <<<"$r")"
-              _targets="$(cut -d'|' -f5 <<<"$r")"
-              _status="$(cut -d'|' -f6 <<<"$r")"
-              tag="$(basename -- "$_dir")"
-              line="When: $_when | Status: $_status | Image: $_img | Targets: $_targets | Note: $_note"
-              choices+=("$tag" "$line")
-            done
             break
           else
             dlg --title "Error" --msgbox "Failed to remove job ${atid}.\n(It may already be gone.)" 8 70
@@ -243,7 +271,6 @@ $note" 15 90
   done
 }
 
-# ---------- Schedule new ----------
 schedule_new(){
   if [[ ! -x "$UPGRADER" ]]; then
     dlg --title "Error" --msgbox "at_image_upgrade.sh not found or not executable in:\n$SCRIPT_DIR" 9 80
@@ -263,6 +290,19 @@ Run Setup Wizard and Discovery/Selection first." 12 74
     clear; exit 1
   fi
 
+  local TARGETS_PREVIEW
+  TARGETS_PREVIEW="$(extract_targets_preview "$SEL_PATH")"
+  if [[ "$TARGETS_PREVIEW" == "<none>" || "$TARGETS_PREVIEW" == "<none (0 eligible by discovery)>" ]]; then
+    dlg --title "No eligible targets" --msgbox \
+"selected_upgrade.env contains no eligible targets after applying discovery gating.
+
+Discovery requires:
+  - ssh=true
+  - login=true
+  - blacklisted!=true" 12 80
+    clear; exit 1
+  fi
+
   local NOTE=""
   dlg --title "Optional note" --inputbox "Enter an optional note (ticket/window/etc.)." 8 72
   [[ $? -eq 0 ]] && NOTE="$(trim "${DOUT:-}")"
@@ -276,12 +316,7 @@ Run Setup Wizard and Discovery/Selection first." 12 74
 
   local default_time="02:00 AM"
   dlg --title "Run time (12-hour)" --inputbox \
-"Enter time as:  HH:MM AM/PM
-
-Examples:
-  2:30 am
-  11:05 PM
-  12:00 pm" 12 48 "$default_time" || { clear; exit 1; }
+"Enter time as:  HH:MM AM/PM" 10 48 "$default_time" || { clear; exit 1; }
   local time_raw canon HH12 MIN AMPM HH24 SS
   time_raw="$(trim "${DOUT:-}")"
   canon="$(printf '%s' "$time_raw" | tr '[:lower:]' '[:upper:]' | sed 's/\./:/g; s/[^0-9APM: ]//g')"
@@ -301,24 +336,18 @@ Examples:
   sel_ts="$(date -d "$sel_iso" +%s)" || true
   now_ts="$(date +%s)"
   [[ -z "${sel_ts:-}" ]] && { dlg --title "Error" --msgbox "Could not parse selected datetime: $sel_iso" 8 70; clear; exit 1; }
-  (( sel_ts <= now_ts )) && {
-    dlg --title "Time is in the past" --msgbox "Please pick a later time.\n\nSelected: $(date -d "$sel_iso")\nNow: $(date)" 10 70
-    clear; exit 1; }
+  (( sel_ts <= now_ts )) && { dlg --title "Time is in the past" --msgbox "Pick a later time." 7 40; clear; exit 1; }
 
   local RUN_LOCAL_HUMAN AT_TSTAMP
   RUN_LOCAL_HUMAN="$(date -d "$sel_iso" '+%a %b %d, %Y  %I:%M:%S %p %Z')"
   AT_TSTAMP="${YYYY}${MM}${DD}${HH24}${MIN}.${SS}"
 
-  local summary="Schedule summary
+  dlg --title "Confirm schedule" --yesno \
+"Date/time (local):       ${RUN_LOCAL_HUMAN}
+Targets (by discovery):  ${TARGETS_PREVIEW}
+Note:                    ${NOTE:-<none>}
 
-Date/time (local):  ${RUN_LOCAL_HUMAN}
-Note:               ${NOTE:-<none>}
-
-Env snapshots (from current directory):
-  meraki_discovery.env
-  selected_upgrade.env
-"
-  dlg --title "Confirm schedule" --yesno "$summary\nProceed to create the scheduled job?" 18 78 || { clear; exit 0; }
+Proceed to create the scheduled job?" 16 78 || { clear; exit 0; }
 
   local JOB_ID="job-${YYYY}${MM}${DD}-${HH24}${MIN}${SS}-$RANDOM"
   local JOB_DIR="$SCRIPT_DIR/schedules/$JOB_ID"
@@ -333,6 +362,7 @@ Env snapshots (from current directory):
 #!/usr/bin/env bash
 set -Eeuo pipefail
 THIS_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+
 CANDIDATES=(
   "$THIS_DIR/../../at_image_upgrade.sh"
   "$THIS_DIR/../at_image_upgrade.sh"
@@ -341,12 +371,27 @@ CANDIDATES=(
 UPGRADER=""
 for c in "${CANDIDATES[@]}"; do [[ -x "$c" ]] && { UPGRADER="$c"; break; }; done
 if [[ -z "$UPGRADER" ]]; then echo "[FATAL] at_image_upgrade.sh not found" >&2; exit 1; fi
-ROOT_DIR="$(cd -- "$(dirname "$UPGRADER")" >/dev/null 2>&1 && pwd -P)"; cd "$ROOT_DIR"
+
+ROOT_DIR="$(cd -- "$(dirname "$UPGRADER")" >/dev/null 2>&1 && pwd -P)"
+cd "$ROOT_DIR"
+
 export RUN_ROOT="$THIS_DIR/runs"
 export BASE_ENV="$THIS_DIR/meraki_discovery.env"
 SEL_ENV_FILE="$THIS_DIR/selected_upgrade.env"
+
 mkdir -p "$THIS_DIR/logs" "$THIS_DIR/runs"
-bash "$UPGRADER" "$SEL_ENV_FILE" >>"$THIS_DIR/logs/stdout.log" 2>>"$THIS_DIR/logs/stderr.log"
+
+# Wrapper markers (job-level)
+echo "$$" > "$THIS_DIR/JOB_RUNNING" 2>/dev/null || true
+rm -f "$THIS_DIR/JOB_DONE" 2>/dev/null || true
+
+rc=0
+bash "$UPGRADER" "$SEL_ENV_FILE" >>"$THIS_DIR/logs/stdout.log" 2>>"$THIS_DIR/logs/stderr.log" || rc=$?
+
+rm -f "$THIS_DIR/JOB_RUNNING" 2>/dev/null || true
+echo "$rc" > "$THIS_DIR/JOB_EXIT_CODE" 2>/dev/null || true
+date -u '+%F %T' > "$THIS_DIR/JOB_DONE" 2>/dev/null || true
+exit "$rc"
 EOS
   chmod +x "$JOB_DIR/job.sh"
 
@@ -385,7 +430,6 @@ Run artifacts will appear in:
   clear
 }
 
-# ---------- Top-level ----------
 while true; do
   dlg --title "IOS-XE Upgrade Scheduler" --menu "Choose an option:" 12 72 6 \
     1 "Schedule new IOS-XE upgrade" \
