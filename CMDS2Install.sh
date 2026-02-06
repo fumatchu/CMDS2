@@ -2449,10 +2449,10 @@ prompt_reboot_now() {
 }
 # ============================================================
 # Service Installer Checklist
-#  - Bind DNS (caching-only)  ✅
-#  - NTP (Chrony)             ✅
-#  - DHCP (Kea)               ✅ (new integration)
-#  - NONE (continue)          ✅
+#  - Bind DNS (caching-only)  
+#  - NTP (Chrony)             
+#  - DHCP (Kea)               
+#  - NONE (continue)          
 #  All popups auto-close (no OK buttons) except where inputs/yes-no are needed.
 # ============================================================
 
