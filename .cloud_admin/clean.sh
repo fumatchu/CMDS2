@@ -15,7 +15,7 @@ fi
 # Collect files (non-recursive; just the target directory)
 # NOTE: protect the "bible" manifest from deletion
 mapfile -d '' FILES < <(find "$TARGET_DIR" -maxdepth 1 -type f \
-  \( -name '*.csv' -o -name '*.env' -o -name '*.json' -o -name '*.flag' \) \
+  \( -name '*.csv' -o -name '*.env' -o -name '*.json' -o -name '*.flag' -o -name '*.ok' \) \
   ! -name 'cloud_models.json' \
   -print0)
 
@@ -24,25 +24,18 @@ if [[ -L "$TARGET_DIR/meraki_claim.log" ]]; then
   FILES+=("$TARGET_DIR/meraki_claim.log")
 fi
 
-# Also remove preflight.ok so the main menu "Validate IOS-XE configuration"
-# checkmark is cleared for the next batch.
-if [[ -e "$TARGET_DIR/preflight.ok" ]]; then
-  FILES+=("$TARGET_DIR/preflight.ok")
-fi
-
 TOTAL="${#FILES[@]}"
 if (( TOTAL == 0 )); then
   dialog --no-shadow --title "Cleanup" --msgbox \
 "Nothing to clean.
 
-No .csv/.env/.json/.flag files, Meraki claim log symlink,
-or preflight.ok were found in:
+No .csv/.env/.json/.flag/.ok files or
+Meraki claim log symlink were found in:
 $(readlink -f "$TARGET_DIR")" 11 76
   clear
   exit 0
 fi
 
-# High-level confirmation (no file list)
 dialog --no-shadow --title "Prepare for next migration" --yesno \
 "This will clean up CMDS migration and preflight artifacts in:
 
@@ -50,7 +43,7 @@ $(readlink -f "$TARGET_DIR")
 
 • Remove previous migration result/working files
 • Remove Meraki claim log symlink (if present)
-• Remove preflight.ok (clears preflight \"ready\" status)
+• Remove ALL .ok state files
 • Free up space and reset state
 
 Use this when you are finished with one batch of switches
@@ -60,13 +53,13 @@ After cleanup, please run the Setup Wizard again
 before starting another migration.
 
 Do you want to continue?" 20 74
+
 resp=$?
 clear
 if (( resp != 0 )); then
   exit 1
 fi
 
-# Small helper to get file size in bytes (portable)
 get_size() {
   local f="$1" s
   if s=$(stat -c %s "$f" 2>/dev/null); then
@@ -78,10 +71,8 @@ get_size() {
   fi
 }
 
-# Setup gauge
 PROG_PIPE="$(mktemp -u)"
 mkfifo "$PROG_PIPE"
-# shellcheck disable=SC3020
 exec {PROG_FD}<>"$PROG_PIPE"
 
 cleanup_pipe() {
@@ -101,7 +92,6 @@ update_gauge () {
   printf 'XXX\n%s\n%s\nXXX\n' "$pct" "$msg" >&"$PROG_FD"
 }
 
-# Work through files
 for ((i=0; i<TOTAL; i++)); do
   f="${FILES[$i]}"
   rel="${f#"$TARGET_DIR"/}"
@@ -116,21 +106,18 @@ done
 update_gauge 100 "Finalizing cleanup…"
 sleep 0.3
 
-# Close the gauge cleanly BEFORE showing the final msgbox
 exec {PROG_FD}>&- 2>/dev/null || true
 
-# Give dialog a moment to exit on its own
 for _ in 1 2 3 4 5; do
   if ! kill -0 "$DPID" 2>/dev/null; then
     break
   fi
   sleep 0.2
 done
-# If somehow still alive, terminate it
+
 kill "$DPID" 2>/dev/null || true
 wait "$DPID" 2>/dev/null || true
 
-# Human readable freed size
 hr() {
   local b=$1
   if (( b < 1024 )); then
@@ -144,7 +131,6 @@ hr() {
   fi
 }
 
-# Final summary — waits for user to press OK (no timeout)
 dialog --no-shadow --title "Configuration cleanup complete" --msgbox \
 "Cleanup finished successfully.
 

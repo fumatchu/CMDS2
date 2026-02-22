@@ -3,8 +3,10 @@
 #   • IOS-XE upgrade logs (manual + scheduled)
 #   • Discovery scans (nmap/SSH discovery + upgrade_plan)
 #   • Meraki preflight runs (connectivity / DNS / HTTP client src-if)
-#   • Meraki migration / switch-claim logs
+#   • Meraki switch-claim inventory (meraki_memory/*.json)
 #   • DNS / HTTP client remediation runs
+#   • Meraki network creation runs
+#   • Port migration runs (runs/port_migration)  <-- NEW
 
 # NOTE: no -e here on purpose; we want Cancel/Esc to be handled manually.
 set -Euo pipefail
@@ -32,17 +34,18 @@ RUNS_DIR="$ROOT/runs"
 SCHED_DIR="$ROOT/schedules"
 
 DISC_ROOT="$RUNS_DIR/discoveryscans"
-MIGRATION_DIR="$RUNS_DIR/migration"   # Meraki migration / claim runs
+MIGRATION_DIR="$RUNS_DIR/migration"   # legacy run folders (kept)
+PORT_MIG_DIR="$RUNS_DIR/port_migration"  # NEW: port migration runs
 
-PREFLIGHT_DIR="$RUNS_DIR/preflight"   # Preflight (connectivity) runs
-DNS_DIR="$RUNS_DIR/dnsfix"            # DNS remediation runs
-HTTP_DIR="$RUNS_DIR/httpfix"          # HTTP client source-if remediation runs
-CREATENET_DIR="$RUNS_DIR/createnetworks"  # Meraki network creation runs
+PREFLIGHT_DIR="$RUNS_DIR/preflight"
+DNS_DIR="$RUNS_DIR/dnsfix"
+HTTP_DIR="$RUNS_DIR/httpfix"
+CREATENET_DIR="$RUNS_DIR/createnetworks"
 
+MERAKI_MEMORY_DIR="$ROOT/meraki_memory"
 
 BACKTITLE="${BACKTITLE:-Main Menu}"
 
-# Colored help text (bottom status line), same style as main menu
 HELP_COLOR_PREFIX="${HELP_COLOR_PREFIX:-\Zb\Z3}"   # bold yellow
 HELP_COLOR_RESET="${HELP_COLOR_RESET:-\Zn}"
 
@@ -50,11 +53,12 @@ declare -A HELP_TEXT=(
   [1]="View IOS-XE upgrade runs (manual and scheduled)."
   [2]="View discovery scan results and upgrade plans."
   [3]="View Meraki preflight runs (DNS/HTTP/ping readiness)."
-  [4]="View Meraki switch-claim / migration runs."
+  [4]="View Meraki switch claim inventory (meraki_memory/*.json)."
   [5]="View DNS remediation runs triggered by preflight."
   [6]="View HTTP client source-interface remediation runs."
   [7]="Search across all logs by IP address or text."
   [8]="View Meraki network creation runs (createnetwork-*)."
+  [9]="View port migration runs (devlogs + diffs)."
   [0]="Return to the previous CMDS menu."
 )
 
@@ -128,6 +132,9 @@ epoch_from_genericid(){
 
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
 
+# NEW: epoch helper for ISO timestamps in JSON (e.g. 2026-02-22T02:47:04-0500)
+epoch_from_iso(){ date -d "$1" +%s 2>/dev/null || echo 0; }
+
 in_at_queue(){
   local id="$1"
   [[ -z "$id" || "$id" == "unknown" ]] && return 1
@@ -146,6 +153,51 @@ view_file(){
   else
     dlg --title "$ttl" --msgbox "No content found:\n$f" 8 70
   fi
+}
+
+# -----------------------------------------------------------------------------
+# Filtered view for port apply logs (strip payload noise)
+# -----------------------------------------------------------------------------
+filter_ports_apply_log(){
+  # $1=input_file -> writes filtered content to stdout
+  # Removes:
+  #   - Row debug for port X:   (and the JSON line immediately after)
+  #   - Computed body for port X: ...
+  #   - PUT body for port X: ...
+  # Keeps success/error lines and higher-level markers.
+  awk '
+    BEGIN { skip_next=0 }
+    skip_next==1 { skip_next=0; next }
+    /^Row debug for port [0-9]+:/ { skip_next=1; next }
+    /^Computed body for port [0-9]+:/ { next }
+    /^PUT body for port [0-9]+:/ { next }
+    { print }
+  ' "$1" 2>/dev/null
+}
+
+view_ports_apply_log_filtered(){
+  local f="$1" ttl="${2:-$(basename "$f")}"
+  if [[ ! -s "$f" ]]; then
+    dlg --title "$ttl" --msgbox "No content found:\n$f" 8 70
+    return
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  filter_ports_apply_log "$f" >"$tmp" || true
+  dlg --title "$ttl (filtered)" --textbox "$tmp" 0 0
+  rm -f "$tmp"
+}
+
+# -----------------------------------------------------------------------------
+# Tiny JSON extractors (no jq dependency)
+# -----------------------------------------------------------------------------
+json_str(){
+  # $1=file $2=key => extracts string value for "key": "value"
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | head -n1
+}
+json_int(){
+  # $1=file $2=key => extracts integer value for "key": 123
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9]\\+\\).*/\\1/p" "$1" 2>/dev/null | head -n1
 }
 
 # ---------------------------------------------------------------------------
@@ -512,7 +564,6 @@ fix_menu(){
   done
 }
 
-# Specific menus using fix_menu
 preflight_menu(){ fix_menu "$PREFLIGHT_DIR" "Preflight Runs" "P" "Meraki preflight run" "summary.csv"; }
 dnsfix_menu(){     fix_menu "$DNS_DIR"       "DNS Fix Runs"  "N" "DNS remediation run"  "dnsfix.csv"; }
 httpfix_menu(){    fix_menu "$HTTP_DIR"      "HTTP Client Fix Runs" "H" "HTTP client source-if remediation run" "httpfix.csv"; }
@@ -551,32 +602,24 @@ show_createnet_run_menu(){
           continue
         fi
         local devitems=() d
-        for d in "${devs[@]}"; do
-          devitems+=("$d" "$(basename "$d")")
-        done
-        dlg --title "Create-network dev logs" \
-            --menu "Pick a log to view" 20 120 12 "${devitems[@]}"
+        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
+        dlg --title "Create-network dev logs" --menu "Pick a log to view" 20 120 12 "${devitems[@]}"
         local rc2=$DIALOG_RC
         (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
         ;;
-      path)
-        dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
-      back)
-        return ;;
+      path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
+      back) return ;;
     esac
   done
 }
 
 createnetworks_menu(){
   if [[ ! -d "$CREATENET_DIR" ]]; then
-    dlg --title "Created Networks" \
-        --msgbox "No create-network runs found yet.\n\nExpected directory:\n$CREATENET_DIR" 9 80
+    dlg --title "Created Networks" --msgbox "No create-network runs found yet.\n\nExpected directory:\n$CREATENET_DIR" 9 80
     return
   fi
 
-  local rows=()
-  local d base ep loc
-
+  local rows=() d base ep loc
   shopt -s nullglob
   for d in "$CREATENET_DIR"/createnetwork-*; do
     [[ -d "$d" ]] || continue
@@ -588,8 +631,7 @@ createnetworks_menu(){
   shopt -u nullglob
 
   if ((${#rows[@]}==0)); then
-    dlg --title "Created Networks" \
-        --msgbox "No createnetwork-* runs found under:\n$CREATENET_DIR" 9 80
+    dlg --title "Created Networks" --msgbox "No createnetwork-* runs found under:\n$CREATENET_DIR" 9 80
     return
   fi
 
@@ -603,13 +645,11 @@ createnetworks_menu(){
   done
 
   while true; do
-    dlg --title "Created Networks" \
-        --menu "Select a create-network run" 22 120 12 "${choices[@]}"
+    dlg --title "Created Networks" --menu "Select a create-network run" 22 120 12 "${choices[@]}"
     local rc=$DIALOG_RC
     [[ $rc -ne 0 ]] && return
 
-    local sel="$DOUT"
-    local path=""
+    local sel="$DOUT" path=""
     for line in "${sorted[@]}"; do
       [[ "$sel" == "$(cut -d'|' -f2 <<<"$line")" ]] || continue
       path="$(cut -d'|' -f4- <<<"$line")"
@@ -617,98 +657,6 @@ createnetworks_menu(){
     done
 
     show_createnet_run_menu "$path" "Created Networks: ${sel#CN:}"
-  done
-}
-
-# ---------------------------------------------------------------------------
-# Meraki switch-claim viewer
-# ---------------------------------------------------------------------------
-show_meraki_claim_run_menu(){
-  local rdir="$1" title="$2"
-
-  while true; do
-    local items=()
-    local claim_log="$rdir/meraki_claim.log"
-    local connect_txt="$rdir/meraki_connect_summary.txt"
-    local connect_csv="$rdir/meraki_connect_summary.csv"
-    local cloud_ids="$rdir/meraki_cloud_ids.json"
-    local map_json="$rdir/meraki_switch_network_map.json"
-
-    items+=("claim"    "meraki_claim.log")
-    items+=("conn_txt" "meraki_connect_summary.txt")
-    items+=("conn_csv" "meraki_connect_summary.csv")
-    items+=("cloud"    "meraki_cloud_ids.json")
-    items+=("map"      "meraki_switch_network_map.json")
-    items+=("path"     "Show run folder path")
-    items+=("back"     "Back")
-
-    dlg --title "$title" --menu "Choose what to view" 20 100 12 "${items[@]}"
-    local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return
-
-    case "$DOUT" in
-      claim)    view_file "$claim_log"   "meraki_claim.log" ;;
-      conn_txt) view_file "$connect_txt" "meraki_connect_summary.txt" ;;
-      conn_csv) view_file "$connect_csv" "meraki_connect_summary.csv" ;;
-      cloud)    view_file "$cloud_ids"   "meraki_cloud_ids.json" ;;
-      map)      view_file "$map_json"    "meraki_switch_network_map.json" ;;
-      path)     dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
-      back)     return ;;
-    esac
-  done
-}
-
-meraki_claims_menu(){
-  if [[ ! -d "$MIGRATION_DIR" ]]; then
-    dlg --title "Meraki SwitchClaims" \
-        --msgbox "No Meraki migration runs found yet.\n\nExpected directory:\n$MIGRATION_DIR" 9 80
-    return
-  fi
-
-  local rows=()
-  local log rdir base ep loc
-
-  shopt -s nullglob
-  for log in "$MIGRATION_DIR"/*/meraki_claim.log; do
-    [[ -f "$log" ]] || continue
-    rdir="$(dirname "$log")"
-    base="$(basename "$rdir")"
-    ep="$(epoch_from_migrationid "$base")"
-    loc="$(to_local_from_migrationid "$base")"
-    rows+=("${ep}|C:${base}|${loc}  (Meraki switch claims)|${rdir}")
-  done
-  shopt -u nullglob
-
-  if ((${#rows[@]}==0)); then
-    dlg --title "Meraki SwitchClaims" \
-        --msgbox "No meraki_claim.log files found.\n\nExpected under:\n$MIGRATION_DIR/*/meraki_claim.log" 10 80
-    return
-  fi
-
-  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
-
-  local choices=() line tag txt
-  for line in "${sorted[@]}"; do
-    tag="$(cut -d'|' -f2 <<<"$line")"
-    txt="$(cut -d'|' -f3 <<<"$line")"
-    choices+=("$tag" "$txt")
-  done
-
-  while true; do
-    dlg --title "Meraki SwitchClaims" \
-        --menu "Select a Meraki claim run" 22 120 12 "${choices[@]}"
-    local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return
-
-    local sel="$DOUT"
-    local path=""
-    for line in "${sorted[@]}"; do
-      [[ "$sel" == "$(cut -d'|' -f2 <<<"$line")" ]] || continue
-      path="$(cut -d'|' -f4- <<<"$line")"
-      break
-    done
-
-    show_meraki_claim_run_menu "$path" "Meraki claims: ${sel#C:}"
   done
 }
 
@@ -801,6 +749,322 @@ ip_search_menu(){
 }
 
 # ---------------------------------------------------------------------------
+# Meraki switch-claim inventory viewer (meraki_memory/*.json)
+# ---------------------------------------------------------------------------
+meraki_memory_build_csv(){
+  local f
+  echo "timestamp,run_id,ip,cloud_id,serial,model,device_name,org_name,network_name,status,ssh_status,stack_count,member_index,stack_base_name,file"
+
+  shopt -s nullglob
+  for f in "$MERAKI_MEMORY_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+
+    local ts rid ip cloud serial model dev org net status ssh sc mi sbn
+    ts="$(json_str "$f" "timestamp")"
+    rid="$(json_str "$f" "run_id")"
+    ip="$(json_str "$f" "ip")"
+    cloud="$(json_str "$f" "cloud_id")"
+    serial="$(json_str "$f" "serial")"
+    model="$(json_str "$f" "model")"
+    dev="$(json_str "$f" "device_name")"
+    org="$(json_str "$f" "org_name")"
+    net="$(json_str "$f" "network_name")"
+    status="$(json_str "$f" "status")"
+    ssh="$(json_str "$f" "ssh_status")"
+    sc="$(json_int "$f" "stack_count")"
+    mi="$(json_int "$f" "member_index")"
+    sbn="$(json_str "$f" "stack_base_name")"
+
+    esc(){ printf '%s' "$1" | sed 's/"/""/g'; }
+
+    printf "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n" \
+      "$(esc "$ts")" "$(esc "$rid")" "$(esc "$ip")" "$(esc "$cloud")" "$(esc "$serial")" "$(esc "$model")" \
+      "$(esc "$dev")" "$(esc "$org")" "$(esc "$net")" "$(esc "$status")" "$(esc "$ssh")" \
+      "$(esc "${sc:-}")" "$(esc "${mi:-}")" "$(esc "$sbn")" "$(esc "$f")"
+  done
+  shopt -u nullglob
+}
+
+meraki_memory_device_summary(){
+  local f="$1"
+  local ts rid ip cloud serial model dev org net addr status ssh sc mi sbn
+  ts="$(json_str "$f" "timestamp")"
+  rid="$(json_str "$f" "run_id")"
+  ip="$(json_str "$f" "ip")"
+  cloud="$(json_str "$f" "cloud_id")"
+  serial="$(json_str "$f" "serial")"
+  model="$(json_str "$f" "model")"
+  dev="$(json_str "$f" "device_name")"
+  org="$(json_str "$f" "org_name")"
+  net="$(json_str "$f" "network_name")"
+  addr="$(json_str "$f" "network_address")"
+  status="$(json_str "$f" "status")"
+  ssh="$(json_str "$f" "ssh_status")"
+  sc="$(json_int "$f" "stack_count")"
+  mi="$(json_int "$f" "member_index")"
+  sbn="$(json_str "$f" "stack_base_name")"
+
+  cat <<EOF
+Meraki Claim Memory Entry
+
+Timestamp:     ${ts:-}
+Run ID:        ${rid:-}
+IP:            ${ip:-}
+Cloud ID:      ${cloud:-}
+Serial:        ${serial:-}
+Model:         ${model:-}
+Device Name:   ${dev:-}
+
+Org:           ${org:-}
+Network:       ${net:-}
+Address:       ${addr:-}
+
+Status:        ${status:-}
+SSH Status:    ${ssh:-}
+
+Stack Count:   ${sc:-}
+Member Index:  ${mi:-}
+Stack Base:    ${sbn:-}
+
+File:          $f
+EOF
+}
+
+show_meraki_memory_entry_menu(){
+  local json_file="$1" title="$2"
+
+  while true; do
+    local items=()
+    items+=("raw"  "View raw JSON")
+    items+=("sum"  "View summary")
+    items+=("path" "Show file path")
+    items+=("back" "Back")
+
+    dlg --title "$title" --menu "Choose what to view" 16 90 8 "${items[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    case "$DOUT" in
+      raw)  view_file "$json_file" "$(basename "$json_file")" ;;
+      sum)
+        local tmp; tmp="$(mktemp)"
+        meraki_memory_device_summary "$json_file" >"$tmp"
+        dlg --title "Summary: $(basename "$json_file")" --textbox "$tmp" 0 0
+        rm -f "$tmp"
+        ;;
+      path) dlg --title "File path" --msgbox "$json_file" 7 80 ;;
+      back) return ;;
+    esac
+  done
+}
+
+meraki_claims_menu(){
+  if [[ ! -d "$MERAKI_MEMORY_DIR" ]]; then
+    dlg --title "Meraki SwitchClaims" --msgbox "No meraki_memory directory found.\n\nExpected:\n$MERAKI_MEMORY_DIR" 9 80
+    return
+  fi
+
+  local rows=() f
+  shopt -s nullglob
+  for f in "$MERAKI_MEMORY_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    local ts ep ip cloud dev net status
+    ts="$(json_str "$f" "timestamp")"
+    ep="$(epoch_from_iso "$ts")"
+    ip="$(json_str "$f" "ip")"
+    cloud="$(json_str "$f" "cloud_id")"
+    dev="$(json_str "$f" "device_name")"
+    net="$(json_str "$f" "network_name")"
+    status="$(json_str "$f" "status")"
+    [[ -z "$cloud" ]] && cloud="$(basename "$f" .json)"
+    rows+=("${ep}|${cloud}|${ts}|${ip}|${dev}|${net}|${status}|${f}")
+  done
+  shopt -u nullglob
+
+  if ((${#rows[@]}==0)); then
+    dlg --title "Meraki SwitchClaims" --msgbox "No *.json entries found in:\n$MERAKI_MEMORY_DIR" 9 80
+    return
+  fi
+
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
+  local choices=()
+  choices+=("ALL" "Compiled summary (all devices)")
+
+  local line cloud ts ip dev net status
+  for line in "${sorted[@]}"; do
+    cloud="$(cut -d'|' -f2 <<<"$line")"
+    ts="$(cut -d'|' -f3 <<<"$line")"
+    ip="$(cut -d'|' -f4 <<<"$line")"
+    dev="$(cut -d'|' -f5 <<<"$line")"
+    net="$(cut -d'|' -f6 <<<"$line")"
+    status="$(cut -d'|' -f7 <<<"$line")"
+    choices+=("$cloud" "${ts}  ${ip}  ${dev}  (${net})  [${status}]")
+  done
+
+  while true; do
+    dlg --title "Meraki SwitchClaims" \
+        --menu "Inventory Root: $MERAKI_MEMORY_DIR\n\nSelect an entry:" 24 130 14 "${choices[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    local sel="$DOUT"
+    if [[ "$sel" == "ALL" ]]; then
+      local tmp; tmp="$(mktemp)"
+      meraki_memory_build_csv >"$tmp"
+      dlg --title "Compiled Claim Summary (CSV)" --textbox "$tmp" 0 0
+      rm -f "$tmp"
+      continue
+    fi
+
+    local path=""
+    for line in "${sorted[@]}"; do
+      cloud="$(cut -d'|' -f2 <<<"$line")"
+      [[ "$cloud" == "$sel" ]] || continue
+      path="$(cut -d'|' -f8- <<<"$line")"
+      break
+    done
+
+    [[ -n "$path" && -f "$path" ]] || {
+      dlg --title "Not found" --msgbox "Could not locate JSON for:\n$sel" 8 60
+      continue
+    }
+
+    show_meraki_memory_entry_menu "$path" "Claim: $sel"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# NEW: Port Migration viewer (runs/port_migration/migrate-*)
+# ---------------------------------------------------------------------------
+portmig_epoch_from_id(){
+  # migrate-YYYYmmddHHMMSS
+  local mid="$1"; mid="${mid#migrate-}"
+  date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
+}
+portmig_local_from_id(){
+  local mid="$1"; mid="${mid#migrate-}"
+  date -d "@$(date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s)" \
+       '+%F %T %Z' 2>/dev/null || echo "$mid"
+}
+
+show_portmig_run_menu(){
+  local rdir="$1" title="$2"
+  local devdir="$rdir/devlogs"
+  local portsdir="$rdir/ports"
+
+  while true; do
+    local items=()
+    [[ -d "$devdir" ]] && items+=("dev" "Device logs (devlogs/)")
+    [[ -d "$portsdir" ]] && items+=("ports" "Port diffs/intents (ports/)")
+    items+=("path" "Show run folder path")
+    items+=("back" "Back")
+
+    dlg --title "$title" --menu "Choose what to view" 18 90 10 "${items[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    case "$DOUT" in
+      dev)
+        if [[ ! -d "$devdir" ]]; then
+          dlg --title "Device logs" --msgbox "No devlogs directory found:\n$devdir" 8 70
+          continue
+        fi
+        mapfile -t logs < <(ls -1 "$devdir"/*.log 2>/dev/null || true)
+        if ((${#logs[@]}==0)); then
+          dlg --title "Device logs" --msgbox "No *.log files found in:\n$devdir" 9 70
+          continue
+        fi
+        local devitems=() f base
+        for f in "${logs[@]}"; do
+          base="$(basename "$f")"
+          devitems+=("$f" "$base")
+        done
+        while true; do
+          dlg --title "Port Migration Device Logs" --menu "Pick a log to view" 22 120 14 "${devitems[@]}"
+          local rc2=$DIALOG_RC
+          [[ $rc2 -ne 0 ]] && break
+
+          local pick="$DOUT"
+          local b; b="$(basename "$pick")"
+          if [[ "$b" == *_ports_apply.log ]]; then
+            view_ports_apply_log_filtered "$pick" "$b"
+          else
+            view_file "$pick" "$b"
+          fi
+        done
+        ;;
+      ports)
+        if [[ ! -d "$portsdir" ]]; then
+          dlg --title "Ports" --msgbox "No ports directory found:\n$portsdir" 8 70
+          continue
+        fi
+        mapfile -t pf < <(ls -1 "$portsdir"/* 2>/dev/null || true)
+        if ((${#pf[@]}==0)); then
+          dlg --title "Ports" --msgbox "No files found in:\n$portsdir" 8 70
+          continue
+        fi
+        local pitems=() p
+        for p in "${pf[@]}"; do pitems+=("$p" "$(basename "$p")"); done
+        dlg --title "Ports" --menu "Pick a file to view" 22 120 14 "${pitems[@]}"
+        local rc3=$DIALOG_RC
+        (( rc3 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        ;;
+      path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
+      back) return ;;
+    esac
+  done
+}
+
+port_migration_menu(){
+  if [[ ! -d "$PORT_MIG_DIR" ]]; then
+    dlg --title "Port Migration Runs" --msgbox "No port migration runs found yet.\n\nExpected directory:\n$PORT_MIG_DIR" 9 80
+    return
+  fi
+
+  local rows=() d base ep loc
+  shopt -s nullglob
+  for d in "$PORT_MIG_DIR"/migrate-*; do
+    [[ -d "$d" ]] || continue
+    base="$(basename "$d")"
+    ep="$(portmig_epoch_from_id "$base")"
+    loc="$(portmig_local_from_id "$base")"
+    rows+=("${ep}|PM:${base}|${loc}  (Port migration)|${d}")
+  done
+  shopt -u nullglob
+
+  if ((${#rows[@]}==0)); then
+    dlg --title "Port Migration Runs" --msgbox "No migrate-* runs found under:\n$PORT_MIG_DIR" 9 80
+    return
+  fi
+
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
+  local choices=() line tag txt
+  for line in "${sorted[@]}"; do
+    tag="$(cut -d'|' -f2 <<<"$line")"
+    txt="$(cut -d'|' -f3 <<<"$line")"
+    choices+=("$tag" "$txt")
+  done
+
+  while true; do
+    dlg --title "Port Migration Runs" --menu "Select a run" 22 120 12 "${choices[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    local sel="$DOUT"
+    local path=""
+    for line in "${sorted[@]}"; do
+      [[ "$sel" == "$(cut -d'|' -f2 <<<"$line")" ]] || continue
+      path="$(cut -d'|' -f4- <<<"$line")"
+      break
+    done
+
+    show_portmig_run_menu "$path" "Port Migration: ${sel#PM:}"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Top-level main menu
 # ---------------------------------------------------------------------------
 main(){
@@ -815,6 +1079,7 @@ main(){
     MENU_ITEMS+=("6" "HTTP Client Fix Runs"     "$(color_help "${HELP_TEXT[6]}")")
     MENU_ITEMS+=("7" "Search by IP / text"      "$(color_help "${HELP_TEXT[7]}")")
     MENU_ITEMS+=("8" "Created Networks"         "$(color_help "${HELP_TEXT[8]}")")
+    MENU_ITEMS+=("9" "Port Migration Runs"      "$(color_help "${HELP_TEXT[9]}")")
     MENU_ITEMS+=("0" "Exit"                     "$(color_help "${HELP_TEXT[0]}")")
 
     local CHOICE
@@ -822,7 +1087,7 @@ main(){
       dialog --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "Logging & Reports" \
-        --menu "Log Root: $ROOT\n\nSelect an option:" 22 90 9 \
+        --menu "Log Root: $ROOT\n\nSelect an option:" 23 95 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || break
@@ -836,8 +1101,10 @@ main(){
       6) httpfix_menu         ;;
       7) ip_search_menu       ;;
       8) createnetworks_menu  ;;
+      9) port_migration_menu  ;;
       0) break                ;;
     esac
   done
 }
+
 main

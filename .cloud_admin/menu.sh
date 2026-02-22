@@ -17,14 +17,22 @@ HELP_COLOR_PREFIX="${HELP_COLOR_PREFIX:-\Zb\Z3}"  # bold yellow
 HELP_COLOR_RESET="${HELP_COLOR_RESET:-\Zn}"
 MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 
+# Completion marker files (OK stamps)
+MIGRATION_OK_FILE="/root/.cloud_admin/migration.ok"
+IOSXE_CONFIG_MIG_OK_FILE="/root/.cloud_admin/iosxe_config_migration.ok"
+IOSXE_UPGRADE_OK_FILE="/root/.cloud_admin/iosxe_upgrade.ok"
+
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
   ["Cloud Support Matrix (Models ↔ IOS-XE)"]="/root/.cloud_admin/cloud_firmware_report.env"
   ["Setup Wizard"]="/root/.cloud_admin/meraki_discovery.env"
   ["Switch Discovery"]="/root/.cloud_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.cloud_admin/preflight.ok"
-  # For migration, we use a symlink to the latest claim log
-  ["Migrate Switches"]="/root/.cloud_admin/meraki_claim.log"
+
+  # NEW completion markers
+  ["IOS-XE Upgrade"]="$IOSXE_UPGRADE_OK_FILE"
+  ["Migrate Switches"]="$MIGRATION_OK_FILE"
+  ["IOS-XE config Migration"]="$IOSXE_CONFIG_MIG_OK_FILE"
 )
 
 # Items: label -> script path
@@ -40,22 +48,29 @@ declare -A ITEMS=(
   # Deployment workflow
   ["Setup Wizard"]="/root/.cloud_admin/setupwizard.sh"
   ["Switch Discovery"]="/root/.cloud_admin/discoverswitches.sh"
-  ["Validate IOS-XE configuration"]="/root/.cloud_admin/meraki_preflight.sh"
   ["IOS-XE Upgrade"]=""  # handled by submenu
+  ["Validate IOS-XE configuration"]="/root/.cloud_admin/meraki_preflight.sh"
+
+  # Switch migration MUST come before IOS-XE config migration
   ["Migrate Switches"]="/root/.cloud_admin/migration.sh"
-  ["Logging"]="/root/.cloud_admin/show_logs.sh"
+
+  # IOS-XE config migration submenu (runs AFTER switches are migrated)
+  ["IOS-XE config Migration"]=""  # handled by submenu
+
   ["Clean Configuration (New Batch Deployment)"]="/root/.cloud_admin/clean.sh"
+  ["Logging"]="/root/.cloud_admin/show_logs.sh"
   ["Utilities"]=""  # handled by submenu
 
   # Server / docs
-  ["Server Management"]=""  # header / separator, not an actual script
-  ["Server Service Control"]=""  # handled by submenu
+  ["Server Management"]=""          # header / separator
+  ["Server Service Control"]=""     # handled by submenu
   ["README"]="/root/.cloud_admin/readme.sh"
 )
 
 # Submenus: label -> function name
 declare -A SUBMENU_FN=(
   ["IOS-XE Upgrade"]="submenu_iosxe"
+  ["IOS-XE config Migration"]="submenu_iosxe_config_migration"
   ["Utilities"]="submenu_utilities"
   ["Server Service Control"]="submenu_server_services"
 )
@@ -67,13 +82,12 @@ declare -A HELP_RAW=(
   ["Deployment Workflow"]="Operational workflows for discovery, validation, upgrade, and cloud conversion."
   ["Setup Wizard"]="Guided Setup: Always run between batches (API keys, credentials)"
   ["Switch Discovery"]="Discover live Catalyst switches, probe via SSH, and build the selection for upgrades."
-  ["Validate IOS-XE configuration"]="Run preflight validation for selected switches and configuration before upgrade."
   ["IOS-XE Upgrade"]="Run IOS-XE install/activate/commit workflows and tools."
-  ["Deploy IOS-XE"]="Copy image to flash, then install/activate/commit on selected switches."
-  ["Schedule Image Upgrade"]="Schedule a future image upgrade (snapshots envs, uses 'at')."
+  ["Validate IOS-XE configuration"]="Run preflight validation for selected switches and configuration before upgrade."
   ["Migrate Switches"]="Run the Catalyst-to-Meraki cloud migration workflow and claim devices into Dashboard."
-  ["Logging"]="View CMDS deployment and migration log files."
+  ["IOS-XE config Migration"]="Port migration + management IP migration (interactive or automated) after switches are claimed."
   ["Clean Configuration (New Batch Deployment)"]="Clear previous selections and files to prepare a new batch deployment."
+  ["Logging"]="View CMDS deployment and migration log files."
   ["Utilities"]="Utility tools for monitoring and quick checks."
   ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
   ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
@@ -82,9 +96,13 @@ declare -A HELP_RAW=(
   ["Server Management"]="Server management tools and utilities."
   ["Server Service Control"]="Manage CMDS services or reboot the server."
   ["README"]="View CMDS cloud README / usage guide."
+
+  # IOS-XE config migration submenu help text (MATCH labels exactly, keep "/")
+  ["Per switch/Per Port"]="Per switch/Per Port with Management IP migration (Interactive)"
+  ["All Switches/All ports"]="No prompt full run (Non-Interactive/Automated)"
 )
 
-# Display order (main menu)
+# Display order (main menu)  (8 then 9 preserved)
 ORDER=(
   "Firmware & Compatibility"
   "Cloud Support Matrix (Models ↔ IOS-XE)"
@@ -94,7 +112,12 @@ ORDER=(
   "Switch Discovery"
   "IOS-XE Upgrade"
   "Validate IOS-XE configuration"
+
+  # 8: Migrate switches FIRST
   "Migrate Switches"
+  # 9: THEN migrate IOS-XE configs
+  "IOS-XE config Migration"
+
   "Clean Configuration (New Batch Deployment)"
   "Logging"
   "Utilities"
@@ -109,27 +132,8 @@ trap cleanup EXIT
 
 is_done(){  # $1=label -> returns 0 if artifact indicates completion
   local lbl="$1" f="${DONE_FILE[$lbl]:-}"
-
   [[ -n "$f" ]] || return 1
-
-  if [[ "$lbl" == "Migrate Switches" ]]; then
-    # Presence of symlink marks completion; optionally fail if underlying log has "FAILED"
-    if [[ -L "$f" ]]; then
-      local tgt; tgt="$(readlink -f -- "$f" 2>/dev/null || true)"
-      if [[ -n "$tgt" && -e "$tgt" ]]; then
-        if grep -q "FAILED" "$tgt" 2>/dev/null; then
-          return 1
-        else
-          return 0
-        fi
-      fi
-      return 1
-    fi
-    return 1
-  fi
-
-  # Default: must be a non-empty file
-  [[ -s "$f" ]]
+  [[ -s "$f" || -f "$f" ]]  # allow empty marker files (touch)
 }
 
 colorize_help(){  # $1=label
@@ -198,6 +202,15 @@ run_target(){
     local rc=$?
     set -e
 
+    # If migrate succeeded, stamp completion marker
+    if [[ "$label" == "Migrate Switches" ]]; then
+      if [[ $rc -eq 0 ]]; then
+        : > "$MIGRATION_OK_FILE" 2>/dev/null || touch "$MIGRATION_OK_FILE"
+      else
+        rm -f -- "$MIGRATION_OK_FILE" 2>/dev/null || true
+      fi
+    fi
+
     case "$rc" in
       0) : ;;                            # success
       1|255|130|143) return 0 ;;         # dialog Cancel/Esc/Ctrl-C → not an error
@@ -233,13 +246,120 @@ submenu_iosxe(){
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
+        --ok-label "OK" \
+        --cancel-label "Back" \
         --menu "Select an option:" 18 78 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || return 0
 
     [[ "$CHOICE" == "0" ]] && return 0
-    run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+
+    local script="${PATH_BY_TAG[$CHOICE]}"
+    local label="${LABEL_BY_TAG[$CHOICE]}"
+
+    clear
+    if [[ -n "$script" && -f "$script" ]]; then
+      set +e
+      bash "$script"
+      local rc=$?
+      set -e
+
+      # Stamp completion marker for IOS-XE Upgrade (main menu item) on success
+      if [[ $rc -eq 0 ]]; then
+        : > "$IOSXE_UPGRADE_OK_FILE" 2>/dev/null || touch "$IOSXE_UPGRADE_OK_FILE"
+      elif [[ $rc -ne 1 && $rc -ne 255 && $rc -ne 130 && $rc -ne 143 ]]; then
+        # real failure → clear completion marker
+        rm -f -- "$IOSXE_UPGRADE_OK_FILE" 2>/dev/null || true
+      fi
+
+      case "$rc" in
+        0) : ;;
+        1|255|130|143) : ;;  # cancel/back/ctrl-c: ignore
+        *) dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
+              --msgbox "Script exited with status $rc.\n\n$script" 8 78 ;;
+      esac
+    else
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
+             --msgbox "Cannot find:\n${script:-<none>}" 7 60
+    fi
+  done
+}
+
+# ---------- IOS-XE config Migration submenu ----------
+submenu_iosxe_config_migration(){
+  local SUB_TITLE="IOS-XE config Migration"
+  color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+
+  while true; do
+    local MENU_ITEMS=()
+    local -A PATH_BY_TAG=()
+    local -A LABEL_BY_TAG=()
+    local -A ARGS_BY_TAG=()
+    local i=1
+
+    # IMPORTANT: labels MUST match HELP_RAW keys exactly (including "/")
+    local lbl1="Per switch/Per Port"
+    local path1="/root/.cloud_admin/per_port_migration.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]:-}")")
+    PATH_BY_TAG["$i"]="$path1"
+    LABEL_BY_TAG["$i"]="$lbl1"
+    ARGS_BY_TAG["$i"]=""   # interactive
+    ((i++))
+
+    local lbl2="All Switches/All ports"
+    local path2="/root/.cloud_admin/per_port_migration.sh"
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]:-}")")
+    PATH_BY_TAG["$i"]="$path2"
+    LABEL_BY_TAG["$i"]="$lbl2"
+    ARGS_BY_TAG["$i"]="--non-interactive"   # CHANGE to your real flag if different
+    ((i++))
+
+    MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
+
+    local CHOICE
+    CHOICE=$(
+      dialog --no-shadow --colors --item-help \
+        --backtitle "$BACKTITLE" \
+        --title "$SUB_TITLE" \
+        --ok-label "OK" \
+        --cancel-label "Back" \
+        --menu "Select an option:" 14 92 8 \
+        "${MENU_ITEMS[@]}" \
+        3>&1 1>&2 2>&3
+    ) || { return 0; }
+
+    [[ "$CHOICE" == "0" ]] && return 0
+
+    local script="${PATH_BY_TAG[$CHOICE]}"
+    local label="${LABEL_BY_TAG[$CHOICE]}"
+    local args="${ARGS_BY_TAG[$CHOICE]}"
+
+    clear
+    if [[ -n "$script" && -f "$script" ]]; then
+      set +e
+      # shellcheck disable=SC2086
+      bash "$script" $args
+      local rc=$?
+      set -e
+
+      # Stamp completion marker for IOS-XE config Migration (main menu item) on success
+      if [[ $rc -eq 0 ]]; then
+        : > "$IOSXE_CONFIG_MIG_OK_FILE" 2>/dev/null || touch "$IOSXE_CONFIG_MIG_OK_FILE"
+      elif [[ $rc -ne 1 && $rc -ne 255 && $rc -ne 130 && $rc -ne 143 ]]; then
+        rm -f -- "$IOSXE_CONFIG_MIG_OK_FILE" 2>/dev/null || true
+      fi
+
+      case "$rc" in
+        0) : ;;
+        1|255|130|143) : ;;
+        *) dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
+              --msgbox "Script exited with status $rc.\n\n$script $args" 8 78 ;;
+      esac
+    else
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
+            --msgbox "Cannot find:\n${script:-<none>}" 7 60
+    fi
   done
 }
 
@@ -288,6 +408,8 @@ submenu_utilities(){
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
+        --ok-label "OK" \
+        --cancel-label "Back" \
         --menu "Select a utility:" 16 78 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
@@ -337,6 +459,8 @@ submenu_server_services(){
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
+        --ok-label "OK" \
+        --cancel-label "Back" \
         --menu "Select an option:" 14 78 8 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
@@ -390,6 +514,8 @@ while true; do
     dialog --no-shadow --colors --item-help \
       --backtitle "$BACKTITLE" \
       --title "$TITLE" \
+      --ok-label "OK" \
+      --cancel-label "Back" \
       --menu "Select an option:" 22 78 10 \
       "${MENU_ITEMS[@]}" \
       3>&1 1>&2 2>&3

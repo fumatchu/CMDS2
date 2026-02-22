@@ -155,94 +155,6 @@ read_ip_list() {
   fi
 }
 
-# ===== UI =====
-DIALOG_AVAILABLE=0
-if [[ "$UI_MODE" == "dialog" ]] && command -v dialog >/dev/null 2>&1; then DIALOG_AVAILABLE=1; fi
-
-STATUS_FILE="$(mktemp)"; : > "$STATUS_FILE"
-PROG_PIPE="$(mktemp -u)"
-PROG_FD=""
-DIALOG_PID=""
-TAIL_H=; TAIL_W=; GAUGE_H=; GAUGE_W=; GAUGE_ROW=; GAUGE_COL=
-
-_ui_calc_layout() {
-  local lines cols
-  if ! read -r lines cols < <(stty size 2>/dev/null); then lines=24 cols=80; fi
-  if (( lines < 18 || cols < 70 )); then DIALOG_AVAILABLE=0; return; fi
-  TAIL_H=$((lines - 10)); (( TAIL_H < 10 )) && TAIL_H=10
-  TAIL_W=$((cols - 4));   (( TAIL_W < 68 )) && TAIL_W=68
-  GAUGE_H=7
-  GAUGE_W=$TAIL_W
-  GAUGE_ROW=$((TAIL_H + 3))
-  GAUGE_COL=2
-}
-
-_ui_fd_open() {
-  [[ -n "${PROG_FD:-}" ]] || return 1
-  [[ -e "/proc/$$/fd/$PROG_FD" ]] && return 0
-  { : >&"$PROG_FD"; } 2>/dev/null || return 1
-  return 0
-}
-
-ui_start() {
-  _ui_calc_layout
-  log_msg "UI: start (DIALOG_AVAILABLE=$DIALOG_AVAILABLE)"
-  if (( DIALOG_AVAILABLE )); then
-    mkfifo "$PROG_PIPE"
-    exec {PROG_FD}<>"$PROG_PIPE"
-    (
-      dialog --no-shadow \
-             --backtitle "Discovering Switches" \
-             --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
-             --and-widget \
-             --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
-             --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE"
-    ) & DIALOG_PID=$!
-    sleep 0.15
-  else
-    echo "[info] UI plain mode (set UI_MODE=dialog and install 'dialog')."
-  fi
-}
-
-ui_status() {
-  local msg="$1"
-  log_msg "STATUS: $msg"
-  printf '%(%H:%M:%S)T %s\n' -1 "$msg" >> "$STATUS_FILE"
-  (( DIALOG_AVAILABLE )) || echo "$msg"
-}
-
-ui_gauge() {
-  local p="$1"; shift || true; local m="${*:-Working…}"
-  log_msg "GAUGE: ${p}%% - $m"
-  if (( DIALOG_AVAILABLE )); then
-    if _ui_fd_open; then
-      { printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; } 2>/dev/null || true
-    fi
-  else
-    echo "[progress] $p%% - $m"
-  fi
-}
-
-ui_stop() {
-  log_msg "UI: stop"
-  if (( DIALOG_AVAILABLE )); then
-    if _ui_fd_open; then
-      { printf 'XXX\n100\nDone.\nXXX\n' >&"$PROG_FD"; } 2>/dev/null || true
-    fi
-    if [[ -n "${PROG_FD:-}" ]]; then
-      exec {PROG_FD}>&- 2>/dev/null || true
-      PROG_FD=""
-    fi
-    rm -f "$PROG_PIPE" 2>/dev/null || true
-    if [[ -n "${DIALOG_PID:-}" ]]; then
-      kill "$DIALOG_PID" 2>/dev/null || true
-      DIALOG_PID=""
-    fi
-  fi
-  rm -f "$STATUS_FILE" 2>/dev/null || true
-}
-trap 'ui_stop' EXIT
-
 # ===== helpers =====
 clean_field() {
   local s
@@ -350,6 +262,94 @@ pick_target_for_ip() {
   printf '%s|%s|%s|%s|%s\n' "$train" "$min" "$status" "$best_file" "$best_ver"
 }
 
+# ===== UI =====
+DIALOG_AVAILABLE=0
+if [[ "$UI_MODE" == "dialog" ]] && command -v dialog >/dev/null 2>&1; then DIALOG_AVAILABLE=1; fi
+
+STATUS_FILE="$(mktemp)"; : > "$STATUS_FILE"
+PROG_PIPE="$(mktemp -u)"
+PROG_FD=""
+DIALOG_PID=""
+TAIL_H=; TAIL_W=; GAUGE_H=; GAUGE_W=; GAUGE_ROW=; GAUGE_COL=
+
+_ui_calc_layout() {
+  local lines cols
+  if ! read -r lines cols < <(stty size 2>/dev/null); then lines=24 cols=80; fi
+  if (( lines < 18 || cols < 70 )); then DIALOG_AVAILABLE=0; return; fi
+  TAIL_H=$((lines - 10)); (( TAIL_H < 10 )) && TAIL_H=10
+  TAIL_W=$((cols - 4));   (( TAIL_W < 68 )) && TAIL_W=68
+  GAUGE_H=7
+  GAUGE_W=$TAIL_W
+  GAUGE_ROW=$((TAIL_H + 3))
+  GAUGE_COL=2
+}
+
+_ui_fd_open() {
+  [[ -n "${PROG_FD:-}" ]] || return 1
+  [[ -e "/proc/$$/fd/$PROG_FD" ]] && return 0
+  { : >&"$PROG_FD"; } 2>/dev/null || return 1
+  return 0
+}
+
+ui_start() {
+  _ui_calc_layout
+  log_msg "UI: start (DIALOG_AVAILABLE=$DIALOG_AVAILABLE)"
+  if (( DIALOG_AVAILABLE )); then
+    mkfifo "$PROG_PIPE"
+    exec {PROG_FD}<>"$PROG_PIPE"
+    (
+      dialog --no-shadow \
+             --backtitle "Discovering Switches" \
+             --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
+             --and-widget \
+             --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
+             --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE"
+    ) & DIALOG_PID=$!
+    sleep 0.15
+  else
+    echo "[info] UI plain mode (set UI_MODE=dialog and install 'dialog')."
+  fi
+}
+
+ui_status() {
+  local msg="$1"
+  log_msg "STATUS: $msg"
+  printf '%(%H:%M:%S)T %s\n' -1 "$msg" >> "$STATUS_FILE"
+  (( DIALOG_AVAILABLE )) || echo "$msg"
+}
+
+ui_gauge() {
+  local p="$1"; shift || true; local m="${*:-Working…}"
+  log_msg "GAUGE: ${p}%% - $m"
+  if (( DIALOG_AVAILABLE )); then
+    if _ui_fd_open; then
+      { printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; } 2>/dev/null || true
+    fi
+  else
+    echo "[progress] $p%% - $m"
+  fi
+}
+
+ui_stop() {
+  log_msg "UI: stop"
+  if (( DIALOG_AVAILABLE )); then
+    if _ui_fd_open; then
+      { printf 'XXX\n100\nDone.\nXXX\n' >&"$PROG_FD"; } 2>/dev/null || true
+    fi
+    if [[ -n "${PROG_FD:-}" ]]; then
+      exec {PROG_FD}>&- 2>/dev/null || true
+      PROG_FD=""
+    fi
+    rm -f "$PROG_PIPE" 2>/dev/null || true
+    if [[ -n "${DIALOG_PID:-}" ]]; then
+      kill "$DIALOG_PID" 2>/dev/null || true
+      DIALOG_PID=""
+    fi
+  fi
+  rm -f "$STATUS_FILE" 2>/dev/null || true
+}
+trap 'ui_stop' EXIT
+
 # ===== Stack parsing (show switch) =====
 parse_stack_info() {
   local file="$1"
@@ -392,7 +392,7 @@ parse_stack_info() {
   printf '%s\t%s\t%s\n' "${base_mac:-}" "$is_stack" "$stack_members"
 }
 
-# NEW: per-member MACs from "show switch" READY rows, ordered by switch# (1,2,3,…)
+# per-member MACs from "show switch" READY rows, ordered by switch# (1,2,3,…)
 parse_stack_member_macs() {
   local file="$1"
   local line sw mac state state_upper
@@ -435,10 +435,137 @@ parse_mb_serials() {
     fi
   done < "$file"
 
-  # dedupe while preserving order
   if ((${#mb[@]} > 0)); then
     printf '%s\n' "${mb[@]}" | awk '!seen[$0]++'
   fi
+}
+
+# ===== NEW: stack_detail.members[] from "show switch" =====
+parse_stack_detail_members_json() {
+  local file="$1"
+  local line
+  local in_table=0
+
+  while IFS= read -r line; do
+    if (( ! in_table )); then
+      [[ "$line" =~ ^Switch# ]] && { in_table=1; continue; }
+      continue
+    fi
+    [[ -z "$line" ]] && break
+    [[ "$line" =~ ^-+$ ]] && continue
+
+    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:space:]]+([A-Za-z]+) ]]; then
+      local sw="${BASH_REMATCH[1]}"
+      local role="${BASH_REMATCH[2]}"
+      local mac="${BASH_REMATCH[3]}"
+      local state="${BASH_REMATCH[6]}"
+      local state_upper="${state^^}"
+
+      [[ "$state_upper" == "READY" ]] || continue
+
+      printf '%s|%s|%s|%s\n' \
+        "$sw" "$(clean_field "$role")" "$(clean_field "$mac")" "$(clean_field "$state")"
+    fi
+  done < "$file" \
+  | sort -t'|' -k1,1n \
+  | jq -R -s '
+      split("\n")
+      | map(select(length>0))
+      | map(split("|"))
+      | map({
+          member_index: (.[0] | tonumber),
+          role: .[1],
+          state: .[3],
+          mac: .[2]
+        })
+    '
+}
+
+# ===== NEW: hw_detail.members{} from "show inventory" =====
+parse_inventory_hw_detail_json() {
+  local file="$1"
+
+  awk '
+    function ltrim(s){ sub(/^[ \t\r\n]+/, "", s); return s }
+    function rtrim(s){ sub(/[ \t\r\n]+$/, "", s); return s }
+    function trim(s){ return rtrim(ltrim(s)) }
+
+    BEGIN{
+      inblk=0; sw=0; name=""; pid=""; sn="";
+    }
+
+    /^NAME:[ \t]*"/{
+      inblk=1;
+      name=$0;
+      sub(/^NAME:[ \t]*"/, "", name);
+      sub(/".*$/, "", name);
+      name=trim(name);
+      pid=""; sn="";
+
+      sw=0;
+      if (match(name, /Switch[ \t]+([0-9]+)/, m)) sw=m[1]+0;
+      next
+    }
+
+    inblk && /PID:[ \t]*/{
+      pid=$0; sub(/.*PID:[ \t]*/, "", pid); sub(/,[ \t]*VID:.*$/, "", pid);
+      pid=trim(pid);
+      next
+    }
+
+    inblk && /SN:[ \t]*/{
+      sn=$0; sub(/.*SN:[ \t]*/, "", sn);
+      sn=trim(sn);
+      next
+    }
+
+    inblk && /^$/{
+      if (sw>0 && (pid!="" || sn!="")) {
+        printf "%d|%s|%s|%s\n", sw, name, pid, sn;
+      }
+      inblk=0; sw=0; name=""; pid=""; sn="";
+      next
+    }
+
+    END{
+      if (inblk && sw>0 && (pid!="" || sn!="")) {
+        printf "%d|%s|%s|%s\n", sw, name, pid, sn;
+      }
+    }
+  ' "$file" \
+  | jq -R -s '
+      def is_nm($n):
+        ($n|ascii_downcase) | (test("uplink") or test("network module") or test("nm") or test("module"));
+
+      def is_chassis($n):
+        ($n|ascii_downcase)
+        | (test("chassis") or test("^switch[ ]+[0-9]+$"))
+        and (test("power")|not) and (test("fan")|not) and (test("supply")|not);
+
+      split("\n")
+      | map(select(length>0))
+      | map(split("|"))
+      | map({
+          sw: (.[0]|tonumber),
+          name: .[1],
+          pid: (.[2]//""),
+          sn: (.[3]//"")
+        })
+      | reduce .[] as $r ({};
+          .[$r.sw|tostring] |= (
+            . // { chassis_pid:"", chassis_sn:"", nm_modules:[] }
+            | if (is_chassis($r.name) and ($r.pid != "" or $r.sn != "")) then
+                .chassis_pid = (if $r.pid != "" then $r.pid else .chassis_pid end)
+              | .chassis_sn  = (if $r.sn  != "" then $r.sn  else .chassis_sn  end)
+              else .
+              end
+            | if (is_nm($r.name) and ($r.pid != "" or $r.sn != "")) then
+                .nm_modules += [{ name: $r.name, pid: $r.pid, sn: $r.sn }]
+              else .
+              end
+          )
+        )
+    '
 }
 
 # ===== Discovery fallback records =====
@@ -446,9 +573,9 @@ emit_extra_json() {
   local hosts=("$@")
   for ip in "${hosts[@]}"; do
     if [[ -n "${TCP22[$ip]:-}" ]]; then
-      printf '{"ip":"%s","ssh":true,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"login failed"}\n' "$ip"
+      printf '{"ip":"%s","ssh":true,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"login failed","stack_detail":{"source":"","members":[]},"hw_detail":{"source":"","members":{}}}\n' "$ip"
     else
-      printf '{"ip":"%s","ssh":false,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"ssh closed or unreachable"}\n' "$ip"
+      printf '{"ip":"%s","ssh":false,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"ssh closed or unreachable","stack_detail":{"source":"","members":[]},"hw_detail":{"source":"","members":{}}}\n' "$ip"
     fi
   done | jq -s '.'
 }
@@ -460,7 +587,12 @@ probe_host() {
   ui_status "[${ip}] Probing via SSH…"
 
   local backup_enabled="false" backup_status="SKIPPED" backup_url="" backup_filename="" backup_timestamp_utc=""
-  local base_mac="" is_stack="false" stack_members=1 stack_serials_json="[]" stack_macs_json="[]"  # NEW
+  local base_mac="" is_stack="false" stack_members=1 stack_serials_json="[]" stack_macs_json="[]"
+
+  # Always present (schema-consistent)
+  local stack_detail_json hw_detail_json
+  stack_detail_json='{"source":"","members":[]}'
+  hw_detail_json='{"source":"","members":{}}'
 
   local -a SSH_CMD
   if [[ -n "$SSH_KEY_PATH" && -r "$SSH_KEY_PATH" ]]; then
@@ -547,7 +679,6 @@ probe_host() {
     is_stack="true"
     stack_members="$stack_members_val"
 
-    # dedupe mb serials and limit to stack_members
     if ((${#mb_arr[@]} > 0)); then
       local -a uniq=()
       local s
@@ -564,9 +695,7 @@ probe_host() {
         limited+=("${uniq[i]}")
       done
       if ((${#limited[@]} > 0)); then
-        stack_serials_json="$(
-          printf '%s\n' "${limited[@]}" | jq -R . | jq -s '.'
-        )"
+        stack_serials_json="$(printf '%s\n' "${limited[@]}" | jq -R . | jq -s '.')"
       else
         stack_serials_json='[]'
       fi
@@ -574,7 +703,6 @@ probe_host() {
       stack_serials_json='[]'
     fi
 
-    # limit MACs to stack_members, preserve order 1,2,3…
     if ((${#mac_arr[@]} > 0)); then
       local -a mac_limited=()
       local i
@@ -582,9 +710,7 @@ probe_host() {
         [[ -n "${mac_arr[i]}" ]] && mac_limited+=("${mac_arr[i]}")
       done
       if ((${#mac_limited[@]} > 0)); then
-        stack_macs_json="$(
-          printf '%s\n' "${mac_limited[@]}" | jq -R . | jq -s '.'
-        )"
+        stack_macs_json="$(printf '%s\n' "${mac_limited[@]}" | jq -R . | jq -s '.')"
       else
         stack_macs_json='[]'
       fi
@@ -592,9 +718,9 @@ probe_host() {
       stack_macs_json='[]'
     fi
   else
-    # treat as standalone device regardless of how many mb serial lines there are
     is_stack="false"
     stack_members=1
+
     local first_serial=""
     if ((${#mb_arr[@]} > 0)); then
       first_serial="${mb_arr[0]}"
@@ -602,14 +728,11 @@ probe_host() {
       first_serial="$sn"
     fi
     if [[ -n "$first_serial" ]]; then
-      stack_serials_json="$(
-        printf '%s\n' "$first_serial" | jq -R . | jq -s '.'
-      )"
+      stack_serials_json="$(printf '%s\n' "$first_serial" | jq -R . | jq -s '.')"
     else
       stack_serials_json='[]'
     fi
 
-    # single member MAC array: prefer per-member MAC, else base_mac
     local first_mac=""
     if ((${#mac_arr[@]} > 0)); then
       first_mac="${mac_arr[0]}"
@@ -617,12 +740,20 @@ probe_host() {
       first_mac="$base_mac"
     fi
     if [[ -n "$first_mac" ]]; then
-      stack_macs_json="$(
-        printf '%s\n' "$first_mac" | jq -R . | jq -s '.'
-      )"
+      stack_macs_json="$(printf '%s\n' "$first_mac" | jq -R . | jq -s '.')"
     else
       stack_macs_json='[]'
     fi
+  fi
+
+  # Only build detail objects when login succeeded
+  if (( login_ok )); then
+    local stack_members_detail='[]' inv_hw_members='{}'
+    stack_members_detail="$(parse_stack_detail_members_json "$outn" 2>/dev/null || echo '[]')"
+    inv_hw_members="$(parse_inventory_hw_detail_json "$outn" 2>/dev/null || echo '{}')"
+
+    stack_detail_json="$(jq -n --arg src "show switch" --argjson members "$stack_members_detail" '{source:$src, members:$members}')"
+    hw_detail_json="$(jq -n --arg src "show inventory" --argjson members "$inv_hw_members" '{source:$src, members:$members}')"
   fi
 
   local bl_flag="false" bl_reason=""
@@ -666,7 +797,6 @@ probe_host() {
   rm -f "$facts" "$outn"
 
   if (( login_ok )); then
-    # PID allowlist enforcement
     if [[ -n "${pid:-}" ]]; then
       case "$pid" in
         C9200*|C9300*|C9400*|C9500*|C9600*) : ;;
@@ -694,6 +824,8 @@ probe_host() {
       --arg stack_members_str "${stack_members:-1}" \
       --argjson stack_serials "$stack_serials_json" \
       --argjson stack_macs "$stack_macs_json" \
+      --argjson stack_detail "$stack_detail_json" \
+      --argjson hw_detail "$hw_detail_json" \
       '{
          ip: $ip,
          ssh: true,
@@ -707,6 +839,8 @@ probe_host() {
          stack_members: ($stack_members_str|tonumber? // 1),
          stack_serials: $stack_serials,
          stack_macs: $stack_macs,
+         stack_detail: $stack_detail,
+         hw_detail: $hw_detail,
          backup_enabled: ($backup_enabled=="true"),
          backup_status: $backup_status,
          backup_url: $backup_url,
@@ -719,25 +853,27 @@ probe_host() {
     jq -n \
       --arg ip "$ip" \
       '{
-         ip:$ip,
-         ssh:true,
-         login:false,
-         hostname:"UNKNOWN",
-         version:"UNKNOWN",
-         pid:"UNKNOWN",
-         serial:"",
-         base_mac:"",
-         is_stack:false,
-         stack_members:0,
-         stack_serials:[],
-         stack_macs:[],
-         backup_enabled:false,
-         backup_status:"SKIPPED",
-         backup_url:"",
-         backup_filename:"",
-         backup_timestamp_utc:"",
-         blacklisted:true,
-         blacklist_reason:"login failed"
+         ip: $ip,
+         ssh: true,
+         login: false,
+         hostname: "UNKNOWN",
+         version: "UNKNOWN",
+         pid: "UNKNOWN",
+         serial: "",
+         base_mac: "",
+         is_stack: false,
+         stack_members: 0,
+         stack_serials: [],
+         stack_macs: [],
+         stack_detail: { source: "", members: [] },
+         hw_detail: { source: "", members: {} },
+         backup_enabled: false,
+         backup_status: "SKIPPED",
+         backup_url: "",
+         backup_filename: "",
+         backup_timestamp_utc: "",
+         blacklisted: true,
+         blacklist_reason: "login failed"
        }'
   fi
 }
@@ -790,7 +926,7 @@ run_nmap_with_heartbeat() {
   local scan_pid=$!
 
   local elapsed=0
-  while kill -0 "$scan_pid" 2>/divnull; do
+  while kill -0 "$scan_pid" 2>/dev/null; do
     ui_status "${label}… (elapsed ${elapsed}s)"
     sleep 5; ((elapsed+=5))
   done
@@ -857,14 +993,24 @@ run_probe_pool() {
     pids+=("$!"); ((running++))
 
     if (( running >= max )); then
-      if (( HAS_WAIT_N )); then wait -n || true; else wait "${pids[0]}" || true; pids=("${pids[@]:1}"); fi
+      if (( HAS_WAIT_N )); then
+        wait -n || true
+      else
+        wait "${pids[0]}" || true
+        pids=("${pids[@]:1}")
+      fi
       ((done++)); ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
       ((running--))
     fi
   done
 
   while (( running > 0 )); do
-    if (( HAS_WAIT_N )); then wait -n || true; else wait "${pids[0]}" || true; pids=("${pids[@]:1}"); fi
+    if (( HAS_WAIT_N )); then
+      wait -n || true
+    else
+      wait "${pids[0]}" || true
+      pids=("${pids[@]:1}")
+    fi
     ((done++)); ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
     ((running--))
   done
@@ -1135,7 +1281,6 @@ main() {
     echo "Selection UI skipped (dialog not available)."
   fi
 
-  # Backup failure summary at the end
   local failed_list
   failed_list="$(jq -r '.[] | select(.backup_enabled==true and .backup_status=="FAILED") | "\(.hostname // "UNKNOWN") (\(.ip)) -> \(.backup_filename // "N/A")"' "$JSON_OUT")"
 
