@@ -399,8 +399,7 @@ Download the following IOS-XE image train(s) before continuing:
 Details:${details}
 
 Reminder:
-- Always verify Cisco's current recommended release for your platform.
-- This wizard enforces your local bible + scan results."
+- Always verify Cisco's current recommended release for your platform."
 
   dialog --no-shadow --backtitle "$BACKTITLE" --title "Firmware Needed (from latest scan)" \
     --msgbox "$(printf '%b' "$msg")" 26 "$W_WIDE"
@@ -590,18 +589,10 @@ ensure_firmware_discovery_scan() {
   while :; do
     [ -s "$FIRMWARE_REPORT_ENV" ] && break
 
-    dialog --no-shadow --backtitle "$BACKTITLE" --title "Firmware discovery scan required" --yesno \
-"This Setup Wizard requires a firmware discovery scan BEFORE you can continue.
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Firmware Discovery Required" --yesno \
+"This Setup Wizard requires a firmware discovery scan before you can continue.
 
-The scan creates:
-  • $FIRMWARE_REPORT_ENV
-  • $FIRMWARE_REPORT_JSON
-  • $FIRMWARE_REPORT_SUMMARY_TXT
-
-Missing:
-  $FIRMWARE_REPORT_ENV
-
-Run the discovery scan now (firmware_scan.sh)?" 18 "$W_WIDE"
+Run the discovery scan now?" 10 "$W_WIDE"
 
     rc=$?
     clear
@@ -617,10 +608,8 @@ Fix this path and re-run setupwizard." 10 "$W_WIDE"
       return 1
     fi
 
-    dialog --no-shadow --backtitle "$BACKTITLE" --title "Running discovery scan" --infobox \
-"Starting firmware_scan.sh…
-
-This collects inventory and writes the firmware report used by this wizard." 8 "$W_WIDE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Running Discovery Scan" --infobox \
+"Running firmware discovery scan…" 5 "$W_WIDE"
     sleep 0.8
 
     clear
@@ -655,12 +644,6 @@ Try running the scan again now?" 16 "$W_WIDE"
       clear
       [ $rc -eq 0 ] || return 1
       continue
-    fi
-
-    # Optional: if summary exists, show it once (nice UX).
-    if [ -s "$FIRMWARE_REPORT_SUMMARY_TXT" ]; then
-      dialog --no-shadow --backtitle "$BACKTITLE" --title "Discovery scan summary" \
-        --textbox "$FIRMWARE_REPORT_SUMMARY_TXT" 22 "$W_WIDE"
     fi
 
     break
@@ -986,12 +969,15 @@ HTTP_CLIENT_VLAN_ID=""
 HTTP_CLIENT_SOURCE_IFACE=""
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "HTTP Client Source SVI (required)" \
-      --inputbox "Enter the VLAN SVI number to use with:
+      --inputbox "Enter the VLAN SVI number of the current Management interface.
 
-For downloading IOS-XE images (your MGMT interface):
+This should match the SVI the switch is currently using for management.
+(We can migrate static IP addressing later if needed.)
+
+We will bind the following command to this interface:
   ip http client source-interface Vlan<N>
 
-Examples: 10, 20, 4094" 12 "$W_DEF" "$HTTP_CLIENT_VLAN_ID"
+Examples: 10, 20, 4094" 16 78 "$HTTP_CLIENT_VLAN_ID"
   rc=$?; [ $rc -eq 0 ] || { clear; exit 1; }
   val="$(trim "${DOUT:-}")"
   python3 - "$val" <<'PY'
@@ -1206,26 +1192,10 @@ PY
   REQ_MIN_UNIVERSAL="$(printf '%s\n' "$out" | awk -F= '$1=="UNIVERSAL"{print $2}')"
   REQ_MIN_LITE="$(printf '%s\n' "$out" | awk -F= '$1=="LITE"{print $2}')"
 }
-
-maybe_show_derived_mins_screen() {
-  [ -s "$FIRMWARE_REPORT_JSON" ] || return 0
-  [ -n "$REQ_MIN_UNIVERSAL$REQ_MIN_LITE" ] || return 0
-
-  dialog --no-shadow --backtitle "$BACKTITLE" --title "Minimum IOS-XE requirements" --yesno \
-"These minimums are derived from your BIBLE + latest firmware scan (no manual input).
-
-View them now?" 10 "$W_DEF" || return 0
-
-  msg="Minimum IOS-XE required (derived):\n\n"
-  [ -n "$REQ_MIN_UNIVERSAL" ] && msg="${msg}  • UNIVERSAL (cat9k_iosxe)      >= ${REQ_MIN_UNIVERSAL}\n"
-  [ -n "$REQ_MIN_LITE" ]      && msg="${msg}  • LITE      (cat9k_lite_iosxe) >= ${REQ_MIN_LITE}\n"
-
-  dialog --no-shadow --backtitle "$BACKTITLE" --title "Derived minimums" \
-    --msgbox "$(printf '%b' "$msg")" 14 "$W_WIDE"
-}
+log "Derived mins: UNIVERSAL='${REQ_MIN_UNIVERSAL}' LITE='${REQ_MIN_LITE}'"
 
 derive_required_mins_from_report
-maybe_show_derived_mins_screen
+
 
 ###############################################################################
 # 5) DISCOVERY SCAN RUN DIR (runs/discoveryscans)

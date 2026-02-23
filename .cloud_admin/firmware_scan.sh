@@ -5,7 +5,14 @@
 # - Runs split-screen collection UI (scan -> ssh/22 -> probe -> PID match vs manifest JSON)
 # - Outputs report JSON/CSV + summary + devlogs
 #
-# Wire this into your "Firmware Check" menu.
+# Functional changes in this revision (per your requests):
+#   1) Remove post-run menu: auto-open Summary then exit.
+#   2) Clean up the initial "Firmware Scan" msgbox line-wrapping.
+#   3) Summary page cleanup:
+#        - Remove Inputs/Manifest/Run Dir and Outputs sections (already gone from your last screenshot).
+#        - Notes: remove "required_* fields..." line (already removed), and update UNIVERSAL examples to include C9500.
+#   4) IMPORTANT logic fix: "Downloads needed" must reflect ONLY devices that are BELOW_REQUIRED
+#        (i.e., don't tell them to download versions for switches that already meet the requirement).
 
 set -Euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -124,67 +131,11 @@ dlg_big_dims() {
   echo "$h $w"
 }
 
-# Post-run viewer menu (summary + JSON/CSV + logs)
-post_run_menu() {
-  local h w choice
-  read -r h w < <(dlg_big_dims)
-
-  while :; do
-    choice="$(
-      dialog --no-shadow --backtitle "Firmware Requirement Report" \
-        --title "Report Complete — $RUN_TAG" \
-        --menu "Choose what to view:" 12 60 6 \
-          1 "View Summary" \
-          2 "View JSON results" \
-          3 "View CSV results" \
-          4 "View per-host logs (devlogs/)" \
-          0 "Exit" \
-        2>&1 >/dev/tty
-    )" || break
-
-    case "$choice" in
-      1) dialog --no-shadow --backtitle "Firmware Requirement Report" --title "Summary — $RUN_TAG" \
-            --textbox "$SUMMARY_TXT" "$h" "$w" ;;
-      2) dialog --no-shadow --backtitle "Firmware Requirement Report" --title "JSON — $RUN_TAG" \
-            --textbox "$REPORT_JSON" "$h" "$w" ;;
-      3) dialog --no-shadow --backtitle "Firmware Requirement Report" --title "CSV — $RUN_TAG" \
-            --textbox "$REPORT_CSV" "$h" "$w" ;;
-      4)
-         local tmp pick
-         tmp="$(mktemp)"
-         (cd "$DEVLOG_DIR" && ls -1 2>/dev/null | sed 's/$/ -/') >"$tmp"
-         if [[ ! -s "$tmp" ]]; then
-           dialog --no-shadow --backtitle "Firmware Requirement Report" --title "Devlogs" \
-             --msgbox "No devlogs found in:\n$DEVLOG_DIR" 8 70
-           rm -f "$tmp"
-           continue
-         fi
-         rm -f "$tmp"
-
-         # shellcheck disable=SC2086
-         pick="$(
-           dialog --no-shadow --backtitle "Firmware Requirement Report" \
-             --title "Per-host logs" \
-             --menu "Select a log file to view:" "$h" "$w" 12 \
-             $(cd "$DEVLOG_DIR" && ls -1 | awk '{print $0" -"}') \
-             2>&1 >/dev/tty
-         )" || continue
-
-         if [[ -n "$pick" && -r "$DEVLOG_DIR/$pick" ]]; then
-           dialog --no-shadow --backtitle "Firmware Requirement Report" \
-             --title "Log: $pick" --textbox "$DEVLOG_DIR/$pick" "$h" "$w"
-         fi
-         ;;
-      0) break ;;
-    esac
-  done
-}
-
 ###############################################################################
 # Setupwizard-style prompt flow (dialog) for Network Report
 ###############################################################################
-REPORT_TITLE="CMDS Network Report — Setup"
-REPORT_BACKTITLE="Meraki Migration Toolkit — Network Report"
+REPORT_TITLE="CMDS Firmware Scan — Setup"
+REPORT_BACKTITLE="CMDS Firmware Scan"
 REPORT_ENV_FILE="$ENV_FILE"
 
 ssh_login_ok() {
@@ -367,7 +318,6 @@ _prompt_creds_test_like_setupwizard() {
     [[ -n "$SSH_USERNAME" ]] && break
     dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 "$W_DEF"
   done
-
   while :; do
     dlg --clear --backtitle "$REPORT_BACKTITLE" --title "SSH Password" --insecure --passwordbox "Enter SSH switch password (masked with *):" 9 "$W_DEF"
     rc=$?; [[ $rc -eq 0 ]] || return 1
@@ -505,15 +455,17 @@ write_report_env() {
 prompt_report_setupwizard_flow() {
   need dialog; need python3; need ssh; need sshpass; need expect
 
-  dlg --clear --backtitle "$REPORT_BACKTITLE" --title "Welcome — Network Report" --msgbox \
-"This will generate a Network Report by:
+  # Clean wrapping: indent the continued line to match the text, not the list number.
+  dlg --clear --backtitle "$REPORT_BACKTITLE" --title "Firmware Scan" --msgbox \
+"This is a firmware scan of switches:
+
   1) Choosing targets (scan CIDR or manual list)
   2) Entering SSH credentials and verifying login
   3) Verifying ENABLE password on one sample switch
-  4) Running discovery + collection with live progress UI
-
-This does NOT overwrite meraki_discovery.env.
-It writes: ${REPORT_ENV_FILE}" 14 80 || return 1
+  4) Running discovery
+  5) This information is used to provide the correct
+     versions of IOS-XE and type for models you are migrating
+" 16 80 || return 1
 
   _prompt_targets_like_setupwizard || return 1
   _prompt_creds_test_like_setupwizard || return 1
@@ -563,6 +515,7 @@ _ui_calc_layout() {
   local lines cols
   if ! read -r lines cols < <(stty size 2>/dev/null); then lines=24 cols=80; fi
   if (( lines < 18 || cols < 70 )); then DIALOG_AVAILABLE=0; return; fi
+  DIALOG_AVAILABLE=1
   TAIL_H=$((lines - 10)); (( TAIL_H < 10 )) && TAIL_H=10
   TAIL_W=$((cols - 4));   (( TAIL_W < 68 )) && TAIL_W=68
   GAUGE_H=7
@@ -586,7 +539,7 @@ ui_start() {
     exec {PROG_FD}<>"$PROG_PIPE"
     (
       dialog --no-shadow \
-             --backtitle "Firmware Requirement Report" \
+             --backtitle "CMDS Firmware Scan" \
              --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
              --and-widget \
              --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
@@ -633,19 +586,15 @@ ui_stop() {
   fi
 }
 
-# ===== NEW: update latest pointers safely =====
+# ===== update latest pointers safely =====
 update_latest_pointers() {
   mkdir -p "$REPORT_ROOT" 2>/dev/null || true
 
-  # Directory pointer
   ln -sfn "$RUN_DIR" "$REPORT_ROOT/latest" 2>/dev/null || true
-
-  # File pointers (preferred by other scripts)
   [[ -s "$REPORT_JSON" ]]   && ln -sfn "$REPORT_JSON"   "$REPORT_ROOT/latest.json"        2>/dev/null || true
   [[ -s "$REPORT_CSV"  ]]   && ln -sfn "$REPORT_CSV"    "$REPORT_ROOT/latest.csv"         2>/dev/null || true
   [[ -s "$SUMMARY_TXT" ]]   && ln -sfn "$SUMMARY_TXT"   "$REPORT_ROOT/latest.summary.txt" 2>/dev/null || true
 
-  # Save the env used for this run inside the run dir, and point latest.env at it
   if [[ -s "$ENV_FILE" ]]; then
     cp -f "$ENV_FILE" "$RUN_DIR/cloud_firmware_report.env" 2>/dev/null || true
     ln -sfn "$RUN_DIR/cloud_firmware_report.env" "$REPORT_ROOT/latest.env" 2>/dev/null || true
@@ -653,7 +602,6 @@ update_latest_pointers() {
 }
 
 # ===== Targets / manifest / ssh probe / pool etc =====
-# (unchanged from your version)
 TARGETS=()
 TARGET_MODE=""
 USE_IFACE=0
@@ -1013,14 +961,18 @@ write_csv_and_summary() {
   missing="$(jq '[.[] | select(.status=="MODEL_NOT_IN_MANIFEST")] | length' "$REPORT_JSON" 2>/dev/null || echo 0)"
   loginfail="$(jq '[.[] | select(.status=="LOGIN_FAILED")] | length' "$REPORT_JSON" 2>/dev/null || echo 0)"
 
+  #
+  # FIXED LOGIC:
+  # Only count downloads for devices that are BELOW_REQUIRED.
+  # (If a switch MEETS_REQUIRED, you do NOT need to fetch its "required_min_iosxe".)
+  #
   local byver_txt downloads_txt
   byver_txt="$(jq -r '
     [ .[]
+      | select(.status=="BELOW_REQUIRED")
       | select((.required_min_iosxe//"") != ""
                and (.required_image_type//"") != ""
-               and (.required_image_train//"") != ""
-               and (.status != "MODEL_NOT_IN_MANIFEST")
-               and (.status != "LOGIN_FAILED"))
+               and (.required_image_train//"") != "")
       | {k:(.required_image_type + "|" + .required_image_train + "|" + .required_min_iosxe), c:1}
     ]
     | group_by(.k)
@@ -1033,11 +985,10 @@ write_csv_and_summary() {
 
   downloads_txt="$(jq -r '
     [ .[]
+      | select(.status=="BELOW_REQUIRED")
       | select((.required_min_iosxe//"") != ""
                and (.required_image_type//"") != ""
-               and (.required_image_train//"") != ""
-               and (.status != "MODEL_NOT_IN_MANIFEST")
-               and (.status != "LOGIN_FAILED"))
+               and (.required_image_train//"") != "")
       | {k:(.required_image_type + "|" + .required_image_train + "|" + .required_min_iosxe)}
     ]
     | group_by(.k)
@@ -1051,11 +1002,7 @@ write_csv_and_summary() {
   [[ -z "$downloads_txt" ]] && downloads_txt="  (none)"
 
   {
-    echo "Firmware Requirement Report — $RUN_TAG"
-    echo
-    echo "Inputs ENV: $ENV_FILE"
-    echo "Manifest:   $MANIFEST_JSON"
-    echo "Run Dir:    $RUN_DIR"
+    echo "CMDS Firmware Scan — $RUN_TAG"
     echo
     echo "Totals:"
     echo "  Devices scanned:           $total"
@@ -1064,22 +1011,17 @@ write_csv_and_summary() {
     echo "  Model not in manifest:     $missing"
     echo "  Login failed:              $loginfail"
     echo
-    echo "IOS-XE downloads required (count by image type + version):"
+    echo "IOS-XE downloads required (ONLY devices below requirement):"
     echo "$byver_txt"
     echo
-    echo "Firmware downloads needed (unique by image type + version):"
+    echo "Firmware downloads needed (unique list):"
     echo "$downloads_txt"
     echo
-    echo "Outputs:"
-    echo "  JSON: $REPORT_JSON"
-    echo "  CSV : $REPORT_CSV"
-    echo
     echo "Notes:"
-    echo "  - required_* fields come from your local manifest JSON “bible” (cloud_models.json)."
     echo "  - Image mapping heuristic used:"
     echo "      * LITE (cat9k_lite_iosxe) for C9200/C9200L/C9200CX"
-    echo "      * UNIVERSAL (cat9k_iosxe) for others (e.g., C9300/C9300L/C9300X)"
-    echo "  - This report does not download firmware; it tells you what to fetch from Cisco."
+    echo "      * UNIVERSAL (cat9k_iosxe) for others (e.g., C9300/C9300L/C9300X/C9500)"
+    echo "  - This scan does not download firmware; it tells you what to fetch from Cisco."
   } >"$SUMMARY_TXT"
 }
 
@@ -1166,14 +1108,23 @@ run_collection() {
   ui_gauge 96 "Writing report files…"
   write_csv_and_summary
 
-  # <<< IMPORTANT: update the "latest" pointers every run >>>
   update_latest_pointers
 
   ui_gauge 100 "Report complete."
 
   if (( DIALOG_AVAILABLE )); then
     ui_stop
-    post_run_menu
+
+    # Auto-open the Summary, then exit (no menu)
+    local h w
+    read -r h w < <(dlg_big_dims)
+
+    dialog --no-shadow \
+           --backtitle "CMDS Firmware Scan" \
+           --title "Firmware Scan Complete" \
+           --textbox "$SUMMARY_TXT" "$h" "$w"
+
+    return 0
   else
     cat "$SUMMARY_TXT"
     echo

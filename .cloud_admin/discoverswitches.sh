@@ -73,6 +73,46 @@ UI_MODE="${UI_MODE:-dialog}"
 
 TFTP_BASE="${TFTP_BASE:-}"
 
+# ===== Cloud model "bible" (single source of truth) =====
+CLOUD_MODELS_JSON="${CLOUD_MODELS_JSON:-/root/.cloud_admin/cloud_models.json}"
+
+# Cached regex for fast membership tests
+APPROVED_MODELS_REGEX=""
+APPROVED_MODELS_LOADED=0
+
+load_approved_models() {
+  # Build a single regex like: ^(?:C9200L-24T-4X|C9300-24T|...|C9500-32QC)$
+  [[ "$APPROVED_MODELS_LOADED" -eq 0 ]] || return 0
+  APPROVED_MODELS_LOADED=1
+
+  if [[ -s "$CLOUD_MODELS_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    # Escape regex metacharacters per model string
+    APPROVED_MODELS_REGEX="$(jq -r '
+      .families
+      | map(.models[]) | flatten
+      | unique
+      | map(gsub("([][(){}.^$*+?|\\\\-])"; "\\\\\u0001") | gsub("\u0001"; "\\\\"))
+      | "^(?:" + join("|") + ")$"
+    ' "$CLOUD_MODELS_JSON" 2>/dev/null || true)"
+    APPROVED_MODELS_REGEX="$(clean_field "${APPROVED_MODELS_REGEX:-}")"
+  fi
+}
+
+# is_approved_model PID
+#   0 = in cloud_models.json
+#   1 = not in cloud_models.json
+#   2 = bible missing/unreadable
+is_approved_model() {
+  local pid="${1:-}"
+  pid="$(clean_field "$pid")"
+  [[ -n "$pid" ]] || return 1
+
+  load_approved_models
+  [[ -n "${APPROVED_MODELS_REGEX:-}" ]] || return 2
+
+  [[ "$pid" =~ $APPROVED_MODELS_REGEX ]]
+}
+
 # ===== backup config settings =====
 BACKUP_DIR="${BACKUP_DIR:-/var/lib/tftpboot/mig}"
 BACKUP_CONFIG_ON_DISCOVERY="${BACKUP_CONFIG_ON_DISCOVERY:-1}"  # 1 = take backup during discovery, 0 = disable
@@ -571,11 +611,61 @@ parse_inventory_hw_detail_json() {
 # ===== Discovery fallback records =====
 emit_extra_json() {
   local hosts=("$@")
+  local ip
+
   for ip in "${hosts[@]}"; do
     if [[ -n "${TCP22[$ip]:-}" ]]; then
-      printf '{"ip":"%s","ssh":true,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"login failed","stack_detail":{"source":"","members":[]},"hw_detail":{"source":"","members":{}}}\n' "$ip"
+      # SSH open but login failed
+      jq -n --arg ip "$ip" '
+        {
+          ip: $ip,
+          ssh: true,
+          login: false,
+          hostname: "UNKNOWN",
+          version: "UNKNOWN",
+          pid: "UNKNOWN",
+          serial: "",
+          base_mac: "",
+          is_stack: false,
+          stack_members: 0,
+          stack_serials: [],
+          stack_macs: [],
+          stack_detail: { source: "", members: [] },
+          hw_detail: { source: "", members: {} },
+          backup_enabled: false,
+          backup_status: "SKIPPED",
+          backup_url: "",
+          backup_filename: "",
+          backup_timestamp_utc: "",
+          blacklisted: true,
+          blacklist_reason: "login failed"
+        }'
     else
-      printf '{"ip":"%s","ssh":false,"login":false,"hostname":"UNKNOWN","version":"UNKNOWN","pid":"UNKNOWN","serial":"","base_mac":"","is_stack":false,"stack_members":0,"stack_serials":[],"stack_macs":[],"backup_enabled":false,"backup_status":"SKIPPED","backup_url":"","backup_filename":"","backup_timestamp_utc":"","blacklisted":true,"blacklist_reason":"ssh closed or unreachable","stack_detail":{"source":"","members":[]},"hw_detail":{"source":"","members":{}}}\n' "$ip"
+      # SSH closed or unreachable
+      jq -n --arg ip "$ip" '
+        {
+          ip: $ip,
+          ssh: false,
+          login: false,
+          hostname: "UNKNOWN",
+          version: "UNKNOWN",
+          pid: "UNKNOWN",
+          serial: "",
+          base_mac: "",
+          is_stack: false,
+          stack_members: 0,
+          stack_serials: [],
+          stack_macs: [],
+          stack_detail: { source: "", members: [] },
+          hw_detail: { source: "", members: {} },
+          backup_enabled: false,
+          backup_status: "SKIPPED",
+          backup_url: "",
+          backup_filename: "",
+          backup_timestamp_utc: "",
+          blacklisted: true,
+          blacklist_reason: "ssh closed or unreachable"
+        }'
     fi
   done | jq -s '.'
 }
@@ -628,7 +718,7 @@ probe_host() {
     printf 'show clock\r\n'
     printf 'show version\r\n'
     printf 'show running-config | include ^hostname\r\n'
-    printf 'show running-config | include ^username\r\n'
+    printf 'show running-config | include meraki-user\r\n'
     printf 'show inventory\r\n'
     printf 'show switch\r\n'
     printf 'show hardware\r\n'
@@ -756,9 +846,15 @@ probe_host() {
     hw_detail_json="$(jq -n --arg src "show inventory" --argjson members "$inv_hw_members" '{source:$src, members:$members}')"
   fi
 
-  local bl_flag="false" bl_reason=""
-  if grep -Eq '^username[[:space:]]+meraki-user\b' "$outn"; then
-    bl_flag="true"; bl_reason="meraki-user exists"
+      local bl_flag="false" bl_reason=""
+    # Hybrid/Cloud-managed switches often have a local "meraki-user" account.
+  # IMPORTANT: Do NOT match the echoed CLI command; only match actual config lines.
+  # Matches both:
+  #   "username meraki-user privilege 15 secret ..."
+  #   " username meraki-user"
+  if (( login_ok )) && grep -Eq '^[[:space:]]*username[[:space:]]+meraki-user\b' "$outn"; then
+    bl_flag="true"
+    bl_reason="meraki-user exists (hybrid controlled)"
   fi
 
   # Backup running-config to TFTP
@@ -797,13 +893,65 @@ probe_host() {
   rm -f "$facts" "$outn"
 
   if (( login_ok )); then
-    if [[ -n "${pid:-}" ]]; then
-      case "$pid" in
-        C9200*|C9300*|C9400*|C9500*|C9600*) : ;;
-        *) bl_flag="true"; bl_reason="unsupported PID (${pid})" ;;
-      esac
-    else
+        # ===== Validate against cloud_models.json (the "bible") =====
+    # Prefer chassis_pid(s) from parsed inventory (member-aware / stack-aware)
+    local -a chassis_pids=()
+    mapfile -t chassis_pids < <(jq -r '
+        .members
+        | to_entries
+        | sort_by(.key|tonumber)
+        | .[].value.chassis_pid
+        | select(length>0)
+      ' <<<"$hw_detail_json" 2>/dev/null || true)
+
+    # Fallback: if we couldn't parse per-member chassis PID, use the single parsed PID
+    if ((${#chassis_pids[@]} == 0)) && [[ -n "${pid:-}" ]]; then
+      chassis_pids=("$pid")
+    fi
+
+    # For output consistency, set pid to member-1 chassis pid when available
+    if ((${#chassis_pids[@]} > 0)); then
+      pid="$(clean_field "${chassis_pids[0]}")"
+    fi
+
+    # If still empty, treat as unknown
+    if [[ -z "${pid:-}" ]]; then
       bl_flag="true"; bl_reason="unknown PID (parse failed)"
+    else
+      local all_ok=1 bible_missing=0 bad_pid=""
+      local cp rc
+
+      for cp in "${chassis_pids[@]}"; do
+        cp="$(clean_field "$cp")"
+        [[ -n "$cp" ]] || continue
+
+        if is_approved_model "$cp"; then
+          : # approved
+        else
+          rc=$?
+          if [[ "$rc" -eq 2 ]]; then
+            bible_missing=1
+          else
+            all_ok=0
+            bad_pid="$cp"
+            break
+          fi
+        fi
+      done
+
+      if [[ "$bible_missing" -eq 1 ]]; then
+        # Permissive fallback if bible missing/unreadable: allow Cat9K family prefixes
+        case "${pid^^}" in
+          C9200*|C9300*|C9400*|C9500*|C9600*) : ;;
+          *)
+            bl_flag="true"
+            bl_reason="cloud_models.json missing/unreadable AND unsupported PID (${pid})"
+            ;;
+        esac
+      elif [[ "$all_ok" -ne 1 ]]; then
+        bl_flag="true"
+        bl_reason="not in cloud_models.json (${bad_pid})"
+      fi
     fi
 
     jq -n \
@@ -1133,44 +1281,73 @@ do_selection_dialog() {
     local req_bits=""
     [[ -n "$req_train" || -n "$req_min" ]] && req_bits=" req:${req_train:-?}>=${req_min:-?} (${rep_status})"
 
-    local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})${req_bits}"
+        local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})${req_bits}"
 
     local def="on"
     if [[ "$blacklisted" == "true" ]]; then
       def="off"
       [[ -z "$bl_reason" ]] && bl_reason="blacklisted"
-      text="$text  [BLACKLISTED: ${bl_reason}]"
+
+      # Put BLACKLISTED first so it is immediately visible
+      text="[BLACKLISTED: ${bl_reason}]  ${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})${req_bits}"
+
       BLKMAP["$ip"]="$bl_reason"
     fi
 
     items+=("$ip" "$text" "$def")
-  done < <(
+    done < <(
     jq -r --arg us "$US" --slurpfile plan "$plan" '
       def idx_by_ip(a):
         reduce a[] as $x ({}; .[$x.ip] = $x);
 
+      def ipkey($ip):
+        ($ip|tostring|split(".")|map(tonumber));
+
       ($plan[0] // []) as $p
       | idx_by_ip($p) as $M
-      | .[] as $d
-      | ($M[$d.ip] // {}) as $u
+
+      # Build merged rows first
+      | [ .[] as $d
+          | ($M[$d.ip] // {}) as $u
+          | {
+              ip: ($d.ip|tostring),
+              hostname: ($d.hostname // "UNKNOWN"),
+              pid: ($d.pid // "UNKNOWN"),
+              cur: ($d.version // "UNKNOWN"),
+              tgt: ($u.target_version // "UNKNOWN"),
+              action: ($u.plan_action // "UNKNOWN"),
+              req_train: ($u.required_image_train // ""),
+              req_min: ($u.required_min_iosxe // ""),
+              rep_status: ($u.firmware_report_status // "UNKNOWN"),
+              blacklisted: ((($d.blacklisted // false) or ($u.blacklisted // false))),
+              bl_reason:
+                (if ($d.blacklist_reason // "") != "" then $d.blacklist_reason
+                 elif ($u.blacklist_reason // "") != "" then $u.blacklist_reason
+                 else "" end),
+              ssh: (($d.ssh // false)),
+              login: (($d.login // false))
+            }
+        ]
+
+      # Sort: non-blacklisted first, then by IP numeric
+      | sort_by(.blacklisted, (ipkey(.ip)))
+
+      # Emit fields to bash loop
+      | .[]
       | [
-          ($d.ip|tostring),
-          ($d.hostname // "UNKNOWN"),
-          ($d.pid // "UNKNOWN"),
-          ($d.version // "UNKNOWN"),
-          ($u.target_version // "UNKNOWN"),
-          ($u.plan_action // "UNKNOWN"),
-          ($u.required_image_train // ""),
-          ($u.required_min_iosxe // ""),
-          ($u.firmware_report_status // "UNKNOWN"),
-          ((($d.blacklisted // false) or ($u.blacklisted // false)) | tostring),
-          (
-            if ($d.blacklist_reason // "") != "" then $d.blacklist_reason
-            elif ($u.blacklist_reason // "") != "" then $u.blacklist_reason
-            else "" end
-          ),
-          (($d.ssh // false) | tostring),
-          (($d.login // false) | tostring)
+          .ip,
+          .hostname,
+          .pid,
+          .cur,
+          .tgt,
+          .action,
+          .req_train,
+          .req_min,
+          .rep_status,
+          (.blacklisted|tostring),
+          .bl_reason,
+          (.ssh|tostring),
+          (.login|tostring)
         ] | join($us)
     ' "$disc"
   )
@@ -1183,10 +1360,29 @@ do_selection_dialog() {
 
   ui_stop
   local tmp_sel; tmp_sel="$(mktemp)"
+    # Dynamically size dialog based on terminal
+  local lines cols dlg_h dlg_w dlg_list
+
+  if read -r lines cols < <(stty size 2>/dev/null); then
+    :
+  else
+    lines=30
+    cols=180
+  fi
+
+  dlg_h=$(( lines - 4 ))
+  dlg_w=$(( cols - 4 ))
+  dlg_list=$(( dlg_h - 7 ))
+
+  # Minimum safety bounds
+  (( dlg_h < 20 )) && dlg_h=20
+  (( dlg_w < 120 )) && dlg_w=120
+  (( dlg_list < 10 )) && dlg_list=10
+
   dialog --no-shadow --title "Select switches to process" \
          --backtitle "Discovery Selection" \
          --checklist "Use <SPACE> to toggle. BLACKLISTED entries are shown for visibility but cannot be selected (ignored even if checked)." \
-         22 140 15 \
+         "$dlg_h" "$dlg_w" "$dlg_list" \
          "${items[@]}" 2> "$tmp_sel"
   local rc=$?
   if (( rc != 0 )); then
