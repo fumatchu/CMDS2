@@ -29,7 +29,7 @@ declare -A DONE_FILE=(
   ["Switch Discovery"]="/root/.cloud_admin/selected_upgrade.env"
   ["Validate IOS-XE configuration"]="/root/.cloud_admin/preflight.ok"
 
-  # NEW completion markers
+  # completion markers
   ["IOS-XE Upgrade"]="$IOSXE_UPGRADE_OK_FILE"
   ["Migrate Switches"]="$MIGRATION_OK_FILE"
   ["IOS-XE config Migration"]="$IOSXE_CONFIG_MIG_OK_FILE"
@@ -97,12 +97,13 @@ declare -A HELP_RAW=(
   ["Server Service Control"]="Manage CMDS services or reboot the server."
   ["README"]="View CMDS cloud README / usage guide."
 
-  # IOS-XE config migration submenu help text (MATCH labels exactly, keep "/")
-  ["Per switch/Per Port"]="Per switch/Per Port with Management IP migration (Interactive)"
-  ["All Switches/All ports"]="No prompt full run (Non-Interactive/Automated)"
+  # IOS-XE config migration submenu help text (MATCH labels exactly)
+  ["Automated"]="No prompt full run (Non-Interactive/Automated)"
+  ["Per Switch/Per Port Selection"]="Per switch/Per Port with Management IP migration (Interactive)"
+  ["IP management Migration"]="Migrate management IP settings per switch (Management interface only)."
 )
 
-# Display order (main menu)  (8 then 9 preserved)
+# Display order (main menu)
 ORDER=(
   "Firmware & Compatibility"
   "Cloud Support Matrix (Models ↔ IOS-XE)"
@@ -286,7 +287,7 @@ submenu_iosxe(){
   done
 }
 
-# ---------- IOS-XE config Migration submenu ----------
+# ---------- IOS-XE config Migration submenu (UPDATED: 3 options) ----------
 submenu_iosxe_config_migration(){
   local SUB_TITLE="IOS-XE config Migration"
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
@@ -295,24 +296,30 @@ submenu_iosxe_config_migration(){
     local MENU_ITEMS=()
     local -A PATH_BY_TAG=()
     local -A LABEL_BY_TAG=()
-    local -A ARGS_BY_TAG=()
     local i=1
 
-    # IMPORTANT: labels MUST match HELP_RAW keys exactly (including "/")
-    local lbl1="Per switch/Per Port"
-    local path1="/root/.cloud_admin/per_port_migration.sh"
+    # 1) Automated -> auto_per_port_migration.sh
+    local lbl1="Automated"
+    local path1="/root/.cloud_admin/auto_per_port_migration.sh"
     MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]:-}")")
     PATH_BY_TAG["$i"]="$path1"
     LABEL_BY_TAG["$i"]="$lbl1"
-    ARGS_BY_TAG["$i"]=""   # interactive
     ((i++))
 
-    local lbl2="All Switches/All ports"
+    # 2) Per Switch/Per Port Selection -> per_port_migration.sh
+    local lbl2="Per Switch/Per Port Selection"
     local path2="/root/.cloud_admin/per_port_migration.sh"
     MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]:-}")")
     PATH_BY_TAG["$i"]="$path2"
     LABEL_BY_TAG["$i"]="$lbl2"
-    ARGS_BY_TAG["$i"]="--non-interactive"   # CHANGE to your real flag if different
+    ((i++))
+
+    # 3) IP management Migration -> per_switch_ip_migration.sh
+    local lbl3="IP management Migration"
+    local path3="/root/.cloud_admin/per_switch_ip_migration.sh"
+    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]:-}")")
+    PATH_BY_TAG["$i"]="$path3"
+    LABEL_BY_TAG["$i"]="$lbl3"
     ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
@@ -324,7 +331,7 @@ submenu_iosxe_config_migration(){
         --title "$SUB_TITLE" \
         --ok-label "OK" \
         --cancel-label "Back" \
-        --menu "Select an option:" 14 92 8 \
+        --menu "Select an option:" 16 92 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || { return 0; }
@@ -333,13 +340,11 @@ submenu_iosxe_config_migration(){
 
     local script="${PATH_BY_TAG[$CHOICE]}"
     local label="${LABEL_BY_TAG[$CHOICE]}"
-    local args="${ARGS_BY_TAG[$CHOICE]}"
 
     clear
     if [[ -n "$script" && -f "$script" ]]; then
       set +e
-      # shellcheck disable=SC2086
-      bash "$script" $args
+      bash "$script"
       local rc=$?
       set -e
 
@@ -352,9 +357,9 @@ submenu_iosxe_config_migration(){
 
       case "$rc" in
         0) : ;;
-        1|255|130|143) : ;;
+        1|255|130|143) : ;;  # cancel/back/ctrl-c: ignore
         *) dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
-              --msgbox "Script exited with status $rc.\n\n$script $args" 8 78 ;;
+              --msgbox "Script exited with status $rc.\n\n$script" 8 78 ;;
       esac
     else
       dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
