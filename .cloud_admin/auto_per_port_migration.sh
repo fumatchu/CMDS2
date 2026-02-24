@@ -67,28 +67,6 @@ MERAKI_ENV_FILE="${MERAKI_ENV_FILE:-${CLOUD_ADMIN_BASE}/meraki_discovery.env}"
 # Uplink type memory created by discovery (per-switch JSON)
 UPLINK_TYPES_DIR="${UPLINK_TYPES_DIR:-${CLOUD_ADMIN_BASE}/uplink_types}"
 mkdir -p "$UPLINK_TYPES_DIR" 2>/dev/null || true
-# ============================================================
-# --- Unattended / press-go mode ---
-# ============================================================
-: "${UNATTENDED:=1}"   # 1 = assume yes, hide selection UI, run all steps
-
-assume_yes() {
-  # Usage: assume_yes "title" "message"
-  # returns 0 (yes) in unattended mode, otherwise does a real prompt.
-  local title="${1:-Confirm}"
-  local msg="${2:-Continue?}"
-  if [[ "${UNATTENDED}" == "1" ]]; then
-    return 0
-  fi
-  dialog --backtitle "${BACKTITLE:-Cloud Admin}" --title "$title" --yesno "$msg" 10 70
-}
-
-assume_menu_all() {
-  # In unattended mode: do nothing and let caller auto-select "all"
-  # In attended mode: caller can still show dialog UI if you ever toggle UNATTENDED=0.
-  [[ "${UNATTENDED}" == "1" ]] && return 0
-  return 1
-}
 
 # ============================================================
 # UI: stack diff viewer (member menu + all-members view)
@@ -3012,123 +2990,25 @@ apply_ports_from_diff() {
 
   apply_ui_update "Building port checklist from diff..." 45
 
-  jq -r '
-    def show(x): if x == null or x == "" then "Auto negotiate" else (x|tostring) end;
-    def haschg(k): (.changes | index(k)) != null;
+   # --------------------------------------------------
+  # AUTOMATED MODE: apply ALL ports that have changes
+  # --------------------------------------------------
 
-    .[]
-    | select((.changes|length) > 0)
-    | [
-        (.portId|tostring),
-        (
-          (.description_intent // "<no-desc>")
-          + " | " + (if (.desired.type != null) then .desired.type else "" end)
-          + " | " + (if (.desired.vlan != null) then "V" + (.desired.vlan|tostring) else "" end)
-          + (if haschg("linkNegotiation") then
-               " | Link: " + show(.current.linkNegotiation) + " → " + show(.desired.linkNegotiation)
-             else
-               ""
-             end)
-          + " | changes=" + ((.changes|length)|tostring)
-        )
-      ]
-    | @tsv
-  ' "$diff_file" >"$tmp_list"
-
-  apply_ui_update "Preparing checklist entries..." 55
-
-  if ! [[ -s "$tmp_list" ]]; then
-    ui_stop
-    "$DIALOG" --clear >/dev/null 2>&1 || true
-
-    dlg --backtitle "$BACKTITLE_PORTS" \
-        --title "No changes" \
-        --msgbox "There are no ports with differences in:\n  $diff_file\n\nNothing to apply." 11 80
-    return 0
-  fi
-
-    local -a items=()
-  while IFS=$'\t' read -r pid label; do
-    pid="$(trim "$pid")"
-    label="$(trim "$label")"
-    [[ -z "$pid" ]] && continue
-
-        # Allow numeric Meraki port IDs AND module/uplink string IDs
-    #
-    # Examples:
-    #   - "1" "24" "48"
-    #   - "1_C9300-NM-8X_1"   (stack member 1, NM module, port 1)
-    #
-    # Still filters out <<UPLINK>>, headers, blanks, and obvious junk.
-    if [[ -z "$pid" ]]; then
-      echo "Skipping empty port id from tmp_list: pid='$pid' label='$label'" >>"$apply_log"
-      continue
-    fi
-
-    # Reject known junk/header tokens (keep extending if you have more)
-    case "$pid" in
-      '<<UPLINK>>'|'UPLINK'|'uplink'|'PORT'|'Port'|'port'|'N/A'|'-')
-        echo "Skipping junk/header port id from tmp_list: pid='$pid' label='$label'" >>"$apply_log"
-        continue
-        ;;
-    esac
-
-    # Accept:
-    #  - purely numeric ids: 1,2,3...
-    #  - module/uplink ids: 1_C9300-NM-8X_1, 2_C9300-NM-8X_8, etc.
-    #
-    # Pattern explanation (per your example):
-    #   ^[0-9]+_C9300-NM-8X_[0-9]+$
-    # We also allow other module strings safely by allowing:
-    #   ^[0-9]+_[A-Za-z0-9._-]+_[0-9]+$
-    if ! [[ "$pid" =~ ^[0-9]+$ || "$pid" =~ ^[0-9]+_[A-Za-z0-9._-]+_[0-9]+$ ]]; then
-      echo "Skipping unsupported port id from tmp_list: pid='$pid' label='$label'" >>"$apply_log"
-      continue
-    fi
-
-    # Optional hardening:
-    # Only apply numeric range checks to *numeric* port IDs.
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      if (( pid < 1 || pid > 128 )); then
-        echo "Skipping out-of-range numeric port id from tmp_list: pid='$pid' label='$label'" >>"$apply_log"
-        continue
-      fi
-    fi
-
-    items+=( "$pid" "$label" "on" )
-  done <"$tmp_list"
-
-  local term_rows term_cols height width listheight
-  term_rows="$(tput lines 2>/dev/null || echo 30)"
-  term_cols="$(tput cols  2>/dev/null || echo 120)"
-
-  height=$(( term_rows - 6 )); (( height < 18 )) && height=18
-  width=$(( term_cols - 6  )); (( width  < 110 )) && width=110
-  (( width > 180 )) && width=180
-  listheight=$(( height - 8 )); (( listheight < 8 )) && listheight=8
-  (( listheight > 20 )) && listheight=20
-
-  apply_ui_update "Opening port selection checklist..." 60
-  ui_stop
-  "$DIALOG" --clear >/dev/null 2>&1 || true
-
-    # no checklist — auto-select ALL ports that were eligible to appear in the checklist
-  local -a PORTS_TO_APPLY=()
-
-  # items[] is structured for dialog checklist as: tag description status, repeated
-  # so every 3rd element starting at 0 is the port id/tag.
-  local i pid
-  for ((i=0; i<${#items[@]}; i+=3)); do
-    pid="$(trim "${items[i]}")"
-    [[ -n "$pid" ]] && PORTS_TO_APPLY+=("$pid")
-  done
+  mapfile -t PORTS_TO_APPLY < <(
+    jq -r '
+      .[]
+      | select((.changes|length) > 0)
+      | .portId
+    ' "$diff_file"
+  )
 
   if ((${#PORTS_TO_APPLY[@]} == 0)); then
-    echo "No eligible ports to apply (items[] empty) for $ip member $member cloud $cloud_id" >>"$apply_log"
+    echo "No ports with changes found in diff. Nothing to apply." >>"$apply_log"
+    ui_stop
     return 0
   fi
 
-  echo "Ports auto-selected to apply: ${PORTS_TO_APPLY[*]}" >>"$apply_log"
+  echo "AUTO MODE – Applying all ports with changes: ${PORTS_TO_APPLY[*]}" >>"$apply_log"
 
   ui_start "Applying ports for $ip (m${member}) cloud $cloud_id" "$apply_log"
   apply_ui_update "Starting port apply..." 0
@@ -3360,9 +3240,10 @@ Warnings: $warn_count port(s)\n\
 Failed:   $fail_count port(s)\n\n\
 See log file for details:\n  $apply_log"
 
-  dlg --backtitle "$BACKTITLE_PORTS" \
-      --title "Port apply results" \
-      --msgbox "$msg" 15 80
+    "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
+            --title "Port apply results" \
+            --infobox "$msg" 15 80
+  sleep 3
 
   return 0
 }
@@ -3592,8 +3473,6 @@ apply_port_diff_for_whole_stack() {
     return 1
   fi
 
-    # no confirm — always apply to whole stack
-
   # -----------------------------
   # Build diff_files[] + pick any_cloud_id (CLOUD ONLY)
   # -----------------------------
@@ -3778,11 +3657,13 @@ fi
     echo "LAG: Skipping post-ports LAG apply (need network_id and >=2 serials)." >>"$stack_apply_log"
   fi
 
-  dlg --backtitle "$BACKTITLE_PORTS" \
-      --title "Whole stack apply complete" \
-      --msgbox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for that member.)\n\nLog:\n  $stack_apply_lo
-g" \
-      16 86
+   "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
+            --title "Whole stack apply complete" \
+            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for that member.)\n\nLog:\n  $stack_apply_log" \
+            16 86
+
+  sleep 4
+
 
   return 0
 }
@@ -4040,8 +3921,6 @@ show_main_menu() {
       continue
     fi
 
-        # no confirm — always run automated flow
-
     # run each selected switch
     local ip ok=0 fail=0
     for ip in "${ips[@]}"; do
@@ -4057,12 +3936,8 @@ show_main_menu() {
 
     dlg --backtitle "$BACKTITLE_PORTS" \
         --title "Run complete" \
-        --msgbox "Automated run complete.\n\nOK:     $ok\nFailed: $fail\n\n(Each switch has logs under: $RUN_DIR/devlogs)" \
+        --msgbox "Automated run complete.\n\nOK:     $ok\nFailed: $fail\n\n(Review Logs if needed: Main Menu--> Logging--> Port Migration Runs)" \
         12 80
-    # Automatically run Mgmt IP migration after port migration
-       if (( ok > 0 )); then
-       /root/.cloud_admin/per_switch_ip_migration.sh || true
-fi
   done
 }
 

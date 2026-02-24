@@ -6,7 +6,8 @@
 #   • Meraki switch-claim inventory (meraki_memory/*.json)
 #   • DNS / HTTP client remediation runs
 #   • Meraki network creation runs
-#   • Port migration runs (runs/port_migration)  <-- NEW
+#   • Port migration runs (runs/port_migration)
+#   • Management IP Migration runs (runs/mgmt_ip)  <-- NEW (menu item 10)
 
 # NOTE: no -e here on purpose; we want Cancel/Esc to be handled manually.
 set -Euo pipefail
@@ -34,8 +35,9 @@ RUNS_DIR="$ROOT/runs"
 SCHED_DIR="$ROOT/schedules"
 
 DISC_ROOT="$RUNS_DIR/discoveryscans"
-MIGRATION_DIR="$RUNS_DIR/migration"   # legacy run folders (kept)
-PORT_MIG_DIR="$RUNS_DIR/port_migration"  # NEW: port migration runs
+MIGRATION_DIR="$RUNS_DIR/migration"        # legacy run folders (kept)
+PORT_MIG_DIR="$RUNS_DIR/port_migration"    # port migration runs
+MGMTIP_DIR="$RUNS_DIR/mgmt_ip"             # NEW: management IP migration runs
 
 PREFLIGHT_DIR="$RUNS_DIR/preflight"
 DNS_DIR="$RUNS_DIR/dnsfix"
@@ -59,6 +61,7 @@ declare -A HELP_TEXT=(
   [7]="Search across all logs by IP address or text."
   [8]="View Meraki network creation runs (createnetwork-*)."
   [9]="View port migration runs (devlogs + diffs)."
+  [10]="View management IP migration runs (actions/items/report/stats/index)."
   [0]="Return to the previous CMDS menu."
 )
 
@@ -132,7 +135,7 @@ epoch_from_genericid(){
 
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
 
-# NEW: epoch helper for ISO timestamps in JSON (e.g. 2026-02-22T02:47:04-0500)
+# epoch helper for ISO timestamps in JSON (e.g. 2026-02-22T02:47:04-0500)
 epoch_from_iso(){ date -d "$1" +%s 2>/dev/null || echo 0; }
 
 in_at_queue(){
@@ -159,12 +162,6 @@ view_file(){
 # Filtered view for port apply logs (strip payload noise)
 # -----------------------------------------------------------------------------
 filter_ports_apply_log(){
-  # $1=input_file -> writes filtered content to stdout
-  # Removes:
-  #   - Row debug for port X:   (and the JSON line immediately after)
-  #   - Computed body for port X: ...
-  #   - PUT body for port X: ...
-  # Keeps success/error lines and higher-level markers.
   awk '
     BEGIN { skip_next=0 }
     skip_next==1 { skip_next=0; next }
@@ -355,9 +352,9 @@ iosxe_menu(){
           local rc2=$DIALOG_RC
           [[ $rc2 -ne 0 ]] && break
           case "$DOUT" in
-            meta) view_file "$path/job.meta"        "job.meta"   ;;
-            sout) view_file "$path/logs/stdout.log" "stdout.log" ;;
-            serr) view_file "$path/logs/stderr.log" "stderr.log" ;;
+            meta) view_file "$path/job.meta"         "job.meta"   ;;
+            sout) view_file "$path/logs/stdout.log"  "stdout.log" ;;
+            serr) view_file "$path/logs/stderr.log"  "stderr.log" ;;
             back) break ;;
           esac
         done
@@ -935,10 +932,9 @@ meraki_claims_menu(){
 }
 
 # ---------------------------------------------------------------------------
-# NEW: Port Migration viewer (runs/port_migration/migrate-*)
+# Port Migration viewer (runs/port_migration/migrate-*)
 # ---------------------------------------------------------------------------
 portmig_epoch_from_id(){
-  # migrate-YYYYmmddHHMMSS
   local mid="$1"; mid="${mid#migrate-}"
   date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
 }
@@ -1065,44 +1061,149 @@ port_migration_menu(){
 }
 
 # ---------------------------------------------------------------------------
+# NEW: Management IP Migration viewer (runs/mgmt_ip/mgmtip-*)
+# ---------------------------------------------------------------------------
+mgmtip_epoch_from_id(){
+  # mgmtip-YYYYmmddHHMMSS
+  local mid="$1"; mid="${mid#mgmtip-}"
+  date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
+}
+mgmtip_local_from_id(){
+  local mid="$1"; mid="${mid#mgmtip-}"
+  date -d "@$(date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s)" \
+       '+%F %T %Z' 2>/dev/null || echo "$mid"
+}
+
+show_mgmtip_run_menu(){
+  local rdir="$1" title="$2"
+
+  local actions="$rdir/actions.log"
+  local items="$rdir/items.jsonl"
+  local report="$rdir/report.json"
+  local stats="$rdir/stats.env"
+  local swidx="$rdir/switch_index.tsv"
+  local grpidx="$rdir/group_index.tsv"
+
+  while true; do
+    local menu=()
+
+    [[ -s "$actions" ]] && menu+=("act"  "actions.log")
+    [[ -s "$report"  ]] && menu+=("rep"  "report.json")
+    [[ -s "$items"   ]] && menu+=("it"   "items.jsonl")
+    [[ -s "$stats"   ]] && menu+=("st"   "stats.env")
+    [[ -s "$swidx"   ]] && menu+=("sw"   "switch_index.tsv")
+    [[ -s "$grpidx"  ]] && menu+=("gr"   "group_index.tsv")
+
+    menu+=("path" "Show run folder path")
+    menu+=("back" "Back")
+
+    dlg --title "$title" --menu "Choose what to view" 20 100 12 "${menu[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    case "$DOUT" in
+      act)  view_file "$actions" "actions.log" ;;
+      rep)  view_file "$report"  "report.json" ;;
+      it)   view_file "$items"   "items.jsonl" ;;
+      st)   view_file "$stats"   "stats.env" ;;
+      sw)   view_file "$swidx"   "switch_index.tsv" ;;
+      gr)   view_file "$grpidx"  "group_index.tsv" ;;
+      path) dlg --title "Run path" --msgbox "$rdir" 7 80 ;;
+      back) return ;;
+    esac
+  done
+}
+
+mgmt_ip_menu(){
+  if [[ ! -d "$MGMTIP_DIR" ]]; then
+    dlg --title "Management IP Migration" --msgbox "No mgmt_ip runs found yet.\n\nExpected directory:\n$MGMTIP_DIR" 9 80
+    return
+  fi
+
+  local rows=() d base ep loc
+  shopt -s nullglob
+  for d in "$MGMTIP_DIR"/mgmtip-*; do
+    [[ -d "$d" ]] || continue
+    base="$(basename "$d")"
+    [[ "$base" == "latest" ]] && continue
+    ep="$(mgmtip_epoch_from_id "$base")"
+    loc="$(mgmtip_local_from_id "$base")"
+    rows+=("${ep}|MI:${base}|${loc}  (Mgmt IP migration)|${d}")
+  done
+  shopt -u nullglob
+
+  if ((${#rows[@]}==0)); then
+    dlg --title "Management IP Migration" --msgbox "No mgmtip-* runs found under:\n$MGMTIP_DIR" 9 80
+    return
+  fi
+
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
+  local choices=() line tag txt
+  for line in "${sorted[@]}"; do
+    tag="$(cut -d'|' -f2 <<<"$line")"
+    txt="$(cut -d'|' -f3 <<<"$line")"
+    choices+=("$tag" "$txt")
+  done
+
+  while true; do
+    dlg --title "Management IP Migration" --menu "Select a run" 22 120 12 "${choices[@]}"
+    local rc=$DIALOG_RC
+    [[ $rc -ne 0 ]] && return
+
+    local sel="$DOUT"
+    local path=""
+    for line in "${sorted[@]}"; do
+      [[ "$sel" == "$(cut -d'|' -f2 <<<"$line")" ]] || continue
+      path="$(cut -d'|' -f4- <<<"$line")"
+      break
+    done
+
+    show_mgmtip_run_menu "$path" "Management IP Migration: ${sel#MI:}"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Top-level main menu
 # ---------------------------------------------------------------------------
 main(){
   while true; do
     local MENU_ITEMS=()
 
-    MENU_ITEMS+=("1" "IOS-XE Upgrade Logs"      "$(color_help "${HELP_TEXT[1]}")")
-    MENU_ITEMS+=("2" "Discovery Scans"          "$(color_help "${HELP_TEXT[2]}")")
-    MENU_ITEMS+=("3" "Preflight Runs"           "$(color_help "${HELP_TEXT[3]}")")
-    MENU_ITEMS+=("4" "Meraki SwitchClaims"      "$(color_help "${HELP_TEXT[4]}")")
-    MENU_ITEMS+=("5" "DNS Fix Runs"             "$(color_help "${HELP_TEXT[5]}")")
-    MENU_ITEMS+=("6" "HTTP Client Fix Runs"     "$(color_help "${HELP_TEXT[6]}")")
-    MENU_ITEMS+=("7" "Search by IP / text"      "$(color_help "${HELP_TEXT[7]}")")
-    MENU_ITEMS+=("8" "Created Networks"         "$(color_help "${HELP_TEXT[8]}")")
-    MENU_ITEMS+=("9" "Port Migration Runs"      "$(color_help "${HELP_TEXT[9]}")")
-    MENU_ITEMS+=("0" "Exit"                     "$(color_help "${HELP_TEXT[0]}")")
+    MENU_ITEMS+=("1"  "IOS-XE Upgrade Logs"           "$(color_help "${HELP_TEXT[1]}")")
+    MENU_ITEMS+=("2"  "Discovery Scans"               "$(color_help "${HELP_TEXT[2]}")")
+    MENU_ITEMS+=("3"  "Preflight Runs"                "$(color_help "${HELP_TEXT[3]}")")
+    MENU_ITEMS+=("4"  "Meraki SwitchClaims"           "$(color_help "${HELP_TEXT[4]}")")
+    MENU_ITEMS+=("5"  "DNS Fix Runs"                  "$(color_help "${HELP_TEXT[5]}")")
+    MENU_ITEMS+=("6"  "HTTP Client Fix Runs"          "$(color_help "${HELP_TEXT[6]}")")
+    MENU_ITEMS+=("7"  "Search by IP / text"           "$(color_help "${HELP_TEXT[7]}")")
+    MENU_ITEMS+=("8"  "Created Networks"              "$(color_help "${HELP_TEXT[8]}")")
+    MENU_ITEMS+=("9"  "Port Migration Runs"           "$(color_help "${HELP_TEXT[9]}")")
+    MENU_ITEMS+=("10" "Management IP Migration"       "$(color_help "${HELP_TEXT[10]}")")
+    MENU_ITEMS+=("0"  "Exit"                          "$(color_help "${HELP_TEXT[0]}")")
 
     local CHOICE
     CHOICE=$(
       dialog --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "Logging & Reports" \
-        --menu "Log Root: $ROOT\n\nSelect an option:" 23 95 10 \
+        --menu "Log Root: $ROOT\n\nSelect an option:" 24 95 12 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || break
 
     case "$CHOICE" in
-      1) iosxe_menu           ;;
-      2) discovery_menu       ;;
-      3) preflight_menu       ;;
-      4) meraki_claims_menu   ;;
-      5) dnsfix_menu          ;;
-      6) httpfix_menu         ;;
-      7) ip_search_menu       ;;
-      8) createnetworks_menu  ;;
-      9) port_migration_menu  ;;
-      0) break                ;;
+      1)  iosxe_menu           ;;
+      2)  discovery_menu       ;;
+      3)  preflight_menu       ;;
+      4)  meraki_claims_menu   ;;
+      5)  dnsfix_menu          ;;
+      6)  httpfix_menu         ;;
+      7)  ip_search_menu       ;;
+      8)  createnetworks_menu  ;;
+      9)  port_migration_menu  ;;
+      10) mgmt_ip_menu         ;;
+      0)  break                ;;
     esac
   done
 }

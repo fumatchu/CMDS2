@@ -99,7 +99,7 @@ declare -A HELP_RAW=(
 
   # IOS-XE config migration submenu help text (MATCH labels exactly)
   ["Automated"]="No prompt full run (Non-Interactive/Automated)"
-  ["Per Switch/Per Port Selection"]="Per switch/Per Port with Management IP migration (Interactive)"
+  ["Per Switch/Per Port Selection"]="Per Switch/Per Port (Interactive)"
   ["IP management Migration"]="Migrate management IP settings per switch (Management interface only)."
 )
 

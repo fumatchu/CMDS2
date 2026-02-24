@@ -7,21 +7,29 @@ set -Eeuo pipefail
 # What it does (per your requirements):
 #   - Builds a selectable list of candidate switches (blacklisted hidden)
 #   - User can CHECK/UNCHECK multiple switches (checklist)
-#   - For each selected switch:
+#   - Filters the list to ONLY IPs in selected_upgrade.env (UPGRADE_SELECTED_IPS)
+#   - For each selected management IP:
 #       * Find latest IOS-XE cfg in /var/lib/tftpboot/mig based on hostname/stack/device_name/pid prefix
 #       * Read mgmt VLAN from meraki_discovery.env (HTTP_CLIENT_VLAN_ID)
 #       * If mgmt VLAN has static "ip address A.B.C.D M.M.M.M":
 #           - Collect DNS (ip name-server) else use DNS_PRIMARY/SECONDARY from env
 #           - Collect GW (ip default-gateway) else default-route next-hop (validated in subnet)
-#           - Update Meraki device managementInterface using cloud_id as "serial"
+#           - Update Meraki device managementInterface using cloud_id(s) from meraki_memory
+#             (stack-safe: multiple cloud IDs may exist for one mgmt IP)
 #           - If Meraki already has the same static settings => SKIPPED (not error)
 #       * If DHCP / no static => DHCP_NO_CHANGE (not error)
 #   - Logs to /root/.cloud_admin/runs/mgmt_ip/<run_id>/actions.log
 #   - latest symlink points to the most recent run dir
 #   - Dialog:
-#       * Checklist selection screen (shows cloud_id + hostname + mgmt VLAN)
+#       * Checklist selection screen (hostname/device_name + pid + cloud_ids + mgmt VLAN)
 #       * Gauge progress while processing
 #       * Final summary shows counts only (NO file paths)
+#
+# Key fixes in this revision:
+#   - Robust parsing of selected_upgrade.env UPGRADE_SELECTED_IPS (handles '\ ' escapes)
+#   - Switch index is filtered to the selected IP set (removes wrong entries)
+#   - cloud IDs come directly from meraki_memory JSONs by matching "ip"
+#   - Stack-safe: one mgmt IP can map to multiple cloud IDs; UI shows all, updates all
 # ============================================================
 
 CLOUD_ADMIN_ROOT="/root/.cloud_admin"
@@ -30,6 +38,7 @@ DISC_ENV="${CLOUD_ADMIN_ROOT}/meraki_discovery.env"
 MEM_DIR="${CLOUD_ADMIN_ROOT}/meraki_memory"
 DISCOVERY_JSON="${CLOUD_ADMIN_ROOT}/discovery_results.json"
 UPGRADE_PLAN_JSON="${CLOUD_ADMIN_ROOT}/upgrade_plan.json"
+SELECTED_UPGRADE_ENV="${CLOUD_ADMIN_ROOT}/selected_upgrade.env"
 
 : "${DIALOG:=dialog}"
 : "${BACKTITLE:=Cloud Admin – Mgmt IP Migration}"
@@ -71,7 +80,6 @@ dlg() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
 
-# No log paths in dialog popups
 die() {
   log "FATAL: $*"
   "$DIALOG" --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "ERROR:\n\n$*\n" 12 70 || true
@@ -82,7 +90,6 @@ log() {
   mkdir -p "$RUN_DIR" >/dev/null 2>&1 || true
   local ts
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  # Always append to file; avoid any dialog spam
   echo "[$ts] $*" >>"$LOG_FILE"
 }
 
@@ -131,13 +138,36 @@ load_discovery_env() {
 }
 
 # ----------------------------
+# selected_upgrade.env parsing (robust)
+# ----------------------------
+selected_ips_from_env() {
+  [[ -f "$SELECTED_UPGRADE_ENV" ]] || return 1
+  python3 - "$SELECTED_UPGRADE_ENV" <<'PY'
+import os,sys
+p=sys.argv[1]
+val=None
+for raw in open(p,"r"):
+  s=raw.strip()
+  if not s or s.startswith("#"): continue
+  if s.startswith("export "): s=s[len("export "):].strip()
+  if s.startswith("UPGRADE_SELECTED_IPS="):
+    val=s.split("=",1)[1].strip()
+    break
+if not val:
+  sys.exit(2)
+
+# handle: 192.168.245.9\ 192.168.245.10
+val = val.replace("\\ ", " ")
+val = val.strip().strip('"').strip("'")
+ips=[x for x in val.split() if x]
+for ip in ips:
+  print(ip)
+PY
+}
+
+# ----------------------------
 # parsing from IOS cfg
 # ----------------------------
-
-# returns:
-#   STATIC: "A.B.C.D M.M.M.M"
-#   DHCP:   "DHCP"
-#   NONE:   "" (no mgmt ip config detected under vlan)
 parse_vlan_mgmt_mode_from_cfg() {
   local cfg="$1" vid="$2"
   awk -v vid="$vid" '
@@ -184,22 +214,19 @@ parse_dns_from_cfg() {
 
 parse_default_gateway_from_cfg() {
   local cfg="$1"
-  awk '
-    $1=="ip" && $2=="default-gateway" && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $3; exit }
-  ' "$cfg"
+  awk '$1=="ip" && $2=="default-gateway" && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $3; exit }' "$cfg"
 }
 
 parse_default_route_nexthop_from_cfg() {
   local cfg="$1"
-  awk '
-    $1=="ip" && $2=="route" && $3=="0.0.0.0" && $4=="0.0.0.0" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $5; exit }
-  ' "$cfg"
+  awk '$1=="ip" && $2=="route" && $3=="0.0.0.0" && $4=="0.0.0.0" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $5; exit }' "$cfg"
 }
 
 # ----------------------------
-# meraki memory: map selected switch IP -> cloud_id (used as Meraki "serial")
+# meraki memory: map mgmt IP -> cloud_id(s)
+#   - for stacks: multiple cloud IDs can share same mgmt IP
 # ----------------------------
-cloud_id_for_ip() {
+cloud_ids_for_ip() {
   local ip="$1"
   python3 - "$MEM_DIR" "$ip" <<'PY'
 import os,sys,json
@@ -207,111 +234,147 @@ mem, target_ip = sys.argv[1], sys.argv[2]
 if not os.path.isdir(mem):
   sys.exit(1)
 
-best=None
-best_ts=""
+hits=[]
 for fn in os.listdir(mem):
   if not fn.endswith(".json"):
     continue
-  path=os.path.join(mem,fn)
+  p=os.path.join(mem,fn)
   try:
-    with open(path,"r") as f:
-      d=json.load(f)
+    d=json.load(open(p,"r"))
   except Exception:
     continue
-  if str(d.get("ip","")) != target_ip:
+  if str(d.get("ip","")).strip() != target_ip:
     continue
-  ts=str(d.get("timestamp",""))
-  if best is None or ts > best_ts:
-    best=d
-    best_ts=ts
+  cid=str(d.get("cloud_id","") or "").strip()
+  if not cid:
+    continue
+  stack=d.get("stack") or {}
+  mi=None
+  if isinstance(stack, dict):
+    try:
+      mi=int(stack.get("member_index"))
+    except Exception:
+      mi=None
+  hits.append((mi if mi is not None else 9999, cid))
 
-if not best:
+if not hits:
   sys.exit(1)
 
-cid=best.get("cloud_id","")
-if not cid:
-  sys.exit(1)
-print(cid)
+# sort by member_index then cid, unique preserve order
+hits.sort(key=lambda x: (x[0], x[1]))
+seen=set()
+for _,cid in hits:
+  if cid in seen:
+    continue
+  seen.add(cid)
+  print(cid)
 PY
+}
+
+cloud_ids_csv_for_ip() {
+  local ip="$1"
+  cloud_ids_for_ip "$ip" 2>/dev/null | paste -sd, - || true
+}
+
+# Backwards compatibility: "primary" cloud id (first)
+cloud_id_for_ip() {
+  local ip="$1"
+  cloud_ids_for_ip "$ip" 2>/dev/null | head -n1 || true
 }
 
 # ----------------------------
 # Build selectable list (blacklisted hidden)
-# Adds cloud_id column by reading meraki_memory.
+# Filtered to selected_upgrade.env IPs
 # TSV columns:
-#   ip \t hostname \t device_name \t pid \t stack_base_name \t cloud_id
+#   ip \t hostname \t device_name \t pid \t stack_base_name \t cloud_ids_csv
 # ----------------------------
 build_switch_index_tsv() {
-  python3 - "$UPGRADE_PLAN_JSON" "$DISCOVERY_JSON" "$MEM_DIR" "$SWITCH_INDEX_TSV" <<'PY'
+  python3 - "$UPGRADE_PLAN_JSON" "$DISCOVERY_JSON" "$MEM_DIR" "$SELECTED_UPGRADE_ENV" "$SWITCH_INDEX_TSV" <<'PY'
 import json, os, sys
 
-plan_path, disc_path, mem_dir, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+plan_path, disc_path, mem_dir, sel_env, out_path = sys.argv[1:6]
 
 def load_list(p):
   if p and os.path.isfile(p):
     try:
-      with open(p,"r") as f:
-        d=json.load(f)
-      if isinstance(d,list):
-        return d
+      d=json.load(open(p,"r"))
+      return d if isinstance(d,list) else []
     except Exception:
       return []
   return []
 
-def cloud_id_for_ip(ip):
+def read_selected_ips(p):
+  if not os.path.isfile(p):
+    return []
+  val=None
+  for raw in open(p,"r"):
+    s=raw.strip()
+    if not s or s.startswith("#"):
+      continue
+    if s.startswith("export "):
+      s=s[len("export "):].strip()
+    if s.startswith("UPGRADE_SELECTED_IPS="):
+      val=s.split("=",1)[1].strip()
+      break
+  if not val:
+    return []
+  val = val.replace("\\ ", " ")
+  val = val.strip().strip('"').strip("'")
+  return [x for x in val.split() if x]
+
+def mem_primary_cloud_and_stackcount(ip):
+  """
+  Returns (primary_cloud_id, stack_count)
+  - primary cloud id: lowest member_index, then stable by cid
+  - stack_count: max observed stack_count for this IP, else 1 if any hit, else 0
+  """
   if not os.path.isdir(mem_dir):
-    return ""
-  best=None
-  best_ts=""
-  try:
-    for fn in os.listdir(mem_dir):
-      if not fn.endswith(".json"):
-        continue
-      p=os.path.join(mem_dir, fn)
+    return ("", 0)
+
+  hits=[]
+  max_stack=0
+  any_hit=False
+
+  for fn in os.listdir(mem_dir):
+    if not fn.endswith(".json"):
+      continue
+    p=os.path.join(mem_dir,fn)
+    try:
+      d=json.load(open(p,"r"))
+    except Exception:
+      continue
+
+    if str(d.get("ip","")).strip() != ip:
+      continue
+
+    any_hit=True
+    cid=str(d.get("cloud_id","") or "").strip()
+    stack=d.get("stack") or {}
+    mi=9999
+    sc=0
+    if isinstance(stack, dict):
       try:
-        with open(p,"r") as f:
-          d=json.load(f)
+        mi=int(stack.get("member_index"))
       except Exception:
-        continue
-      if str(d.get("ip","")).strip() != ip:
-        continue
-      ts=str(d.get("timestamp",""))
-      if best is None or ts > best_ts:
-        best=d
-        best_ts=ts
-  except Exception:
-    return ""
-  if not best:
-    return ""
-  return str(best.get("cloud_id","") or "").strip()
+        mi=9999
+      try:
+        sc=int(stack.get("stack_count") or 0)
+      except Exception:
+        sc=0
+    if sc > max_stack:
+      max_stack = sc
 
-plan = load_list(plan_path)
-disc = load_list(disc_path)
-data = plan if plan else disc
+    if cid:
+      hits.append((mi, cid))
 
-rows=[]
-seen=set()
-for d in data:
-  ip = str(d.get("ip","")).strip()
-  if not ip or ip in seen:
-    continue
-  seen.add(ip)
+  if any_hit and max_stack <= 0:
+    max_stack = 1
 
-  if bool(d.get("blacklisted", False)):
-    continue
+  if not hits:
+    return ("", max_stack)
 
-  hostname = str(d.get("hostname","")).strip()
-  device_name = str(d.get("device_name","")).strip()
-  pid = str(d.get("pid","UNKNOWN")).strip() or "UNKNOWN"
-
-  stack_base = ""
-  stack = d.get("stack") or {}
-  if isinstance(stack, dict):
-    stack_base = str(stack.get("stack_base_name","")).strip()
-
-  cid = cloud_id_for_ip(ip)
-
-  rows.append((ip, hostname, device_name, pid, stack_base, cid))
+  hits.sort(key=lambda x:(x[0], x[1]))
+  return (hits[0][1], max_stack)
 
 def ipkey(ip):
   try:
@@ -319,8 +382,43 @@ def ipkey(ip):
   except:
     return (999,999,999,999)
 
+plan = load_list(plan_path)
+disc = load_list(disc_path)
+data = plan if plan else disc
+
+selected = read_selected_ips(sel_env)
+selset = set(selected)
+
+by_ip={}
+for d in data:
+  ip=str(d.get("ip","")).strip()
+  if not ip or ip not in selset:
+    continue
+  if ip not in by_ip:
+    by_ip[ip]=d
+
+for ip in selected:
+  if ip not in by_ip:
+    by_ip[ip]={"ip":ip}
+
+rows=[]
+for ip in selected:
+  d=by_ip.get(ip, {"ip":ip})
+  if bool(d.get("blacklisted", False)):
+    continue
+
+  hostname=str(d.get("hostname","")).strip()
+  device_name=str(d.get("device_name","")).strip()
+  pid=str(d.get("pid","UNKNOWN")).strip() or "UNKNOWN"
+
+  primary_cid, stack_count = mem_primary_cloud_and_stackcount(ip)
+
+  rows.append((ip, hostname, device_name, pid, primary_cid, str(stack_count)))
+
 rows.sort(key=lambda r: ipkey(r[0]))
 
+# TSV columns now:
+# ip \t hostname \t device_name \t pid \t primary_cloud_id \t stack_count
 with open(out_path,"w") as f:
   for r in rows:
     f.write("\t".join(r) + "\n")
@@ -336,30 +434,51 @@ lookup_index_row_for_ip() {
 
 # ----------------------------
 # checklist selection (multi)
-# Shows: IP, hostname, pid, cloud_id, mgmt VLAN
+# Keeps your original "look" but adds cloud IDs cleanly + IP
 # ----------------------------
 select_switches_dialog_checklist() {
   local vid="Vlan${HTTP_CLIENT_VLAN_ID}"
   local prompt="Select switch(es) to process (blacklisted hidden)\nMgmt VLAN: ${vid}\n\nUse SPACE to toggle selection."
 
   local -a menu=()
-  while IFS=$'\t' read -r ip hn dn pid sb cid; do
+  while IFS=$'\t' read -r ip hn dn pid primary_cid stack_count; do
     [[ -n "$ip" ]] || continue
+
     local label
     label="$(echo "${hn:-${dn:-UNKNOWN}}" | trim)"
-local desc
-if [[ -n "${sb:-}" ]]; then
-  desc="${label} (${pid}, stack:${sb})  ${vid}"
-else
-  desc="${label} (${pid})  ${vid}"
+    [[ -n "$label" ]] || label="UNKNOWN"
+
+    # Build "serial-ish" display: primary cloud id + +N for stack
+    local cid_part=""
+    if [[ -n "${primary_cid:-}" ]]; then
+      local sc="${stack_count:-0}"
+      local plus=""
+      if [[ "$sc" =~ ^[0-9]+$ ]] && (( sc > 1 )); then
+        plus="+$((sc-1))"
+      fi
+      cid_part=", ${primary_cid}${plus}"
+    fi
+
+    local qty_part=""
+if [[ "${stack_count:-}" =~ ^[0-9]+$ ]] && (( stack_count > 0 )); then
+  qty_part=", Switch QTY:${stack_count}"
 fi
-    # default OFF
+
+local cid_part=""
+if [[ -n "${primary_cid:-}" ]]; then
+  cid_part="${primary_cid}${qty_part}"
+else
+  cid_part="Switch QTY:${stack_count}"
+fi
+
+local desc="${label} (${cid_part})  IP:${ip}  ${vid}"
+
+    # default ON
     menu+=("$ip" "$desc" "on")
   done <"$SWITCH_INDEX_TSV"
 
   [[ ${#menu[@]} -gt 0 ]] || die "No eligible (non-blacklisted) switches found."
 
-  # --separate-output => one tag per line
   dlg --separate-output --checklist "$prompt" 22 110 14 "${menu[@]}"
 }
 
@@ -473,7 +592,6 @@ PY
 }
 
 meraki_already_has_static() {
-  # returns 0 if matches exactly (best-effort), else 1
   local json="$1" ip="$2" mask="$3" gw="$4" dns1="$5" dns2="$6"
   python3 - "$json" "$ip" "$mask" "$gw" "$dns1" "$dns2" <<'PY'
 import sys, json
@@ -502,7 +620,6 @@ want=[]
 if d1: want.append(d1)
 if d2 and d2 != d1: want.append(d2)
 
-# Compare as sets (Meraki may reorder)
 if set(dns) != set(want):
   sys.exit(1)
 
@@ -512,6 +629,7 @@ PY
 
 # ----------------------------
 # Process selected switches with ONE overall gauge
+# (stack-safe: updates all cloud IDs for a mgmt IP)
 # ----------------------------
 process_selected_with_gauge() {
   local -a ips=("$@")
@@ -519,7 +637,6 @@ process_selected_with_gauge() {
   [[ "$total" -ge 1 ]] || return 0
 
   local stats_file="${RUN_DIR}/stats.env"
-  : >"$stats_file"
   printf "UPDATED=0\nDHCP=0\nSKIPPED=0\nERRORS=0\n" >"$stats_file"
 
   local items_json="${RUN_DIR}/items.jsonl"
@@ -530,14 +647,12 @@ process_selected_with_gauge() {
     for ip in "${ips[@]}"; do
       idx=$((idx+1))
 
-      # coarse percent per device, plus step offsets
       local base=$(( (idx-1) * 100 / total ))
       local next=$(( idx * 100 / total ))
       local span=$(( next - base ))
       [[ $span -lt 1 ]] && span=1
 
       echo "XXX"; echo "$((base+1))"; echo "[$idx/$total] Preparing $ip"; echo "XXX"
-
       log "----"
       log "Processing selected IP: $ip"
 
@@ -549,11 +664,8 @@ print(json.dumps({"ip":sys.argv[1],"action":"SKIPPED_INVALID_IP"}))
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -571,11 +683,8 @@ print(json.dumps({"ip":sys.argv[1],"action":"SKIPPED_NO_CFG"}))
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -583,10 +692,10 @@ PY
       fi
       log "CFG: $cfg"
 
-      echo "XXX"; echo "$((base + span*30/100 + 1))"; echo "[$idx/$total] Mapping Meraki cloud ID"; echo "XXX"
-      local cloud_id=""
-      cloud_id="$(cloud_id_for_ip "$ip" || true)"
-      if [[ -z "$cloud_id" ]]; then
+      echo "XXX"; echo "$((base + span*30/100 + 1))"; echo "[$idx/$total] Mapping Meraki cloud ID(s)"; echo "XXX"
+      local cloud_list=""
+      cloud_list="$(cloud_ids_for_ip "$ip" 2>/dev/null || true)"
+      if [[ -z "$cloud_list" ]]; then
         log "SKIP: no meraki_memory mapping found for IP $ip (cloud_id unknown)"
         python3 - "$ip" "$cfg" <<'PY' >>"$items_json"
 import json,sys
@@ -594,37 +703,37 @@ print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"action":"SKIPPED_NO_CLOUD_
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
         continue
       fi
-      log "CLOUD_ID (used as Meraki serial): $cloud_id"
+
+      log "CLOUD_ID(s) for IP $ip:"
+      while IFS= read -r cid; do
+        [[ -n "$cid" ]] && log "  - $cid"
+      done <<<"$cloud_list"
 
       echo "XXX"; echo "$((base + span*45/100 + 1))"; echo "[$idx/$total] Parsing mgmt VLAN Vlan${HTTP_CLIENT_VLAN_ID}"; echo "XXX"
       local mgmt_mode
       mgmt_mode="$(parse_vlan_mgmt_mode_from_cfg "$cfg" "$HTTP_CLIENT_VLAN_ID" | tr -s ' ' | trim || true)"
 
       if [[ -z "$mgmt_mode" || "$mgmt_mode" == "DHCP" ]]; then
-        # DHCP/no-change is NOT an error
         log "DHCP: no static mgmt IP for Vlan${HTTP_CLIENT_VLAN_ID} (no change)"
-        python3 - "$ip" "$cloud_id" "$cfg" <<'PY' >>"$items_json"
+        while IFS= read -r cid; do
+          [[ -n "$cid" ]] || continue
+          python3 - "$ip" "$cid" "$cfg" <<'PY' >>"$items_json"
 import json,sys
 ip,cid,cfg=sys.argv[1:4]
 print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"DHCP_NO_CHANGE"}))
 PY
+        done <<<"$cloud_list"
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["DHCP"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -637,17 +746,14 @@ PY
 
       if ! ip_is_ipv4 "$mgmt_ip" || ! ip_is_ipv4 "$mgmt_mask"; then
         log "SKIP: parsed mgmt ip/mask invalid: $mgmt_ip $mgmt_mask"
-        python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_mode" <<'PY' >>"$items_json"
+        python3 - "$ip" "$cfg" "$mgmt_mode" <<'PY' >>"$items_json"
 import json,sys
-print(json.dumps({"ip":sys.argv[1],"cloud_id":sys.argv[2],"cfg":sys.argv[3],"raw":sys.argv[4],"action":"SKIPPED_BAD_MGMT_PARSE"}))
+print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"raw":sys.argv[3],"action":"SKIPPED_BAD_MGMT_PARSE"}))
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -678,17 +784,14 @@ PY
             log "GW: using default-route next-hop $gw (validated in subnet)"
           else
             log "SKIP: default-route next-hop $nh NOT in subnet of $mgmt_ip/$mgmt_mask"
-            python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" "$nh" <<'PY' >>"$items_json"
+            python3 - "$ip" "$cfg" "$mgmt_ip" "$mgmt_mask" "$nh" <<'PY' >>"$items_json"
 import json,sys
-print(json.dumps({"ip":sys.argv[1],"cloud_id":sys.argv[2],"cfg":sys.argv[3],"mgmt_ip":sys.argv[4],"mask":sys.argv[5],"nexthop":sys.argv[6],"action":"SKIPPED_GW_NOT_IN_SUBNET"}))
+print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"mgmt_ip":sys.argv[3],"mask":sys.argv[4],"nexthop":sys.argv[5],"action":"SKIPPED_GW_NOT_IN_SUBNET"}))
 PY
             python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -696,17 +799,14 @@ PY
           fi
         else
           log "SKIP: no ip default-gateway and no default route found"
-          python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" <<'PY' >>"$items_json"
+          python3 - "$ip" "$cfg" "$mgmt_ip" "$mgmt_mask" <<'PY' >>"$items_json"
 import json,sys
-print(json.dumps({"ip":sys.argv[1],"cloud_id":sys.argv[2],"cfg":sys.argv[3],"mgmt_ip":sys.argv[4],"mask":sys.argv[5],"action":"SKIPPED_NO_GATEWAY"}))
+print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"mgmt_ip":sys.argv[3],"mask":sys.argv[4],"action":"SKIPPED_NO_GATEWAY"}))
 PY
           python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -716,17 +816,14 @@ PY
 
       if ! ip_is_ipv4 "$gw"; then
         log "SKIP: gateway invalid IPv4: $gw"
-        python3 - "$ip" "$cloud_id" "$cfg" "$gw" <<'PY' >>"$items_json"
+        python3 - "$ip" "$cfg" "$gw" <<'PY' >>"$items_json"
 import json,sys
-print(json.dumps({"ip":sys.argv[1],"cloud_id":sys.argv[2],"cfg":sys.argv[3],"gateway":sys.argv[4],"action":"SKIPPED_BAD_GATEWAY"}))
+print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"gateway":sys.argv[3],"action":"SKIPPED_BAD_GATEWAY"}))
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -734,17 +831,14 @@ PY
       fi
       if ! ip_in_same_subnet "$mgmt_ip" "$mgmt_mask" "$gw"; then
         log "SKIP: gateway $gw not in same subnet as $mgmt_ip/$mgmt_mask"
-        python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" <<'PY' >>"$items_json"
+        python3 - "$ip" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" <<'PY' >>"$items_json"
 import json,sys
-print(json.dumps({"ip":sys.argv[1],"cloud_id":sys.argv[2],"cfg":sys.argv[3],"mgmt_ip":sys.argv[4],"mask":sys.argv[5],"gateway":sys.argv[6],"action":"SKIPPED_GW_NOT_IN_SUBNET"}))
+print(json.dumps({"ip":sys.argv[1],"cfg":sys.argv[2],"mgmt_ip":sys.argv[3],"mask":sys.argv[4],"gateway":sys.argv[5],"action":"SKIPPED_GW_NOT_IN_SUBNET"}))
 PY
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
@@ -754,54 +848,43 @@ PY
       log "STATIC: mgmt_ip=$mgmt_ip mask=$mgmt_mask gw=$gw dns1=$dns1 dns2=$dns2"
 
       echo "XXX"; echo "$((base + span*75/100 + 1))"; echo "[$idx/$total] Checking if Meraki already matches"; echo "XXX"
-      local cur_json=""
-      cur_json="$(meraki_get_mgmt_interface "$cloud_id")"
-      if [[ -n "$cur_json" ]] && meraki_already_has_static "$cur_json" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2"; then
-        log "SKIP: Meraki already set to same STATIC settings (no change)"
-        python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" <<'PY' >>"$items_json"
+
+      # apply to ALL cloud IDs for this mgmt IP
+      local any_updated=0 any_error=0 any_skipped=0
+      while IFS= read -r cid; do
+        [[ -n "$cid" ]] || continue
+
+        local cur_json=""
+        cur_json="$(meraki_get_mgmt_interface "$cid")"
+        if [[ -n "$cur_json" ]] && meraki_already_has_static "$cur_json" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2"; then
+          log "SKIP: Meraki already set (no change) for $cid"
+          any_skipped=1
+          python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" <<'PY' >>"$items_json"
 import json,sys
-ip,cid,cfg,mip,mask,gw,d1,d2=sys.argv[1:10]
+ip,cid,cfg,mip,mask,gw,d1,d2=sys.argv[1:9]
 print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"SKIPPED_ALREADY_SET",
                   "mgmt_ip":mip,"mask":mask,"gateway":gw,"dns":[x for x in [d1,d2] if x]}))
 PY
-        python3 - "$stats_file" <<'PY'
-import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
-d["SKIPPED"]+=1
-open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
-PY
-        continue
-      fi
+          continue
+        fi
 
-      echo "XXX"; echo "$((base + span*90/100 + 1))"; echo "[$idx/$total] Updating Meraki management interface"; echo "XXX"
-      local http_code
-      http_code="$(meraki_update_mgmt_static "$cloud_id" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2")"
-      if [[ "$http_code" == "200" ]]; then
-        log "OK: Meraki updated managementInterface to STATIC for $cloud_id ($ip -> $mgmt_ip)"
-        python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
+        echo "XXX"; echo "$((base + span*90/100 + 1))"; echo "[$idx/$total] Updating Meraki management interface"; echo "XXX"
+        local http_code
+        http_code="$(meraki_update_mgmt_static "$cid" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2")"
+        if [[ "$http_code" == "200" ]]; then
+          log "OK: Meraki updated managementInterface to STATIC for $cid ($ip -> $mgmt_ip)"
+          any_updated=1
+          python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
 import json,sys
 ip,cid,cfg,mip,mask,gw,d1,d2,code=sys.argv[1:10]
 print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"UPDATED_STATIC",
                   "mgmt_ip":mip,"mask":mask,"gateway":gw,"dns":[x for x in [d1,d2] if x],
                   "http_code":int(code)}))
 PY
-        python3 - "$stats_file" <<'PY'
-import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
-d["UPDATED"]+=1
-open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
-PY
-      else
-        log "ERROR: Meraki update failed for $cloud_id (HTTP $http_code). Response saved to curl_${cloud_id}.out"
-        python3 - "$ip" "$cloud_id" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
+        else
+          log "ERROR: Meraki update failed for $cid (HTTP $http_code). Response saved to curl_${cid}.out"
+          any_error=1
+          python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
 import json,sys
 ip,cid,cfg,mip,mask,gw,d1,d2,code=sys.argv[1:10]
 def to_int(x):
@@ -811,14 +894,33 @@ print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"ERROR_MERAKI_UPDATE
                   "mgmt_ip":mip,"mask":mask,"gateway":gw,"dns":[x for x in [d1,d2] if x],
                   "http_code":to_int(code)}))
 PY
+        fi
+      done <<<"$cloud_list"
+
+      # Update rollup counters ONCE per selected IP (keeps summary sane)
+      if [[ $any_error -eq 1 ]]; then
         python3 - "$stats_file" <<'PY'
 import sys
-p=sys.argv[1]
-d={}
-for line in open(p):
-  k,v=line.strip().split("=",1)
-  d[k]=int(v)
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
 d["ERRORS"]+=1
+open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
+PY
+      elif [[ $any_updated -eq 1 ]]; then
+        python3 - "$stats_file" <<'PY'
+import sys
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
+d["UPDATED"]+=1
+open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
+PY
+      else
+        # includes already-set cases
+        python3 - "$stats_file" <<'PY'
+import sys
+p=sys.argv[1]; d={}
+for line in open(p): k,v=line.strip().split("=",1); d[k]=int(v)
+d["SKIPPED"]+=1
 open(p,"w").write("\n".join(f"{k}={d[k]}" for k in ["UPDATED","DHCP","SKIPPED","ERRORS"])+"\n")
 PY
       fi
@@ -828,26 +930,23 @@ PY
     echo "XXX"; echo "100"; echo "Finalizing report"; echo "XXX"
   ) | "$DIALOG" --backtitle "$BACKTITLE" --title "$TITLE" --gauge "Starting..." 10 90 0
 
-  # Build report.json
-  python3 - "$RUN_ID" "$items_json" "$stats_file" "$REPORT_JSON" <<'PY'
+  python3 - "$RUN_ID" "${RUN_DIR}/items.jsonl" "${RUN_DIR}/stats.env" "$REPORT_JSON" <<'PY'
 import json,sys
 run_id, items_path, stats_path, out_path = sys.argv[1:5]
 items=[]
-with open(items_path,"r") as f:
-  for line in f:
-    line=line.strip()
-    if not line: continue
-    try: items.append(json.loads(line))
-    except: pass
+for line in open(items_path,"r"):
+  line=line.strip()
+  if not line: continue
+  try: items.append(json.loads(line))
+  except: pass
 
 stats={}
-with open(stats_path,"r") as f:
-  for line in f:
-    line=line.strip()
-    if not line or "=" not in line: continue
-    k,v=line.split("=",1)
-    try: stats[k]=int(v)
-    except: stats[k]=v
+for line in open(stats_path,"r"):
+  line=line.strip()
+  if not line or "=" not in line: continue
+  k,v=line.split("=",1)
+  try: stats[k]=int(v)
+  except: stats[k]=v
 
 doc={
   "run_id": run_id,
@@ -857,8 +956,7 @@ doc={
   "errors": int(stats.get("ERRORS",0)),
   "items": items
 }
-with open(out_path,"w") as f:
-  json.dump(doc,f,indent=2)
+json.dump(doc, open(out_path,"w"), indent=2)
 PY
 
   local updated dhcp skipped errors
@@ -867,7 +965,6 @@ PY
   skipped="$(python3 -c "import json;print(json.load(open('$REPORT_JSON'))['skipped'])" 2>/dev/null || echo 0)"
   errors="$(python3 -c "import json;print(json.load(open('$REPORT_JSON'))['errors'])" 2>/dev/null || echo 0)"
 
-  # Final summary WITHOUT paths
   "$DIALOG" --backtitle "$BACKTITLE" --title "$TITLE" --msgbox \
 "Completed: ${RUN_ID}\n\nUpdated to STATIC in Meraki: ${updated}\nDHCP (no change): ${dhcp}\nSkipped: ${skipped}\nErrors: ${errors}" \
 12 70 || true
@@ -882,6 +979,7 @@ main() {
   need_cmd curl
   need_cmd python3
   need_cmd date
+  need_cmd paste
 
   mkdir -p "$RUN_DIR" "$RUNS_ROOT"
   : >"$LOG_FILE"
@@ -889,15 +987,19 @@ main() {
 
   load_discovery_env
 
-  build_switch_index_tsv >/dev/null 2>&1 || true
-  [[ -s "$SWITCH_INDEX_TSV" ]] || die "No eligible switches found (or could not build index)."
+  # Require selected_upgrade.env and a non-empty selection set (this is how we avoid wrong entries)
+  [[ -f "$SELECTED_UPGRADE_ENV" ]] || die "Missing ${SELECTED_UPGRADE_ENV} (run the upgrade selection step first)."
+  local sel_count
+  sel_count="$(selected_ips_from_env 2>/dev/null | wc -l | tr -d ' ' || true)"
+  [[ "${sel_count:-0}" -ge 1 ]] || die "UPGRADE_SELECTED_IPS is empty or not parseable in selected_upgrade.env"
 
-  # Multi-select checklist (check/uncheck)
+  build_switch_index_tsv >/dev/null 2>&1 || die "Could not build index (check selected_upgrade.env + plan/discovery files)."
+  [[ -s "$SWITCH_INDEX_TSV" ]] || die "No eligible switches found after filtering to selected_upgrade.env."
+
   local selected
   selected="$(select_switches_dialog_checklist)" || { log "User cancelled."; exit 0; }
   [[ -n "${selected//[[:space:]]/}" ]] || { log "No selection."; exit 0; }
 
-  # dialog --separate-output returns one IP per line
   local -a ips=()
   while IFS= read -r line; do
     line="$(echo "$line" | trim)"
@@ -907,7 +1009,6 @@ main() {
 
   [[ ${#ips[@]} -ge 1 ]] || { log "No valid selections."; exit 0; }
 
-  # No confirmation prompt; run immediately
   process_selected_with_gauge "${ips[@]}"
 }
 
