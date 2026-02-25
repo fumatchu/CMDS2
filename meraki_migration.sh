@@ -198,12 +198,12 @@ while true; do
   MENU_ITEMS=()
 
   [[ -f "$HYBRID_MENU" ]] && MENU_ITEMS+=(
-    1 "Catalyst to Meraki (hybrid) (Device Local)"
+    1 "Catalyst to Meraki (hybrid) (Configuration Device Local)"
     "${HELP_COLOR_PREFIX}Non-destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE preserved. Cloud CLI read/write enabled. IOS-XE feature set retained.${HELP_COLOR_RESET}"
   )
 
   [[ -f "$CLOUD_MENU" ]] && MENU_ITEMS+=(
-    2 "Catalyst for Meraki (cloud)"
+    2 "Catalyst to Meraki (cloud) (Configuration Device Cloud)"
     "${HELP_COLOR_PREFIX}Destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE configuration migrated. Flash wiped. Full Dashboard control. Meraki feature set enabled.${HELP_COLOR_RESET}"
   )
 

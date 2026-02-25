@@ -1,1 +1,2 @@
 1.0.1|cmds-1.0.1.tar|cmds-1.0.1.notes|[Backup Module Auto Update]|sha256:338adf59e34ae9e838d510ce727439170b77c1ca1b691f38d2abb2e092edfcf1
+1.0.2|cmds-1.0.2.tar|cmds-1.0.2.notes|[Cloud Migration Module]|sha256:766b3c4433bbbc28ec78c9bd1708e1a1047bd482a8a18901bb564050b42fb2e0
