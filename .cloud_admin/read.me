@@ -1,0 +1,157 @@
+CMDS Deployment Server
+Cloud Catalyst-to-Meraki Conversion Menu System
+================================================
+
+This menu-driven system provides a complete workflow for discovering
+Catalyst switches, validating IOS-XE configurations, upgrading firmware,
+and migrating devices into the Meraki Dashboard. It is designed for
+repeatable batch deployments—typical in K-12 or multi-site enterprise environments.
+
+------------------------------------------------
+HIGH-LEVEL WORKFLOW
+------------------------------------------------
+
+Run the menu from top to bottom:
+
+  1. Setup Wizard
+  2. Switch Discovery
+  3. IOS-XE Upgrade  (optional but recommended)
+  4. Validate IOS-XE Configuration
+  5. Migrate Switches
+  7. Clean Configuration (New Batch Deployment)
+
+A green checkmark appears next to items that are completed for the
+current batch (Except IOS-XE Upgrades as that is optional depending on the environment).
+
+------------------------------------------------
+1. STEP-BY-STEP OVERVIEW
+------------------------------------------------
+
+1.1 Setup Wizard
+----------------
+
+Collects all environment settings:
+  • Firmware requirements for switch model and type mapping for IOS-XE (Uinversal/Lite 17.15 or 17.18)
+  • Meraki Dashboard API key
+  • Organization and Network selection
+  • SSH credentials for Catalyst
+  • Local CMDS environment variables
+
+This MUST be run at the start of every batch.
+
+----------------------------
+
+1.2 Switch Discovery
+--------------------
+
+Discovers reachable Catalyst switches via:
+  • ICMP (ping)
+  • SSH handshake
+  • IOS-XE version and model parsing
+
+This list becomes the source of truth for every later workflow step.
+
+----------------------------
+
+1.3 IOS-XE Upgrade
+-------------------
+Menu: IOS-XE Upgrade > Deploy IOS-XE
+
+Performs:
+  • Image upload (scp)
+  • Install add
+  • Install activate
+  • Install commit
+  • Model-aware image compatibility checks
+
+Optional:
+  • Schedule Upgrade (uses “at” scheduler and env snapshots)
+
+----------------------------
+
+1.4 Validate IOS-XE Configuration
+---------------------------------
+
+Validates each switch for Meraki requirements:
+  • DNS/NTP configuration
+  • AAA/authentication order correctness
+  • “ip routing” detection
+  • Required Meraki onboarding configuration
+  • Checks for “Configuration source: Device” conflicts
+  • Ensures the migration will succeed without Dashboard lockout
+
+----------------------------
+
+1.5 Migrate Switches
+---------------------
+
+Runs the Catalyst-to-Meraki conversion:
+  • Applies Meraki-required configuration
+  • Claims devices into Dashboard using API
+  • Moves device into target network
+  • Creates symlink: /root/.hybrid_admin/meraki_claim.log → last run
+
+----------------------------
+
+
+1.6 IOS-XE Config Migration
+---------------------
+
+Runs the IOS-XE config Migration conversion:
+  • Applies IOS-XE required configuration to Cloud ID
+  • Automated option fully automates the conversion per switch/port
+  • Per port option allows port selection of each switch port and stack
+  • IP Management Migration moves Management IP address to Meraki switch (If static)
+
+----------------------------
+1.7 Logging
+-----------
+
+Provides convenient log viewer for:
+  • Discovery logs
+  • Upgrade logs
+  • Migration logs
+  • Scheduler logs
+  • Preflight validation logs
+
+----------------------------
+
+1.8 Clean Configuration (New Batch Deployment)
+----------------------------------------------
+
+Clears all files related to the previous batch:
+  • Discovery lists
+  • Env files
+  • Logs
+  • Validation flags
+  • Claim symlink
+
+This prepares the system for a completely fresh set of devices.
+
+------------------------------------------------
+2. UTILITIES
+------------------------------------------------
+
+Utilities Menu Includes:
+  • Switch UP/Down Status (continuous ping)
+  • IOS-XE Image Management (list/remove images)
+  • CLI Updater (send command packs to switches)
+  • Backup Config Viewer
+
+------------------------------------------------
+3. SERVER MANAGEMENT
+------------------------------------------------
+
+Includes:
+  • Service Control (start/stop CMDS services)
+  • DHCP Administration (if Kea is installed)
+  • Server reboot
+
+------------------------------------------------
+NOTES
+------------------------------------------------
+  • Always run Setup Wizard for each new batch.
+  • Always review preflight validation before upgrading or migrating.
+  • Use Clean Configuration after finishing each batch.
+
+End of README
