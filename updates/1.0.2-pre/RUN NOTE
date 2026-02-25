@@ -1,0 +1,2 @@
+In order to install 1.0.2 successfully the meraki_migration.sh and cmds_updater.sh must be updated. This can be accomplised by running the following:
+curl -fsSL https://raw.githubusercontent.com/fumatchu/CMDS2/main/updates/1.0.2-pre/update.sh -o /tmp/cmds_bootstrap.sh && bash /tmp/cmds_bootstrap.sh && rm -f /tmp/cmds_bootstrap.sh
