@@ -15,7 +15,10 @@
 #
 # BEHAVIOR:
 # - Only installs tooling under:
+#     /root/.cloud_admin
 #     /root/.hybrid_admin
+#     /root/.wlc_admin
+#     /root/.cat_admin
 #     /root/.server_admin
 # - Preserves customer data/artifacts:
 #     */runs/*
@@ -47,7 +50,10 @@ INDEX_CANDIDATES=(
 )
 
 ROOT_DIR="/root"
+CLOUD_DIR="${ROOT_DIR}/.cloud_admin"
 HYBRID_DIR="${ROOT_DIR}/.hybrid_admin"
+WLC_DIR="${ROOT_DIR}/.wlc_admin"
+CAT_DIR="${ROOT_DIR}/.cat_admin"
 SERVER_DIR="${ROOT_DIR}/.server_admin"
 
 WORKDIR="$(mktemp -d /tmp/cmds_updater.XXXXXX)"
@@ -115,7 +121,6 @@ VERSION_FILE="${SERVER_DIR}/CMDS_VERSION"
 INSTALL_DATE_FILE="${SERVER_DIR}/CMDS_INSTALL_DATE"
 
 read_installed_version(){
-  # Expected file format: VERSION=1.0.0
   local v=""
   [[ -r "$VERSION_FILE" ]] || { echo ""; return 0; }
   v="$(grep -m1 '^VERSION=' "$VERSION_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -124,16 +129,11 @@ read_installed_version(){
 }
 
 write_installed_version(){
-  # Writes VERSION=<ver> and INSTALLED_AT='<timestamp>'
   local ver="${1:-}"
   [[ -n "$ver" ]] || return 0
   mkdir -p "$SERVER_DIR" 2>/dev/null || true
-  {
-    echo "VERSION=$ver"
-  } >"$VERSION_FILE"
-  {
-    echo "INSTALLED_AT='$(date '+%Y-%m-%d %H:%M:%S %Z')'"
-  } >"$INSTALL_DATE_FILE"
+  { echo "VERSION=$ver"; } >"$VERSION_FILE"
+  { echo "INSTALLED_AT='$(date '+%Y-%m-%d %H:%M:%S %Z')'"; } >"$INSTALL_DATE_FILE"
   chmod 600 "$VERSION_FILE" "$INSTALL_DATE_FILE" 2>/dev/null || true
   log "Wrote CMDS version files: $VERSION_FILE ($ver), $INSTALL_DATE_FILE"
 }
@@ -143,15 +143,12 @@ INDEX_LINES=()
 INDEX_USED_URL=""
 SELECTED_VERSION=""
 
-# Selected metadata
 SELECTED_TAR=""
 SELECTED_NOTES=""
 SELECTED_DESC=""
 SELECTED_SHA=""
 
 normalize_desc(){
-  # Always show [Description] in UI.
-  # If desc already contains brackets, strip outermost and re-wrap.
   local d="${1:-}"
   d="${d//$'\r'/}"
   d="$(printf '%s' "$d" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
@@ -164,10 +161,6 @@ normalize_desc(){
 }
 
 parse_index_line(){
-  # Supports:
-  #  5-col: ver|tar|notes|desc|sha256:...
-  #  4-col: ver|tar|notes|sha256:...
-  # Echoes: ver|tar|notes|desc|sha
   local line="$1"
   local ver="" tar="" notes="" desc="" sha=""
   IFS='|' read -r ver tar notes desc sha <<<"$line"
@@ -231,7 +224,6 @@ $LOG_FILE"
 }
 
 latest_index_version(){
-  # Returns highest version from INDEX_LINES (semver-ish)
   local ver
   ver="$(
     printf '%s\n' "${INDEX_LINES[@]}" \
@@ -356,17 +348,20 @@ show_release_notes(){
 should_include_member(){
   local m="$1"
 
+  # Only allow these module roots
   case "$m" in
-    .hybrid_admin/*|.server_admin/*) ;;
+    .cloud_admin/*|.hybrid_admin/*|.wlc_admin/*|.cat_admin/*|.server_admin/*) ;;
     *) return 1 ;;
   esac
 
+  # Preserve customer artifacts/data
   case "$m" in
     */runs/*) return 1 ;;
     *.env|*.json|*.csv|*.flag) return 1 ;;
     */discovery_results.*|*/upgrade_plan.*) return 1 ;;
   esac
 
+  # Installable tooling patterns
   case "$m" in
     */bin/*) return 0 ;;
     *.sh)    return 0 ;;
@@ -429,7 +424,10 @@ dry_run_report(){
 }
 
 ensure_dirs_exist(){
+  [[ -d "$CLOUD_DIR"  ]] || mkdir -p "$CLOUD_DIR"
   [[ -d "$HYBRID_DIR" ]] || mkdir -p "$HYBRID_DIR"
+  [[ -d "$WLC_DIR"    ]] || mkdir -p "$WLC_DIR"
+  [[ -d "$CAT_DIR"    ]] || mkdir -p "$CAT_DIR"
   [[ -d "$SERVER_DIR" ]] || mkdir -p "$SERVER_DIR"
   mkdir -p "$UPD_RUNS_DIR" || true
 }
@@ -492,9 +490,7 @@ append_patch_history(){
 }
 
 finish_success(){
-  # Record the installed version BEFORE telling the user we're done.
   write_installed_version "${SELECTED_VERSION}"
-
   append_patch_history
 
   dlg_msg "Update complete" "CMDS update v${SELECTED_VERSION} applied successfully.
@@ -541,12 +537,10 @@ main(){
 
   fetch_versions_raw
 
-  # ---- Version logic ----
   local installed latest
   installed="$(read_installed_version)"
   latest="$(latest_index_version)"
 
-  # If we have a valid local version and it matches latest -> exit cleanly
   if [[ -n "${installed:-}" && -n "${latest:-}" && "$installed" == "$latest" ]]; then
     log "Already up to date: installed=$installed latest=$latest"
     dlg_msg "Up to date" "This system is already up to date.
@@ -556,7 +550,6 @@ Latest:    $latest" 10 60
     exit 0
   fi
 
-  # If no version file / invalid version -> auto-pick latest
   if [[ -z "${installed:-}" ]]; then
     dlg_msg "Version not found" "This system does not have a local CMDS_VERSION recorded yet.
 
@@ -565,13 +558,11 @@ We'll assume this is an unknown install state and prepare the latest update.
 Latest available: ${latest:-<unknown>}" 12 70
     auto_select_latest_version
   else
-    # Normal behavior: user selects which version (cumulative patches supported)
     if ! pick_version_menu; then
       log "User cancelled at version selection."
       exit 0
     fi
   fi
-  # ------------------------
 
   local meta
   meta="$(get_meta_for_version "$SELECTED_VERSION")" || fail "Selected version not found in index."
@@ -614,7 +605,10 @@ Latest available: ${latest:-<unknown>}" 12 70
 Description: $(normalize_desc "${SELECTED_DESC:-}")
 
 This will overwrite installed tools under:
+  /root/.cloud_admin
   /root/.hybrid_admin
+  /root/.wlc_admin
+  /root/.cat_admin
   /root/.server_admin
 
 It will preserve:
@@ -622,7 +616,7 @@ It will preserve:
   - *.env, *.json, *.csv, *.flag
   - generated discovery/plan artifacts (discovery_results.*, upgrade_plan.*)
 
-Proceed?" 16 92
+Proceed?" 19 92
         if (( $? == 0 )); then
           apply_update
           finish_success

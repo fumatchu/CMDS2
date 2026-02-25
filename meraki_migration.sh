@@ -104,6 +104,44 @@ is_newer_version() {
   [[ "$(printf "%s\n%s\n" "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
 }
 
+run_updater_and_show_log_on_failure() {
+  # Run updater; if it fails, show the latest run log instead of silently returning.
+  [[ -f "$UPDATER_BIN" ]] || {
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Updater missing" --msgbox \
+"Missing updater binary:
+$UPDATER_BIN" 8 70
+    return 1
+  }
+
+  # Ensure executable (safe even if already executable)
+  chmod +x "$UPDATER_BIN" 2>/dev/null || true
+
+  clear
+  bash "$UPDATER_BIN"
+  local upd_rc=$?
+
+  if (( upd_rc != 0 )); then
+    local latest_run
+    latest_run="$(ls -1dt /root/.server_admin/runs/cmds-update/run-* 2>/dev/null | head -n1)"
+
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "Updater exited" --msgbox \
+"Updater exited with code: ${upd_rc}
+
+Showing the most recent updater log next." 10 70
+
+    if [[ -n "${latest_run:-}" && -f "${latest_run}/cmds_updater.log" ]]; then
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Updater log" --textbox \
+"${latest_run}/cmds_updater.log" 0 0
+    else
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Updater log" --msgbox \
+"No updater log was found under:
+/root/.server_admin/runs/cmds-update/" 9 70
+    fi
+  fi
+
+  return 0
+}
+
 check_for_updates_and_prompt() {
   is_online_github || return 0
 
@@ -125,9 +163,9 @@ Installed: $installed
 Latest:    $latest
 
 Update now?" 12 60
-    if (( $? == 0 )) && [[ -x "$UPDATER_BIN" ]]; then
-      clear
-      bash "$UPDATER_BIN" || true
+
+    if (( $? == 0 )); then
+      run_updater_and_show_log_on_failure || true
     fi
   fi
 }
@@ -160,12 +198,12 @@ while true; do
   MENU_ITEMS=()
 
   [[ -f "$HYBRID_MENU" ]] && MENU_ITEMS+=(
-    1 "Catalyst to Meraki (hybrid) (Configuration Device Local)"
+    1 "Catalyst to Meraki (hybrid) (Device Local)"
     "${HELP_COLOR_PREFIX}Non-destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE preserved. Cloud CLI read/write enabled. IOS-XE feature set retained.${HELP_COLOR_RESET}"
   )
 
   [[ -f "$CLOUD_MENU" ]] && MENU_ITEMS+=(
-    2 "Catalyst to Meraki (cloud) (Configuration Device Cloud)"
+    2 "Catalyst for Meraki (cloud)"
     "${HELP_COLOR_PREFIX}Destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE configuration migrated. Flash wiped. Full Dashboard control. Meraki feature set enabled.${HELP_COLOR_RESET}"
   )
 
