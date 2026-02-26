@@ -117,6 +117,7 @@ CMDS2 validates switches for:
 - Create Meraki networks on-demand
 - Map multiple switches to Dashboard networks
 - Collect Cloud-ID automatically
+- Apply Port changes for cloud on destructive flash (cloud)
 - Register switches per operational mode:
   - Cloud mode
   - Device-local mode
