@@ -57,6 +57,10 @@ Older x86_64 revisions (v1/v2) are not supported unless rebuilt by community SIG
 
 Before installing CMDS2:
 
+- 2vCPU (4 Preferred)
+- 4 GB of RAM (8 Preferred)
+- 20 GB or Higher storage (for IOS-XE images and logging)
+- 1 Network interface
 - Enable root access during Rocky installation
 - Enable SSH access for root
 - Configure a static IP address
