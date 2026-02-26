@@ -21,7 +21,7 @@ Supports:
 
 ### Base OS Requirement
 
-A base installation of **Rocky Linux 10.1** is required.
+A base installation of **Rocky Linux 10.1 (minimal)** is required.
 
 Download:
 https://rockylinux.org/download
