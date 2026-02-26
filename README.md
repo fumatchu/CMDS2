@@ -26,4 +26,7 @@ Older x86_64 revisions (v1/v2) are not supported unless rebuilt by community SIG
 Before installing CMDS it's required to enable root access and SSH access for the root account during the Rocky install process.
 A Static IP address is required and Internet access is also required. 
 
-After Rocky OS installation, within this REPO, 
+After Rocky OS installation, within this REPO:
+sudo dnf -y install wget && cd "$HOME" && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
+
+
