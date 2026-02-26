@@ -70,3 +70,56 @@ After Rocky OS installation, run:
 
 ```bash
 sudo dnf -y install wget && cd "$HOME" && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
+
+## CMDS2 Functions
+
+### Switch Migration
+
+Supports migration from:
+
+- Config source device
+- Config source cloud
+
+---
+
+### Network Discovery
+
+- Scan networks automatically
+- Specify IP address lists manually
+
+---
+
+### IOS-XE Firmware Management
+
+- Validate minimum firmware requirements
+- Perform interactive firmware upgrades
+- Schedule firmware upgrades for after-hours execution
+
+---
+
+### Configuration Validation & Best Practice Parsing
+
+CMDS2 validates switches for:
+
+- Firmware requirements
+- NTP configuration
+- AAA configuration
+- DNS configuration
+- `ip http client source-interface`
+- Layer 3 routing requirements
+
+---
+
+### Meraki Integration
+
+- Create Meraki networks on-demand
+- Map multiple switches to Dashboard networks
+- Collect Cloud-ID automatically
+- Register switches per operational mode:
+  - Cloud mode
+  - Device-local mode
+
+For cloud-migrated devices:
+
+- Migrate existing IOS-XE port configurations
+- Map valid dashboard-compatible port settings
