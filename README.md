@@ -71,7 +71,7 @@ After Rocky OS installation, run:
 ```bash
 sudo dnf -y install wget && cd "$HOME" && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/CMDS2/main/CMDS2-Installer.sh)
 
-</> Code
+```
 
 ## CMDS2 Functions
 
