@@ -1450,6 +1450,7 @@ Continuing..."
 #  sleep 2
 #  return 0
 #}
+
 #===========TFTP Server Setup=============
 tftp_setup_module() {
   local TITLE="TFTP Server Configuration"
@@ -1495,7 +1496,7 @@ tftp_setup_module() {
     sed -i '/^ExecStart=/c\ExecStart=/usr/sbin/in.tftpd -c -p -s /var/lib/tftpboot' "$SVC" >>"$LOGFILE" 2>&1
 
     _gauge_step "Creating TFTP root and subdirectories..."
-    mkdir -p "$TFTP_ROOT/images" "$TFTP_ROOT/hybrid" "$TFTP_ROOT/wlc" "$TFTP_ROOT/mig" >>"$LOGFILE" 2>&1
+    mkdir -p "$TFTP_ROOT/images" "$TFTP_ROOT/hybrid" "$TFTP_ROOT/wlc" "$TFTP_ROOT/mig" "$TFTP_ROOT/cat" >>"$LOGFILE" 2>&1
 
     _gauge_step "Applying permissive POSIX perms (R/W for uploads)…"
     chmod 777 -R "$TFTP_ROOT" >>"$LOGFILE" 2>&1
@@ -1530,7 +1531,7 @@ tftp_setup_module() {
 
 • Socket status: ${status}
 • Root: $TFTP_ROOT
-• Subdirs (TFTP R/W): images, hybrid, wlc, mig
+• Subdirs (TFTP R/W): images, hybrid, wlc, mig, cat
 • SELinux:
     - restorecon applied to tree
     - tftp_anon_write=on
@@ -1540,122 +1541,7 @@ tftp_setup_module() {
 • Log: ${LOGFILE}" 15 78
   sleep 3
 }
-#===========HTTP Repo Setup (images via HTTP; ALL dirs writable via TFTP)=============
-http_repo_setup_module() {
-  local TITLE="HTTP Repository Configuration"
-  local BACKTITLE="HTTP Repo Setup"
-  local LOGFILE="/var/log/http-repo-setup.log"
 
-  local TFTP_ROOT="/var/lib/tftpboot"
-  local IMAGES_DIR="$TFTP_ROOT/images"
-  local HYBRID_DIR="$TFTP_ROOT/hybrid"
-  local WLC_DIR="$TFTP_ROOT/wlc"
-  local MIG_DIR="$TFTP_ROOT/mig"
-
-  local SITE_CONF="/etc/httpd/conf.d/tftp-images.conf"
-  local SEND_FILE_CONF="/etc/httpd/conf.d/00-sendfile.conf"
-
-  mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
-  : > "$LOGFILE"
-
-  if [[ $EUID -ne 0 ]]; then
-    dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-           --msgbox "This function must be run as root." 7 50
-    return 1
-  fi
-
-  _server_ip() {
-    ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
-      || hostname -I 2>/dev/null | awk '{print $1}' \
-      || echo "127.0.0.1"
-  }
-
-  local total=12 step=0
-  _gauge_step() {
-    step=$((step + 1))
-    local pct=$(( step * 100 / total ))
-    echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
-    sleep 0.35
-  }
-
-  local selinux_persist="applied"
-  {
-    _gauge_step "Ensuring directories exist (images, hybrid, wlc, mig)…"
-    mkdir -p "$IMAGES_DIR" "$HYBRID_DIR" "$WLC_DIR" "$MIG_DIR" >>"$LOGFILE" 2>&1
-    # NOTE: Do NOT chmod 755 here; keep your TFTP module's 777 so TFTP can write everywhere.
-
-    _gauge_step "Writing Apache alias for /images → $IMAGES_DIR…"
-    cat > "$SITE_CONF" <<CONF
-# Serve firmware from TFTP images over HTTP at /images
-Alias /images $IMAGES_DIR
-<Directory "$IMAGES_DIR">
-    Options Indexes FollowSymLinks
-    AllowOverride None
-    Require all granted
-</Directory>
-# NOTE: hybrid/, wlc/, mig/ are NOT exposed over HTTP
-CONF
-
-    _gauge_step "Disabling sendfile globally…"
-    cat > "$SEND_FILE_CONF" <<'CONF'
-EnableSendfile Off
-CONF
-
-    _gauge_step "Remove any old broad fcontext rules on /var/lib/tftpboot…"
-    if command -v semanage >/dev/null 2>&1; then
-      semanage fcontext -d "$TFTP_ROOT(/.*)?" >>"$LOGFILE" 2>&1 || true
-    fi
-
-    _gauge_step "Label ONLY images/ as public_content_rw_t (Apache-readable, still TFTP-writable)…"
-    if command -v semanage >/dev/null 2>&1; then
-      semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1 \
-        || semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1
-      selinux_persist="applied"
-    else
-      selinux_persist="skipped (no semanage)"
-    fi
-
-    _gauge_step "Restore SELinux contexts (hybrid/wlc/mig stay tftpdir_rw_t)…"
-    restorecon -RFv "$TFTP_ROOT" >>"$LOGFILE" 2>&1 || true
-
-    _gauge_step "Allow TFTP to write into public_content_rw_t (boolean)…"
-    if command -v setsebool >/dev/null 2>&1; then
-      setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
-    fi
-
-    _gauge_step "Ensure Apache can read/traverse images/ without reducing write bits…"
-    chmod -R a+rX "$IMAGES_DIR" >>"$LOGFILE" 2>&1 || true   # adds r/X; doesn't remove existing write
-
-    _gauge_step "Ensure autoindex (remove stale index.html)…"
-    rm -f "$IMAGES_DIR/index.html" >>"$LOGFILE" 2>&1 || true
-
-    _gauge_step "Finalizing…"
-    sleep 0.3
-  } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
-             --gauge "Configuring HTTP repo (images via HTTP; ALL TFTP R/W)…\n(Logging to $LOGFILE)" 12 74 0
-
-  local IP=$(_server_ip)
-  dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
-"HTTP repo setup complete.
-
-• Served via HTTP:
-    /images  →  $IMAGES_DIR  (SELinux: public_content_rw_t)
-• TFTP R/W (all four dirs, writable by design):
-    $IMAGES_DIR, $HYBRID_DIR, $WLC_DIR, $MIG_DIR
-    (POSIX perms left as set by TFTP module; SELinux:
-      images/* public_content_rw_t, others tftpdir_rw_t)
-• SELinux:
-    fcontext images/* → public_content_rw_t   (persist: $selinux_persist)
-    boolean tftp_anon_write=on
-• Configs:
-    $SITE_CONF
-    $SEND_FILE_CONF
-• Log: $LOGFILE
-
-URL after reboot:
-  http://$IP/images/" 20 84
-  sleep 3
-}
 #===========IOS-XE Images Symlink Setup=============
 create_iosxe_symlink_module() {
   # Optional overrides:
@@ -2118,6 +2004,90 @@ install_cloud_admin_module() (
   gauge 100 "Done! Cloud Admin Module installed."
   sleep 1.2
   log "=== Cloud Admin install complete ==="
+)
+
+install_cat_admin_module() (
+  set -Eeuo pipefail
+
+  # --- configurable (override before calling) ---
+  : "${STEP_PAUSE:=0.7}"
+  : "${BACKTITLE:=Installing CAT Admin Module}"
+  : "${TITLE:=CAT Admin Installer}"
+  : "${SRC_BASE:=/root/CMDS2Installer}"
+
+  # --- paths ---
+  LOG_FILE="/var/log/cat-admin-install.log"
+  SRC_CAT="${SRC_BASE}/.cat_admin"
+  DEST_CAT="/root/.cat_admin"
+
+  # Optional: install a main entrypoint into PATH (uncomment if you have one)
+  # SRC_DISC="${SRC_BASE}/switch_discovery.sh"
+  # DEST_DISC="/usr/local/bin/switch_discovery.sh"
+
+  # --- deps ---
+  command -v dialog >/dev/null 2>&1 || { echo "Missing: dialog" >&2; exit 3; }
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log(){ printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"; }
+
+  # --- gauge plumbing ---
+  PIPE="" PROG_FD="" DIALOG_PID=""
+  cleanup() {
+    { [[ -n "${PROG_FD:-}" ]] && exec {PROG_FD}>&-; } 2>/dev/null || true
+    { [[ -n "${DIALOG_PID:-}" ]] && kill "$DIALOG_PID" 2>/dev/null; } 2>/dev/null || true
+    { [[ -n "${PIPE:-}" && -p "$PIPE" ]] && rm -f "$PIPE"; } 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  start_gauge() {
+    PIPE="$(mktemp -u)"
+    mkfifo "$PIPE"
+    dialog --no-shadow --backtitle "$BACKTITLE" --title "$TITLE" \
+           --gauge "Starting…" 10 70 0 < "$PIPE" & DIALOG_PID=$!
+    exec {PROG_FD}> "$PIPE"
+    rm -f "$PIPE"
+  }
+  gauge(){ local p="$1"; shift; local m="${*:-Working…}"; printf 'XXX\n%s\n%s\nXXX\n' "$p" "$m" >&"$PROG_FD"; }
+
+  # --- work ---
+  log "=== CAT Admin install start ==="
+  start_gauge
+  gauge 1  "Initializing…"; sleep "$STEP_PAUSE"
+
+  # 1) Move/merge .cat_admin → /root and chmod 700
+  gauge 10 "Staging CAT Admin files…"; sleep "$STEP_PAUSE"
+  if [[ -d "$SRC_CAT" ]]; then
+    if [[ -d "$DEST_CAT" ]]; then
+      gauge 18 "Merging existing .cat_admin…"; sleep "$STEP_PAUSE"
+      rsync -a "$SRC_CAT"/ "$DEST_CAT"/ >>"$LOG_FILE" 2>&1 || true
+      rm -rf "$SRC_CAT"
+    else
+      gauge 18 "Moving .cat_admin to /root…"; sleep "$STEP_PAUSE"
+      mv "$SRC_CAT" "$DEST_CAT" >>"$LOG_FILE" 2>&1
+    fi
+  fi
+
+  if [[ -d "$DEST_CAT" ]]; then
+    chmod -R 700 "$DEST_CAT" >>"$LOG_FILE" 2>&1 || true
+  else
+    gauge 100 "Failed: .cat_admin not found"; sleep 1
+    log "ERROR: $DEST_CAT missing after install"
+    exit 2
+  fi
+
+  # 2) Optional: install a launcher/helper into /usr/local/bin (enable if desired)
+  # gauge 40 "Installing switch_discovery into /usr/local/bin…"; sleep "$STEP_PAUSE"
+  # if [[ -f "$SRC_DISC" ]]; then
+  #   install -m 700 -o root -g root "$SRC_DISC" "$DEST_DISC" >>"$LOG_FILE" 2>&1
+  # fi
+
+  # 3) Verify
+  gauge 75 "Verifying installation…"; sleep "$STEP_PAUSE"
+  chmod -R 700 "$DEST_CAT" >>"$LOG_FILE" 2>&1 || true
+
+  gauge 100 "Done! CAT Admin Module installed."
+  sleep 1.2
+  log "=== CAT Admin install complete ==="
 )
 
 install_server_admin_module() (
@@ -3020,6 +2990,7 @@ configure_dnf_automatic
 remove_home_mapper
 install_hybrid_admin_module
 install_cloud_admin_module
+install_cat_admin_module
 install_server_admin_module
 write_cmds_version
 check_and_enable_services
