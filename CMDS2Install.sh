@@ -1542,6 +1542,123 @@ tftp_setup_module() {
   sleep 3
 }
 
+#===========HTTP Repo Setup (images via HTTP; ALL dirs writable via TFTP)=============
+http_repo_setup_module() {
+ local TITLE="HTTP Repository Configuration"
+ local BACKTITLE="HTTP Repo Setup"
+ local LOGFILE="/var/log/http-repo-setup.log"
+
+ local TFTP_ROOT="/var/lib/tftpboot"
+ local IMAGES_DIR="$TFTP_ROOT/images"
+ local HYBRID_DIR="$TFTP_ROOT/hybrid"
+ local WLC_DIR="$TFTP_ROOT/wlc"
+ local MIG_DIR="$TFTP_ROOT/mig"
+
+ local SITE_CONF="/etc/httpd/conf.d/tftp-images.conf"
+ local SEND_FILE_CONF="/etc/httpd/conf.d/00-sendfile.conf"
+
+ mkdir -p "$(dirname "$LOGFILE")" >/dev/null 2>&1
+ : > "$LOGFILE"
+
+ if [[ $EUID -ne 0 ]]; then
+   dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+          --msgbox "This function must be run as root." 7 50
+   return 1
+ fi
+
+ _server_ip() {
+   ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
+     || hostname -I 2>/dev/null | awk '{print $1}' \
+     || echo "127.0.0.1"
+ }
+
+ local total=12 step=0
+ _gauge_step() {
+   step=$((step + 1))
+   local pct=$(( step * 100 / total ))
+   echo "XXX"; echo "$pct"; echo -e "$1"; echo "XXX"
+   sleep 0.35
+ }
+
+ local selinux_persist="applied"
+ {
+   _gauge_step "Ensuring directories exist (images, hybrid, wlc, mig)…"
+   mkdir -p "$IMAGES_DIR" "$HYBRID_DIR" "$WLC_DIR" "$MIG_DIR" >>"$LOGFILE" 2>&1
+   # NOTE: Do NOT chmod 755 here; keep your TFTP module's 777 so TFTP can write everywhere.
+
+   _gauge_step "Writing Apache alias for /images → $IMAGES_DIR…"
+   cat > "$SITE_CONF" <<CONF
+# Serve firmware from TFTP images over HTTP at /images
+Alias /images $IMAGES_DIR
+<Directory "$IMAGES_DIR">
+   Options Indexes FollowSymLinks
+   AllowOverride None
+   Require all granted
+</Directory>
+# NOTE: hybrid/, wlc/, mig/ are NOT exposed over HTTP
+CONF
+
+   _gauge_step "Disabling sendfile globally…"
+   cat > "$SEND_FILE_CONF" <<'CONF'
+EnableSendfile Off
+CONF
+
+   _gauge_step "Remove any old broad fcontext rules on /var/lib/tftpboot…"
+   if command -v semanage >/dev/null 2>&1; then
+     semanage fcontext -d "$TFTP_ROOT(/.*)?" >>"$LOGFILE" 2>&1 || true
+   fi
+
+   _gauge_step "Label ONLY images/ as public_content_rw_t (Apache-readable, still TFTP-writable)…"
+   if command -v semanage >/dev/null 2>&1; then
+     semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1 \
+       || semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >>"$LOGFILE" 2>&1
+     selinux_persist="applied"
+   else
+     selinux_persist="skipped (no semanage)"
+   fi
+
+   _gauge_step "Restore SELinux contexts (hybrid/wlc/mig stay tftpdir_rw_t)…"
+   restorecon -RFv "$TFTP_ROOT" >>"$LOGFILE" 2>&1 || true
+
+   _gauge_step "Allow TFTP to write into public_content_rw_t (boolean)…"
+   if command -v setsebool >/dev/null 2>&1; then
+     setsebool -P tftp_anon_write on >>"$LOGFILE" 2>&1 || true
+   fi
+
+   _gauge_step "Ensure Apache can read/traverse images/ without reducing write bits…"
+   chmod -R a+rX "$IMAGES_DIR" >>"$LOGFILE" 2>&1 || true   # adds r/X; doesn't remove existing write
+
+   _gauge_step "Ensure autoindex (remove stale index.html)…"
+   rm -f "$IMAGES_DIR/index.html" >>"$LOGFILE" 2>&1 || true
+
+   _gauge_step "Finalizing…"
+   sleep 0.3
+ } | dialog --backtitle "$BACKTITLE" --title "$TITLE" \
+            --gauge "Configuring HTTP repo (images via HTTP; ALL TFTP R/W)…\n(Logging to $LOGFILE)" 12 74 0
+
+ local IP=$(_server_ip)
+ dialog --backtitle "$BACKTITLE" --title "$TITLE" --infobox \
+"HTTP repo setup complete.
+
+• Served via HTTP:
+   /images  →  $IMAGES_DIR  (SELinux: public_content_rw_t)
+• TFTP R/W (all four dirs, writable by design):
+   $IMAGES_DIR, $HYBRID_DIR, $WLC_DIR, $MIG_DIR
+   (POSIX perms left as set by TFTP module; SELinux:
+     images/* public_content_rw_t, others tftpdir_rw_t)
+• SELinux:
+   fcontext images/* → public_content_rw_t   (persist: $selinux_persist)
+   boolean tftp_anon_write=on
+• Configs:
+   $SITE_CONF
+   $SEND_FILE_CONF
+• Log: $LOGFILE
+
+URL after reboot:
+ http://$IP/images/" 20 84
+ sleep 3
+}
+
 #===========IOS-XE Images Symlink Setup=============
 create_iosxe_symlink_module() {
   # Optional overrides:
