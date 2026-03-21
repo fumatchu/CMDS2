@@ -198,13 +198,13 @@ while true; do
   MENU_ITEMS=()
 
   [[ -f "$HYBRID_MENU" ]] && MENU_ITEMS+=(
-    1 "Catalyst to Meraki (hybrid) (Configuration Device Local)"
-    "${HELP_COLOR_PREFIX}Non-destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE preserved. Cloud CLI read/write enabled. IOS-XE feature set retained.${HELP_COLOR_RESET}"
+    1 "Catalyst to Meraki (Hybrid) (Configuration Source: Device)"
+    "${HELP_COLOR_PREFIX}Non-destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE firmware preserved. Cloud CLI read/write enabled. IOS-XE feature set retained.${HELP_COLOR_RESET}"
   )
 
   [[ -f "$CLOUD_MENU" ]] && MENU_ITEMS+=(
-    2 "Catalyst to Meraki (cloud) (Configuration Device Cloud)"
-    "${HELP_COLOR_PREFIX}Destructive migration of supported 9K switches to the Meraki Dashboard. IOS-XE configuration migrated. Flash wiped. Full Dashboard control. Meraki feature set enabled.${HELP_COLOR_RESET}"
+    2 "Catalyst to Meraki (Cloud) (Configuration Source: Cloud)"
+    "${HELP_COLOR_PREFIX}Migration of supported 9K switches to the Meraki Dashboard. IOS-XE configuration migrated. Flash wiped. Full Dashboard control. Meraki feature set enabled.${HELP_COLOR_RESET}"
   )
 
   [[ -f "$WLC_MENU" ]] && MENU_ITEMS+=(
@@ -213,8 +213,8 @@ while true; do
   )
 
   [[ -f "$CAT_MENU" ]] && MENU_ITEMS+=(
-    4 "Catalyst to Meraki (Legacy Hardware)"
-    "${HELP_COLOR_PREFIX}Migration of legacy IOS-XE switch configs to an already provisioned Dashboard switch.${HELP_COLOR_RESET}"
+    4 "Catalyst to Meraki (Legacy) IOS-XE Config Migration to Configuration Source: Cloud)"
+    "${HELP_COLOR_PREFIX}Migration of legacy (non-9K) IOS-XE switch configs to an already provisioned Dashboard switch.${HELP_COLOR_RESET}"
   )
 
   # If nothing exists at all, exit cleanly

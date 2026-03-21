@@ -17,7 +17,26 @@ fi
 
 FILES=()
 
-# Top-level only — never touch runs/
+# -------------------------------------------------------
+# Explicit CMDS state files (safe to remove)
+# -------------------------------------------------------
+
+STATE_FILES=(
+  "$REAL_TARGET/switch_mapping.ok"
+  "$REAL_TARGET/port_migration.ok"
+  "$REAL_TARGET/switch_map.json"
+  "$REAL_TARGET/selected_upgrade.env"
+  "$REAL_TARGET/meraki_discovery.env"
+)
+
+for f in "${STATE_FILES[@]}"; do
+  [[ -f "$f" || -L "$f" ]] && FILES+=("$f")
+done
+
+# -------------------------------------------------------
+# Generic workspace artifacts
+# -------------------------------------------------------
+
 while IFS= read -r -d '' f; do
   FILES+=("$f")
 done < <(
@@ -36,6 +55,9 @@ done < <(
 
 # Remove claim log symlink if present
 [[ -L "$REAL_TARGET/meraki_claim.log" ]] && FILES+=("$REAL_TARGET/meraki_claim.log")
+
+# Remove duplicates (safe guard)
+mapfile -t FILES < <(printf "%s\n" "${FILES[@]}" | sort -u)
 
 TOTAL="${#FILES[@]}"
 
@@ -74,3 +96,4 @@ wait "$DPID" 2>/dev/null || true
 dialog --no-shadow --msgbox "Workspace reset." 6 40 || true
 clear
 exit 0
+   

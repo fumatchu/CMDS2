@@ -7,7 +7,7 @@
 #   • DNS / HTTP client remediation runs
 #   • Meraki network creation runs
 #   • Port migration runs (runs/port_migration)
-#   • Management IP Migration runs (runs/mgmt_ip)  <-- NEW (menu item 10)
+#   • Management IP Migration runs (runs/mgmt_ip)
 
 # NOTE: no -e here on purpose; we want Cancel/Esc to be handled manually.
 set -Euo pipefail
@@ -37,7 +37,7 @@ SCHED_DIR="$ROOT/schedules"
 DISC_ROOT="$RUNS_DIR/discoveryscans"
 MIGRATION_DIR="$RUNS_DIR/migration"        # legacy run folders (kept)
 PORT_MIG_DIR="$RUNS_DIR/port_migration"    # port migration runs
-MGMTIP_DIR="$RUNS_DIR/mgmt_ip"             # NEW: management IP migration runs
+MGMTIP_DIR="$RUNS_DIR/mgmt_ip"             # management IP migration runs
 
 PREFLIGHT_DIR="$RUNS_DIR/preflight"
 DNS_DIR="$RUNS_DIR/dnsfix"
@@ -80,7 +80,34 @@ dlg() {
   DOUT=""
   [[ -s "$_t" ]] && DOUT="$(cat "$_t")"
   rm -f "$_t"
-  return 0                # always 0
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# helper: build short picker menu from file list
+# outputs arrays by nameref:
+#   $1 = input file array name
+#   $2 = output menu items array name
+#   $3 = output pick paths array name
+# -----------------------------------------------------------------------------
+build_short_file_menu(){
+  local in_name="$1"
+  local items_name="$2"
+  local picks_name="$3"
+
+  declare -n _in="$in_name"
+  declare -n _items="$items_name"
+  declare -n _picks="$picks_name"
+
+  _items=()
+  _picks=()
+
+  local idx=1 f
+  for f in "${_in[@]}"; do
+    _picks[idx]="$f"
+    _items+=("$idx" "$(basename "$f")")
+    ((idx++))
+  done
 }
 
 # ----- time helpers for IOS-XE run-YYYYmmddHHMMSS (UTC) -----
@@ -123,7 +150,7 @@ epoch_from_migrationid(){
 # ----- time helpers for generic prefix-YYYYmmddHHMMSS dirs (preflight-, dns-, http-, etc.) -----
 to_local_from_genericid(){
   local gid="$1"
-  gid="${gid#*-}"   # strip everything up to first '-'
+  gid="${gid#*-}"
   date -d "@$(date -ud "${gid:0:4}-${gid:4:2}-${gid:6:2} ${gid:8:2}:${gid:10:2}:${gid:12:2}" +%s)" \
        '+%F %T %Z' 2>/dev/null || echo "$gid"
 }
@@ -134,8 +161,6 @@ epoch_from_genericid(){
 }
 
 epoch_from_human(){ date -d "$1" +%s 2>/dev/null || echo 0; }
-
-# epoch helper for ISO timestamps in JSON (e.g. 2026-02-22T02:47:04-0500)
 epoch_from_iso(){ date -d "$1" +%s 2>/dev/null || echo 0; }
 
 in_at_queue(){
@@ -189,11 +214,9 @@ view_ports_apply_log_filtered(){
 # Tiny JSON extractors (no jq dependency)
 # -----------------------------------------------------------------------------
 json_str(){
-  # $1=file $2=key => extracts string value for "key": "value"
   sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | head -n1
 }
 json_int(){
-  # $1=file $2=key => extracts integer value for "key": 123
   sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9]\\+\\).*/\\1/p" "$1" 2>/dev/null | head -n1
 }
 
@@ -231,11 +254,13 @@ show_upgrade_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path)
         dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
@@ -404,11 +429,13 @@ show_discovery_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Discovery device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Discovery device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path)
         dlg --title "Scan path" --msgbox "$rdir" 7 70 ;;
@@ -498,11 +525,13 @@ show_fix_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -598,11 +627,13 @@ show_createnet_run_menu(){
           dlg --title "Per-run dev logs" --msgbox "No dev logs found in:\n$devdir" 9 70
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Create-network dev logs" --menu "Pick a log to view" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Create-network dev logs" --menu "Pick a log to view" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -971,17 +1002,16 @@ show_portmig_run_menu(){
           dlg --title "Device logs" --msgbox "No *.log files found in:\n$devdir" 9 70
           continue
         fi
-        local devitems=() f base
-        for f in "${logs[@]}"; do
-          base="$(basename "$f")"
-          devitems+=("$f" "$base")
-        done
+        local devitems=() pick_paths=()
+        build_short_file_menu logs devitems pick_paths
         while true; do
-          dlg --title "Port Migration Device Logs" --menu "Pick a log to view" 22 120 14 "${devitems[@]}"
+          dlg --title "Port Migration Device Logs" --menu "Pick a log to view" 22 110 14 "${devitems[@]}"
           local rc2=$DIALOG_RC
           [[ $rc2 -ne 0 ]] && break
 
-          local pick="$DOUT"
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] || continue
+
           local b; b="$(basename "$pick")"
           if [[ "$b" == *_ports_apply.log ]]; then
             view_ports_apply_log_filtered "$pick" "$b"
@@ -1000,11 +1030,13 @@ show_portmig_run_menu(){
           dlg --title "Ports" --msgbox "No files found in:\n$portsdir" 8 70
           continue
         fi
-        local pitems=() p
-        for p in "${pf[@]}"; do pitems+=("$p" "$(basename "$p")"); done
-        dlg --title "Ports" --menu "Pick a file to view" 22 120 14 "${pitems[@]}"
-        local rc3=$DIALOG_RC
-        (( rc3 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local pitems=() pick_paths=()
+        build_short_file_menu pf pitems pick_paths
+        dlg --title "Ports" --menu "Pick a file to view" 22 110 14 "${pitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -1061,10 +1093,9 @@ port_migration_menu(){
 }
 
 # ---------------------------------------------------------------------------
-# NEW: Management IP Migration viewer (runs/mgmt_ip/mgmtip-*)
+# Management IP Migration viewer (runs/mgmt_ip/mgmtip-*)
 # ---------------------------------------------------------------------------
 mgmtip_epoch_from_id(){
-  # mgmtip-YYYYmmddHHMMSS
   local mid="$1"; mid="${mid#mgmtip-}"
   date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
 }

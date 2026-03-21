@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # switch_discovery.sh
 # Catalyst/Meraki discovery + processing plan with split-screen dialog UI + selection
+#
+# Legacy SSH handling:
+# - Creates custom RSA-OPENSSH-1024 crypto policy module if missing
+# - Switches system policy to LEGACY:RSA-OPENSSH-1024 for the duration of discovery
+# - Uses legacy-compatible SSH options for old Catalyst gear
+# - Always restores host crypto policy to DEFAULT on exit
+# - Logs crypto policy transitions to the discovery log
 
 set -Euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -81,12 +88,12 @@ detect_server_ip() {
 if [[ -z "$TFTP_BASE" ]]; then
   SERVER_IP="$(detect_server_ip)"
   if [[ -n "${SERVER_IP:-}" ]]; then
-    TFTP_BASE="tftp://${SERVER_IP}/mig"
+    TFTP_BASE="tftp://${SERVER_IP}/cat"
   fi
 fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need nmap; need jq; need awk; need sed
+need nmap; need jq; need awk; need sed; need update-crypto-policies
 command -v sshpass >/dev/null 2>/dev/null || echo "NOTE: sshpass not found; password auth disabled unless SSH_KEY_PATH is set." >&2
 
 OUT_DIR="$(dirname "$ENV_FILE")"
@@ -109,8 +116,8 @@ DEV_LOG="$RUN_DIR/ui.status"
 PROBE_LOG_DIR="$DEVLOG_DIR"
 
 ln -sfn "$RUN_DIR" "$RUNS_ROOT/latest"
-ln -sfn "$JSON_OUT"    "$RUN_DIR/discovery_results.json"
-ln -sfn "$CSV_OUT"     "$RUN_DIR/discovery_results.csv"
+ln -sfn "$JSON_OUT" "$RUN_DIR/discovery_results.json"
+ln -sfn "$CSV_OUT"  "$RUN_DIR/discovery_results.csv"
 
 log_msg() {
   printf '%s [%s] %s\n' "$(date '+%F %T')" "$RUN_TAG" "$*" >>"$DEV_LOG"
@@ -150,6 +157,96 @@ clean_field() {
   printf '%s' "$s"
 }
 
+###############################################################################
+# Legacy crypto policy handling
+###############################################################################
+DEFAULT_CRYPTO_POLICY="DEFAULT"
+CRYPTO_MODULE_DIR="/etc/crypto-policies/policies/modules"
+CRYPTO_MODULE_FILE="$CRYPTO_MODULE_DIR/RSA-OPENSSH-1024.pmod"
+LEGACY_CRYPTO_POLICY="LEGACY:RSA-OPENSSH-1024"
+CRYPTO_POLICY_AT_START="$(update-crypto-policies --show 2>/dev/null || printf 'UNKNOWN')"
+
+log_crypto_policy() {
+  local stage="$1"
+  local current
+  current="$(update-crypto-policies --show 2>/dev/null || printf 'UNKNOWN')"
+  log_msg "CRYPTO: ${stage} | current=${current}"
+}
+
+restore_crypto_policy() {
+  log_msg "CRYPTO: restoring host crypto policy to ${DEFAULT_CRYPTO_POLICY}"
+  update-crypto-policies --set "$DEFAULT_CRYPTO_POLICY" >/dev/null 2>&1 || true
+  log_crypto_policy "post-restore"
+}
+
+ensure_legacy_crypto_policy() {
+  mkdir -p "$CRYPTO_MODULE_DIR" || return 1
+
+  if [[ ! -f "$CRYPTO_MODULE_FILE" ]]; then
+    cat >"$CRYPTO_MODULE_FILE" <<'EOF'
+min_rsa_size@openssh = 1024
+EOF
+    chmod 644 "$CRYPTO_MODULE_FILE" || true
+    log_msg "CRYPTO: created module ${CRYPTO_MODULE_FILE}"
+  else
+    log_msg "CRYPTO: module already present ${CRYPTO_MODULE_FILE}"
+  fi
+
+  log_msg "CRYPTO: switching host crypto policy from ${CRYPTO_POLICY_AT_START} to ${LEGACY_CRYPTO_POLICY}"
+  update-crypto-policies --set "$LEGACY_CRYPTO_POLICY" >/dev/null 2>&1 || return 1
+  log_crypto_policy "post-switch-to-legacy"
+  return 0
+}
+
+###############################################################################
+# Legacy SSH option helper
+###############################################################################
+build_ssh_cmd() {
+  local ip="$1"
+
+  if [[ -n "$SSH_KEY_PATH" && -r "$SSH_KEY_PATH" ]]; then
+    printf '%s\0' \
+      ssh \
+      -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 \
+      -o ServerAliveInterval=5 \
+      -o ServerAliveCountMax=1 \
+      -o PreferredAuthentications=publickey,password,keyboard-interactive \
+      -o KbdInteractiveAuthentication=yes \
+      -o PubkeyAuthentication=yes \
+      -o NumberOfPasswordPrompts=1 \
+      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc \
+      -o MACs=+hmac-sha1,hmac-sha1-96 \
+      -i "$SSH_KEY_PATH" \
+      -tt "$SSH_USERNAME@$ip"
+  else
+    printf '%s\0' \
+      sshpass -p "$SSH_PASSWORD" \
+      ssh \
+      -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 \
+      -o ServerAliveInterval=5 \
+      -o ServerAliveCountMax=1 \
+      -o PreferredAuthentications=password,keyboard-interactive \
+      -o KbdInteractiveAuthentication=yes \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc \
+      -o MACs=+hmac-sha1,hmac-sha1-96 \
+      -tt "$SSH_USERNAME@$ip"
+  fi
+}
+
 # ===== UI =====
 DIALOG_AVAILABLE=0
 if [[ "$UI_MODE" == "dialog" ]] && command -v dialog >/dev/null 2>&1; then DIALOG_AVAILABLE=1; fi
@@ -187,11 +284,11 @@ ui_start() {
     exec {PROG_FD}<>"$PROG_PIPE"
     (
       dialog --no-shadow \
-             --backtitle "Discovering Switches" \
-             --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
-             --and-widget \
-             --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
-             --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE"
+        --backtitle "Discovering Switches" \
+        --begin 2 2 --title "Activity" --tailboxbg "$STATUS_FILE" "$TAIL_H" "$TAIL_W" \
+        --and-widget \
+        --begin "$GAUGE_ROW" "$GAUGE_COL" --title "Overall Progress" \
+        --gauge "Starting…" "$GAUGE_H" "$GAUGE_W" 0 < "$PROG_PIPE"
     ) & DIALOG_PID=$!
     sleep 0.15
   else
@@ -207,7 +304,8 @@ ui_status() {
 }
 
 ui_gauge() {
-  local p="$1"; shift || true; local m="${*:-Working…}"
+  local p="$1"; shift || true
+  local m="${*:-Working…}"
   log_msg "GAUGE: ${p}%% - $m"
   if (( DIALOG_AVAILABLE )); then
     if _ui_fd_open; then
@@ -236,7 +334,13 @@ ui_stop() {
   fi
   rm -f "$STATUS_FILE" 2>/dev/null || true
 }
-trap 'ui_stop' EXIT
+
+cleanup_all() {
+  restore_crypto_policy
+  ui_stop
+}
+
+trap 'cleanup_all' EXIT
 
 # ===== Stack parsing (show switch) =====
 parse_stack_info() {
@@ -247,7 +351,7 @@ parse_stack_info() {
   local line sw state state_upper
 
   base_mac="$(grep -m1 -E 'Switch/Stack Mac Address[[:space:]]*:' "$file" \
-              | sed -E 's/.*Address[[:space:]]*:[[:space:]]*([0-9a-fA-F.]+).*/\1/')" || true
+    | sed -E 's/.*Address[[:space:]]*:[[:space:]]*([0-9a-fA-F.]+).*/\1/')" || true
   base_mac="$(clean_field "${base_mac:-}")"
 
   local in_table=0
@@ -259,8 +363,7 @@ parse_stack_info() {
     [[ -z "$line" ]] && break
     [[ "$line" =~ ^-+$ ]] && continue
 
-    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:s
-pace:]]+([A-Za-z]+) ]]; then
+    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:space:]]+([A-Za-z]+) ]]; then
       sw="${BASH_REMATCH[1]}"
       state="${BASH_REMATCH[6]}"
       state_upper="${state^^}"
@@ -281,7 +384,6 @@ pace:]]+([A-Za-z]+) ]]; then
   printf '%s\t%s\t%s\n' "${base_mac:-}" "$is_stack" "$stack_members"
 }
 
-# per-member MACs from "show switch" READY rows, ordered by switch# (1,2,3,…)
 parse_stack_member_macs() {
   local file="$1"
   local line sw mac state state_upper
@@ -296,8 +398,7 @@ parse_stack_member_macs() {
     [[ -z "$line" ]] && break
     [[ "$line" =~ ^-+$ ]] && continue
 
-    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:s
-pace:]]+([A-Za-z]+) ]]; then
+    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:space:]]+([A-Za-z]+) ]]; then
       sw="${BASH_REMATCH[1]}"
       mac="${BASH_REMATCH[3]}"
       state="${BASH_REMATCH[6]}"
@@ -314,7 +415,6 @@ pace:]]+([A-Za-z]+) ]]; then
   done
 }
 
-# ===== Motherboard serial parsing (show hardware) =====
 parse_mb_serials() {
   local file="$1" line sn
   local -a mb=()
@@ -330,7 +430,6 @@ parse_mb_serials() {
   fi
 }
 
-# ===== NEW: stack_detail.members[] from "show switch" =====
 parse_stack_detail_members_json() {
   local file="$1"
   local line
@@ -344,8 +443,7 @@ parse_stack_detail_members_json() {
     [[ -z "$line" ]] && break
     [[ "$line" =~ ^-+$ ]] && continue
 
-    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:s
-pace:]]+([A-Za-z]+) ]]; then
+    if [[ "$line" =~ ^[\*\ ]*([0-9]+)[[:space:]]+([A-Za-z]+)[[:space:]]+([0-9a-fA-F\.]+)[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9]+)[[:space:]]+([A-Za-z]+) ]]; then
       local sw="${BASH_REMATCH[1]}"
       local role="${BASH_REMATCH[2]}"
       local mac="${BASH_REMATCH[3]}"
@@ -358,21 +456,20 @@ pace:]]+([A-Za-z]+) ]]; then
         "$sw" "$(clean_field "$role")" "$(clean_field "$mac")" "$(clean_field "$state")"
     fi
   done < "$file" \
-  | sort -t'|' -k1,1n \
-  | jq -R -s '
-      split("\n")
-      | map(select(length>0))
-      | map(split("|"))
-      | map({
-          member_index: (.[0] | tonumber),
-          role: .[1],
-          state: .[3],
-          mac: .[2]
-        })
-    '
+    | sort -t'|' -k1,1n \
+    | jq -R -s '
+        split("\n")
+        | map(select(length>0))
+        | map(split("|"))
+        | map({
+            member_index: (.[0] | tonumber),
+            role: .[1],
+            state: .[3],
+            mac: .[2]
+          })
+      '
 }
 
-# ===== NEW: hw_detail.members{} from "show inventory" =====
 parse_inventory_hw_detail_json() {
   local file="$1"
 
@@ -381,9 +478,7 @@ parse_inventory_hw_detail_json() {
     function rtrim(s){ sub(/[ \t\r\n]+$/, "", s); return s }
     function trim(s){ return rtrim(ltrim(s)) }
 
-    BEGIN{
-      inblk=0; sw=0; name=""; pid=""; sn="";
-    }
+    BEGIN{ inblk=0; sw=0; name=""; pid=""; sn=""; }
 
     /^NAME:[ \t]*"/{
       inblk=1;
@@ -392,7 +487,6 @@ parse_inventory_hw_detail_json() {
       sub(/".*$/, "", name);
       name=trim(name);
       pid=""; sn="";
-
       sw=0;
       if (match(name, /Switch[ \t]+([0-9]+)/, m)) sw=m[1]+0;
       next
@@ -424,42 +518,41 @@ parse_inventory_hw_detail_json() {
       }
     }
   ' "$file" \
-  | jq -R -s '
-      def is_nm($n):
-        ($n|ascii_downcase) | (test("uplink") or test("network module") or test("nm") or test("module"));
+    | jq -R -s '
+        def is_nm($n):
+          ($n|ascii_downcase) | (test("uplink") or test("network module") or test("nm") or test("module"));
 
-      def is_chassis($n):
-        ($n|ascii_downcase)
-        | (test("chassis") or test("^switch[ ]+[0-9]+$"))
-        and (test("power")|not) and (test("fan")|not) and (test("supply")|not);
+        def is_chassis($n):
+          ($n|ascii_downcase)
+          | (test("chassis") or test("^switch[ ]+[0-9]+$"))
+          and (test("power")|not) and (test("fan")|not) and (test("supply")|not);
 
-      split("\n")
-      | map(select(length>0))
-      | map(split("|"))
-      | map({
-          sw: (.[0]|tonumber),
-          name: .[1],
-          pid: (.[2]//""),
-          sn: (.[3]//"")
-        })
-      | reduce .[] as $r ({};
-          .[$r.sw|tostring] |= (
-            . // { chassis_pid:"", chassis_sn:"", nm_modules:[] }
-            | if (is_chassis($r.name) and ($r.pid != "" or $r.sn != "")) then
-                .chassis_pid = (if $r.pid != "" then $r.pid else .chassis_pid end)
-              | .chassis_sn  = (if $r.sn  != "" then $r.sn  else .chassis_sn  end)
-              else .
-              end
-            | if (is_nm($r.name) and ($r.pid != "" or $r.sn != "")) then
-                .nm_modules += [{ name: $r.name, pid: $r.pid, sn: $r.sn }]
-              else .
-              end
+        split("\n")
+        | map(select(length>0))
+        | map(split("|"))
+        | map({
+            sw: (.[0]|tonumber),
+            name: .[1],
+            pid: (.[2]//""),
+            sn: (.[3]//"")
+          })
+        | reduce .[] as $r ({};
+            .[$r.sw|tostring] |= (
+              . // { chassis_pid:"", chassis_sn:"", nm_modules:[] }
+              | if (is_chassis($r.name) and ($r.pid != "" or $r.sn != "")) then
+                  .chassis_pid = (if $r.pid != "" then $r.pid else .chassis_pid end)
+                | .chassis_sn  = (if $r.sn  != "" then $r.sn  else .chassis_sn  end)
+                else .
+                end
+              | if (is_nm($r.name) and ($r.pid != "" or $r.sn != "")) then
+                  .nm_modules += [{ name: $r.name, pid: $r.pid, sn: $r.sn }]
+                else .
+                end
+            )
           )
-        )
-    '
+      '
 }
 
-# ===== Discovery fallback records =====
 emit_extra_json() {
   local hosts=("$@")
   local ip
@@ -519,7 +612,6 @@ emit_extra_json() {
   done | jq -s '.'
 }
 
-# ===== SSH probe =====
 probe_host() {
   local ip="$1" log="$PROBE_LOG_DIR/$ip.log"
   : > "$log"
@@ -532,20 +624,8 @@ probe_host() {
   stack_detail_json='{"source":"","members":[]}'
   hw_detail_json='{"source":"","members":{}}'
 
-  local -a SSH_CMD
-  if [[ -n "$SSH_KEY_PATH" && -r "$SSH_KEY_PATH" ]]; then
-    SSH_CMD=(ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-      -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
-      -o PreferredAuthentications=publickey,password,keyboard-interactive
-      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=yes
-      -o NumberOfPasswordPrompts=1 -i "$SSH_KEY_PATH" -tt "$SSH_USERNAME@$ip")
-  else
-    SSH_CMD=(sshpass -p "$SSH_PASSWORD" ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-      -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
-      -o PreferredAuthentications=password,keyboard-interactive
-      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no
-      -o NumberOfPasswordPrompts=1 -tt "$SSH_USERNAME@$ip")
-  fi
+  local -a SSH_CMD=()
+  mapfile -d '' -t SSH_CMD < <(build_ssh_cmd "$ip")
 
   _run_ssh() {
     local timeout_secs="$1"; shift || true
@@ -559,19 +639,30 @@ probe_host() {
   local facts outn
   facts="$(mktemp)"; outn="$(mktemp)"
 
-  {
-    printf '\r\n\r\n'
-    printf 'terminal length 0\r\n'
-    printf 'terminal width 511\r\n'
-    printf 'show clock\r\n'
-    printf 'show version\r\n'
-    printf 'show running-config | include ^hostname\r\n'
-    printf 'show running-config | include meraki-user\r\n'
-    printf 'show inventory\r\n'
-    printf 'show switch\r\n'
-    printf 'show hardware\r\n'
-    printf 'exit\r\n'
-  } | _run_ssh "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
+  (
+    sleep 1
+    echo ""
+    sleep 0.3
+    echo "terminal length 0"
+    sleep 0.3
+    echo "terminal width 511"
+    sleep 0.3
+    echo "show clock"
+    sleep 0.3
+    echo "show version"
+    sleep 0.3
+    echo "show running-config | include ^hostname"
+    sleep 0.3
+    echo "show running-config | include meraki-user"
+    sleep 0.3
+    echo "show inventory"
+    sleep 0.3
+    echo "show switch"
+    sleep 0.3
+    echo "show hardware"
+    sleep 0.3
+    echo "exit"
+  ) | _run_ssh "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
 
   tr -d '\r' < "$facts" | tee -a "$log" > "$outn"
 
@@ -586,14 +677,20 @@ probe_host() {
   [[ -z "$hostname" ]] && hostname="$(grep -m1 -E ' uptime is ' "$outn" | awk '{print $1}')"
   hostname="$(clean_field "${hostname:-}")"
 
-  version="$(grep -m1 -E 'Cisco IOS XE Software, Version[[:space:]]+' "$outn" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
-  [[ -z "$version" ]] && version="$(grep -m1 -E 'Cisco IOS Software|Version[[:space:]]+[0-9]' "$outn" | sed -E 's/.*Version[[:space:]]+([^
-, ]+).*/\1/')"
+  version=""
+  version="$(grep -m1 -E 'Cisco IOS XE Software, Version[[:space:]]+' "$outn" \
+    | sed -E 's/.*Version[[:space:]]+([^,]+).*/\1/')"
+  [[ -z "$version" ]] && version="$(grep -m1 -E 'Cisco IOS Software,' "$outn" \
+    | sed -E 's/.*Version[[:space:]]+([^,]+).*/\1/')"
+  [[ -z "$version" ]] && version="$(grep -m1 -E '^[*[:space:][:digit:]]+[[:digit:]]+[[:space:]]+[[:digit:]]+[[:space:]]+WS-C[[:alnum:]-]+[[:space:]]+[0-9A-Za-z().-]+' "$outn" \
+    | awk '{print $(NF-1)}')"
+  [[ -z "$version" ]] && version="$(grep -m1 -E 'Version[[:space:]]+[0-9A-Za-z()._-]+' "$outn" \
+    | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
   version="$(clean_field "${version:-}")"
 
   pid="$(grep -m1 -E 'PID:[[:space:]]*[^,]+' "$outn" | sed -E 's/.*PID:[[:space:]]*([^,]+).*/\1/')"
   sn="$(grep -m1 -E 'System Serial Number[[:space:]]*:[[:space:]]*([^[:space:]]+)' "$outn" \
-        | sed -E 's/.*System Serial Number[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/')" || true
+    | sed -E 's/.*System Serial Number[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/')" || true
   pid="$(clean_field "${pid:-}")"
   sn="$(clean_field "${sn:-}")"
 
@@ -694,12 +791,18 @@ probe_host() {
     backup_filename="${h_safe}-${ts}.cfg"
     backup_timestamp_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-    {
-      printf '\r\n'
-      printf 'copy running-config %s/%s\r\n' "$TFTP_BASE" "$backup_filename"
-      printf '\r\n\r\n'
-      printf 'exit\r\n'
-    } | _run_ssh "${SSH_TIMEOUT:-60}" >>"$log" 2>&1 || true
+    (
+      sleep 1
+      echo ""
+      sleep 0.3
+      printf 'copy running-config %s/%s\n' "$TFTP_BASE" "$backup_filename"
+      sleep 0.7
+      echo ""
+      sleep 0.7
+      echo ""
+      sleep 0.3
+      echo "exit"
+    ) | _run_ssh "${SSH_TIMEOUT:-60}" >>"$log" 2>&1 || true
 
     if [[ -f "$BACKUP_DIR/$backup_filename" ]]; then
       backup_enabled="true"
@@ -788,7 +891,6 @@ probe_host() {
   fi
 }
 
-# ===== Target resolution + discovery =====
 resolve_targets() {
   local mode="${DISCOVERY_MODE,,}" targets=()
   case "$mode" in
@@ -804,8 +906,11 @@ resolve_targets() {
       fi
       ;;
   esac
-  [[ ${#targets[@]} -gt 0 ]] || { echo "No targets: set DISCOVERY_MODE=list & DISCOVERY_IPS, or DISCOVERY_MODE=scan|networks & DISCOVERY_N
-ETWORKS" >&2; return 1; }
+
+  [[ ${#targets[@]} -gt 0 ]] || {
+    echo "No targets: set DISCOVERY_MODE=list & DISCOVERY_IPS, or DISCOVERY_MODE=scan|networks & DISCOVERY_NETWORKS" >&2
+    return 1
+  }
 
   if [[ -n "$DISCOVERY_INTERFACE" ]]; then
     ui_status "Using interface override: $DISCOVERY_INTERFACE"
@@ -851,8 +956,11 @@ run_nmap_with_heartbeat() {
   rm -f "$tmp"
 }
 
-pass_a() { local probes=(-PE -PS22,80,443,830 -PA22,443); (( USE_IFACE )) && probes+=(-PR); run_nmap_with_heartbeat "Discovering live host
-s (pass 1/3)" "${probes[@]}"; }
+pass_a() {
+  local probes=(-PE -PS22,80,443,830 -PA22,443)
+  (( USE_IFACE )) && probes+=(-PR)
+  run_nmap_with_heartbeat "Discovering live hosts (pass 1/3)" "${probes[@]}"
+}
 pass_b() { run_nmap_with_heartbeat "Discovering live hosts (ICMP-only)" -PE; }
 pass_c() { run_nmap_with_heartbeat "Discovering live hosts (TCP ping)" -Pn -PS22,80,443; }
 
@@ -911,7 +1019,8 @@ run_probe_pool() {
         wait "${pids[0]}" || true
         pids=("${pids[@]:1}")
       fi
-      ((done++)); ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
+      ((done++))
+      ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
       ((running--))
     fi
   done
@@ -923,12 +1032,12 @@ run_probe_pool() {
       wait "${pids[0]}" || true
       pids=("${pids[@]:1}")
     fi
-    ((done++)); ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
+    ((done++))
+    ui_gauge $(( 25 + 60 * done / total )) "Probing devices… ($done / $total)"
     ((running--))
   done
 }
 
-# ===== Selection =====
 do_selection_dialog() {
   local disc="$JSON_OUT"
   [[ -s "$disc" ]] || { dialog --no-shadow --infobox "No discovery results to select from." 6 60; sleep 2; return 1; }
@@ -946,13 +1055,13 @@ do_selection_dialog() {
     blacklisted="${blacklisted:-false}"
     bl_reason="${bl_reason:-}"
 
-    local text="${host} (${ip})  ${pid}  IOS:${cur}"
+    local text="${host} (${ip})  ${pid}  Ver:${cur}"
 
     local def="on"
     if [[ "$blacklisted" == "true" ]]; then
       def="off"
       [[ -z "$bl_reason" ]] && bl_reason="blacklisted"
-      text="[BLACKLISTED: ${bl_reason}]  ${host} (${ip})  ${pid}  IOS:${cur}"
+      text="[BLACKLISTED: ${bl_reason}]  ${host} (${ip})  ${pid}  Ver:${cur}"
       BLKMAP["$ip"]="$bl_reason"
     fi
 
@@ -1001,11 +1110,10 @@ do_selection_dialog() {
   (( dlg_list < 10 )) && dlg_list=10
 
   dialog --no-shadow --title "Select switches to process" \
-         --backtitle "Discovery Selection" \
-         --checklist "Use <SPACE> to toggle. BLACKLISTED entries are shown for visibility but cannot be selected (ignored even if checked)
-." \
-         "$dlg_h" "$dlg_w" "$dlg_list" \
-         "${items[@]}" 2> "$tmp_sel"
+    --backtitle "Discovery Selection" \
+    --checklist "Use <SPACE> to toggle. BLACKLISTED entries are shown for visibility but cannot be selected (ignored even if checked)." \
+    "$dlg_h" "$dlg_w" "$dlg_list" \
+    "${items[@]}" 2> "$tmp_sel"
   local rc=$?
   if (( rc != 0 )); then
     rm -f "$tmp_sel"
@@ -1014,29 +1122,27 @@ do_selection_dialog() {
     return 2
   fi
 
-  # dialog checklist returns selected tags on ONE LINE, space-separated.
-# So we must split on whitespace (not read lines).
-local sel_raw
-sel_raw="$(tr -d '"' < "$tmp_sel")"
-rm -f "$tmp_sel"
+  local sel_raw
+  sel_raw="$(tr -d '"' < "$tmp_sel")"
+  rm -f "$tmp_sel"
 
-local -a SEL_ARR=()
-# shellcheck disable=SC2206
-SEL_ARR=($sel_raw)
+  local -a SEL_ARR=()
+  # shellcheck disable=SC2206
+  SEL_ARR=($sel_raw)
 
-local -a FILTERED_SEL=()
-local ip
-for ip in "${SEL_ARR[@]}"; do
-  ip="$(clean_field "$ip")"
-  [[ -z "$ip" ]] && continue
-  [[ -n "${BLKMAP[$ip]:-}" ]] && continue
-  FILTERED_SEL+=("$ip")
-done
-# ---- DEBUG (enable with DISCOVERY_DEBUG=1) ----
-dbg "Selected raw line: ${sel_raw:-<empty>}"
-dbg "Selected parsed tags (SEL_ARR): ${SEL_ARR[*]:-<empty>}"
-dbg "Selected after blacklist filter (FILTERED_SEL): ${FILTERED_SEL[*]:-<empty>}"
-dbg "Discovery IPs in JSON_OUT: $(jq -r '.[].ip' "$JSON_OUT" 2>/dev/null | tr '\n' ' ')"
+  local -a FILTERED_SEL=()
+  local ip
+  for ip in "${SEL_ARR[@]}"; do
+    ip="$(clean_field "$ip")"
+    [[ -z "$ip" ]] && continue
+    [[ -n "${BLKMAP[$ip]:-}" ]] && continue
+    FILTERED_SEL+=("$ip")
+  done
+
+  dbg "Selected raw line: ${sel_raw:-<empty>}"
+  dbg "Selected parsed tags (SEL_ARR): ${SEL_ARR[*]:-<empty>}"
+  dbg "Selected after blacklist filter (FILTERED_SEL): ${FILTERED_SEL[*]:-<empty>}"
+  dbg "Discovery IPs in JSON_OUT: $(jq -r '.[].ip' "$JSON_OUT" 2>/dev/null | tr '\n' ' ')"
 
   if (( ${#FILTERED_SEL[@]} == 0 )); then
     dialog --no-shadow --infobox \
@@ -1049,12 +1155,10 @@ dbg "Discovery IPs in JSON_OUT: $(jq -r '.[].ip' "$JSON_OUT" 2>/dev/null | tr '\
   local ips_json
   ips_json="$(printf '%s\n' "${FILTERED_SEL[@]}" | jq -R -s 'split("\n")|map(select(length>0))')"
 
-  # ---- FIX #2: robust jq selection + avoids empty [] due to mismatched whitespace ----
   jq --argjson ips "$ips_json" '
     [ .[] | select(.ip as $x | ($ips | index($x)) != null) ]
   ' "$JSON_OUT" > "$SEL_JSON_OUT"
 
-  # Optional: also write CSV of selected
   printf "ip,ssh,login,hostname,version,pid,serial\n" > "$SEL_CSV_OUT"
   jq -r '.[] | [.ip, .ssh, .login, (.hostname//""), (.version//""), (.pid//""), (.serial//"")] | @csv' \
     "$SEL_JSON_OUT" >> "$SEL_CSV_OUT"
@@ -1062,7 +1166,6 @@ dbg "Discovery IPs in JSON_OUT: $(jq -r '.[].ip' "$JSON_OUT" 2>/dev/null | tr '\
   {
     echo "# Generated $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     printf "export UPGRADE_BASE_ENV=%q\n" "$ENV_FILE"
-    # ---- FIX #3: no backslash-escaped spaces ----
     printf 'export UPGRADE_SELECTED_IPS="%s"\n' "${FILTERED_SEL[*]}"
     printf "export UPGRADE_SELECTED_JSON=%q\n" "$SEL_JSON_OUT"
     printf "export UPGRADE_SELECTED_CSV=%q\n" "$SEL_CSV_OUT"
@@ -1076,9 +1179,18 @@ BLACKLISTED entries were ignored." 7 70
   return 0
 }
 
-# ===== Main =====
 main() {
-  ui_start; ui_gauge 1 "Initializing…"
+  log_msg "CRYPTO: script start | detected-at-start=${CRYPTO_POLICY_AT_START}"
+  if ! ensure_legacy_crypto_policy; then
+    log_msg "CRYPTO: FAILED to enable temporary legacy crypto compatibility mode: ${LEGACY_CRYPTO_POLICY}"
+    echo "Failed to enable temporary legacy crypto compatibility mode: $LEGACY_CRYPTO_POLICY" >&2
+    exit 1
+  fi
+
+  ui_start
+  ui_status "Crypto policy temporarily set to ${LEGACY_CRYPTO_POLICY}"
+  ui_status "Host crypto policy will be restored to ${DEFAULT_CRYPTO_POLICY} on exit"
+  ui_gauge 1 "Initializing…"
 
   resolve_targets || { jq -n '[]' > "$JSON_OUT"; return 0; }
 
@@ -1124,8 +1236,7 @@ main() {
   fi
 
   local failed_list
-  failed_list="$(jq -r '.[] | select(.backup_enabled==true and .backup_status=="FAILED") | "\(.hostname // "UNKNOWN") (\(.ip)) -> \(.backu
-p_filename // "N/A")"' "$JSON_OUT")"
+  failed_list="$(jq -r '.[] | select(.backup_enabled==true and .backup_status=="FAILED") | "\(.hostname // "UNKNOWN") (\(.ip)) -> \(.backup_filename // "N/A")"' "$JSON_OUT")"
 
   if [[ -n "$failed_list" ]]; then
     if (( DIALOG_AVAILABLE )); then
@@ -1142,6 +1253,7 @@ p_filename // "N/A")"' "$JSON_OUT")"
     fi
   fi
 
+  ui_status "Discovery complete. Host crypto policy will now be restored to ${DEFAULT_CRYPTO_POLICY}."
   ui_gauge 100 "Done."
 }
 

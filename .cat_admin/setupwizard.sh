@@ -1,8 +1,16 @@
-#!/bin/sh
-# setupwizard.sh — CMDS Switch Discovery — Setup (POSIX /bin/sh)
+#!/usr/bin/env bash
+# setupwizard.sh — CMDS Switch Discovery — Setup
 # - Prompts: targets, SSH creds (+ test), default privilege 15 check, enable password verify
 # - Meraki API key
 # - Writes ./meraki_discovery.env
+#
+# Legacy SSH handling:
+# - Creates custom RSA-OPENSSH-1024 crypto policy module if missing
+# - Switches system policy to LEGACY:RSA-OPENSSH-1024 for the duration of the wizard
+# - Uses legacy-compatible SSH options that work for old Catalyst gear
+# - Always restores the host crypto policy to DEFAULT on exit
+
+set -u
 
 TITLE="CMDS Switch Discovery — Setup"
 BACKTITLE="Meraki Migration Toolkit — Discovery"
@@ -19,7 +27,7 @@ mkdir -p "$DISC_SCAN_ROOT"
 
 # ---- deps ----
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need dialog; need python3; need ssh; need sshpass; need timeout; need expect
+need dialog; need python3; need ssh; need sshpass; need timeout; need expect; need update-crypto-policies
 
 # ---- helpers ----
 log() { [ "${DEBUG:-0}" = "1" ] && printf '[%s] %s\n' "$(date -u '+%F %T')" "$*" >>"$DEBUG_LOG"; }
@@ -40,81 +48,224 @@ is_valid_cidr() { python3 -c 'import sys,ipaddress; ipaddress.ip_network(sys.arg
 
 first_token() { set -- $1; printf '%s' "${1:-}"; }
 
+###############################################################################
+# Legacy crypto policy handling
+###############################################################################
+DEFAULT_CRYPTO_POLICY="DEFAULT"
+CRYPTO_MODULE_DIR="/etc/crypto-policies/policies/modules"
+CRYPTO_MODULE_FILE="$CRYPTO_MODULE_DIR/RSA-OPENSSH-1024.pmod"
+LEGACY_CRYPTO_POLICY="LEGACY:RSA-OPENSSH-1024"
+
+restore_crypto_policy() {
+  update-crypto-policies --set "$DEFAULT_CRYPTO_POLICY" >/dev/null 2>&1 || true
+}
+
+cleanup_and_exit() {
+  restore_crypto_policy
+  clear
+  exit "${1:-0}"
+}
+
+trap 'restore_crypto_policy' EXIT
+
+ensure_legacy_crypto_policy() {
+  mkdir -p "$CRYPTO_MODULE_DIR" || return 1
+
+  if [ ! -f "$CRYPTO_MODULE_FILE" ]; then
+    cat >"$CRYPTO_MODULE_FILE" <<'EOF'
+min_rsa_size@openssh = 1024
+EOF
+    chmod 644 "$CRYPTO_MODULE_FILE" || true
+  fi
+
+  update-crypto-policies --set "$LEGACY_CRYPTO_POLICY" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+###############################################################################
+# Legacy SSH option profile
+###############################################################################
 ssh_login_ok() {
   sshpass -p "$3" ssh \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=8 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=1 \
     -o PreferredAuthentications=password,keyboard-interactive \
-    -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
-    -o NumberOfPasswordPrompts=1 -tt "$2@$1" "exit" >/dev/null 2>&1
+    -o KbdInteractiveAuthentication=yes \
+    -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=1 \
+    -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+    -o Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc \
+    -o MACs=+hmac-sha1,hmac-sha1-96 \
+    -tt "$2@$1" "exit" >/dev/null 2>&1
 }
 
 get_default_priv_level() {
   host="$1"; user="$2"; pass="$3"
   [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] || { echo ""; return 1; }
-  OUT="$(
-    { printf 'terminal length 0\n'; printf 'show privilege\n'; printf 'exit\n'; } |
-    sshpass -p "$pass" ssh \
-      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+
+  HOST="$host" USER="$user" PASS="$pass" \
+  DEBUG_FLAG="${DEBUG:-0}" DEBUG_LOG_FILE="${DEBUG_LOG:-/tmp/cmds_discovery_prompt.log}" \
+  expect -f - <<'EXP'
+    log_user 0
+    if {$env(DEBUG_FLAG) == "1"} { catch {log_file -a $env(DEBUG_LOG_FILE)} }
+
+    set host   $env(HOST)
+    set user   $env(USER)
+    set pass   $env(PASS)
+    set t_login 15
+    set t_cmd   8
+    set prompt_re {[\r\n][^\r\n]*([>#]) ?$}
+
+    spawn ssh \
+      -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
       -o ConnectTimeout=10 \
       -o PreferredAuthentications=password,keyboard-interactive \
-      -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
-      -o NumberOfPasswordPrompts=1 -tt "$user@$host" 2>/dev/null
-  )"
-  OUT_CLEAN="$(printf '%s' "$OUT" | tr -d '\r')"
-  PL="$(printf '%s\n' "$OUT_CLEAN" | awk 'BEGIN{IGNORECASE=1} /Current privilege level is/ {print $NF; exit}')"
-  PL="$(trim "$PL")"
-  if [ -z "$PL" ]; then
-    PC="$(printf '%s\n' "$OUT_CLEAN" | awk '/[>#][[:space:]]*$/{p=$0} END{print p}' | sed -nE 's/.*([>#])[[:space:]]*$/\1/p')"
-    case "$PC" in \#) PL="15";; \>) PL="1";; *) PL="";; esac
-  fi
-  printf '%s' "$PL"
+      -o KbdInteractiveAuthentication=yes \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc \
+      -o MACs=+hmac-sha1,hmac-sha1-96 \
+      -tt $user@$host
+
+    set timeout $t_login
+    while 1 {
+      expect \
+        -nocase -re {username:} { send -- "$user\r" } \
+        -nocase -re {password:} { send -- "$pass\r" } \
+        -re $prompt_re {
+          if {[regexp {([>#]) ?$} $expect_out(0,string) -> prompt_char]} {
+            if {$prompt_char eq "#"} {
+              puts "15"
+              exit 0
+            } elseif {$prompt_char eq ">"} {
+              puts "1"
+              exit 0
+            }
+          }
+        } \
+        -re {denied|authentication failed|login invalid} { exit 3 } \
+        timeout { exit 3 } \
+        eof { exit 3 }
+    }
+
+    send -- "\r"
+    expect -re $prompt_re
+
+    send -- "terminal length 0\r"
+    set timeout $t_cmd
+    expect -re $prompt_re
+
+    send -- "show privilege\r"
+    expect {
+      -re {Current privilege level is[[:space:]]*([0-9]+)} {
+        puts $expect_out(1,string)
+        exit 0
+      }
+      -re $prompt_re {
+        if {[regexp {([>#]) ?$} $expect_out(0,string) -> prompt_char]} {
+          if {$prompt_char eq "#"} {
+            puts "15"
+            exit 0
+          } elseif {$prompt_char eq ">"} {
+            puts "1"
+            exit 0
+          }
+        }
+        puts ""
+        exit 1
+      }
+      timeout {
+        puts ""
+        exit 1
+      }
+      eof {
+        puts ""
+        exit 1
+      }
+    }
+EXP
 }
 
 ssh_enable_ok() {
   host="$1"; user="$2"; pass="$3"; enable_pass="$4"
   [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$enable_pass" ] || return 7
+
   HOST="$host" USER="$user" PASS="$pass" ENPASS="$enable_pass" \
   DEBUG_FLAG="${DEBUG:-0}" DEBUG_LOG_FILE="${DEBUG_LOG:-/tmp/cmds_discovery_prompt.log}" \
-  ENABLE_PROMPT_TIMEOUT="${ENABLE_PROMPT_TIMEOUT:-2}" ENABLE_VERIFY_TIMEOUT="${ENABLE_VERIFY_TIMEOUT:-4}" \
+  ENABLE_VERIFY_TIMEOUT="${ENABLE_VERIFY_TIMEOUT:-6}" \
   expect -f - <<'EXP'
     log_user 0
     if {$env(DEBUG_FLAG) == "1"} { catch {log_file -a $env(DEBUG_LOG_FILE)} }
-    set host   $env(HOST); set user $env(USER); set pass $env(PASS); set enpass $env(ENPASS)
-    set t_enable [expr {int($env(ENABLE_PROMPT_TIMEOUT))}]; set t_verify [expr {int($env(ENABLE_VERIFY_TIMEOUT))}]
-    set t_login 15; set prompt_re {[\r\n][^\r\n]*[>#] ?$}
-    spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o ConnectTimeout=10 -o PreferredAuthentications=password,keyboard-interactive \
-              -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no \
-              -o NumberOfPasswordPrompts=1 -tt $user@$host
+
+    set host   $env(HOST)
+    set user   $env(USER)
+    set pass   $env(PASS)
+    set enpass $env(ENPASS)
+    set t_login 15
+    set t_verify [expr {int($env(ENABLE_VERIFY_TIMEOUT))}]
+    set prompt_re {[\r\n][^\r\n]*[>#] ?$}
+
+    spawn ssh \
+      -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 \
+      -o PreferredAuthentications=password,keyboard-interactive \
+      -o KbdInteractiveAuthentication=yes \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc \
+      -o MACs=+hmac-sha1,hmac-sha1-96 \
+      -tt $user@$host
+
     set timeout $t_login
     while 1 {
-      expect -nocase -re {username:} { send -- "$user\r" } \
-             -nocase -re {password:} { send -- "$pass\r" } \
-             -re $prompt_re          { break } \
-             -re {denied|authentication failed|login invalid} { exit 3 } \
-             timeout                 { exit 3 } eof { exit 3 }
+      expect \
+        -nocase -re {username:} { send -- "$user\r" } \
+        -nocase -re {password:} { send -- "$pass\r" } \
+        -re $prompt_re { break } \
+        -re {denied|authentication failed|login invalid} { exit 3 } \
+        timeout { exit 3 } \
+        eof { exit 3 }
     }
-    send -- "\r"; expect -re $prompt_re
-    send -- "terminal length 0\r"; expect -re $prompt_re
-    send -- "disable\r"; expect -re $prompt_re
-    proc try_enable {t_enable prompt_re} {
-      send -- "enable\r"; set sawpw 0; set timeout $t_enable
-      while 1 {
-        expect -nocase -re {password:} { set sawpw 1; send -- "$::enpass\r"; exp_continue } \
-               -re $prompt_re          { return [list 1 $sawpw] } \
-               timeout                 { return [list 0 $sawpw] } eof { return [list -1 $sawpw] }
-      }
+
+    send -- "\r"
+    expect -re $prompt_re
+
+    send -- "terminal length 0\r"
+    expect -re $prompt_re
+
+    send -- "show privilege\r"
+    set timeout $t_verify
+    expect {
+      -re {Current privilege level is[[:space:]]*15} {}
+      -re {Current privilege level is[[:space:]]*[0-9]+} { exit 6 }
+      timeout { exit 4 }
+      eof { exit 4 }
     }
-    lassign [try_enable $t_enable $prompt_re] ok1 sawpw1
-    if {$ok1 == 0 && $sawpw1 == 0} {
-      lassign [try_enable $t_enable $prompt_re] ok2 sawpw2
-      if {$ok2 == 0 && $sawpw2 == 0} { exit 5 }
-    } elseif {$ok1 < 0} { exit 4 }
-    set timeout $t_verify; send -- "show privilege\r"
-    expect { -re {Current privilege level is[[:space:]]*15} { exit 0 }
-             -re {Current privilege level is[[:space:]]*[0-9]+} { exit 6 }
-             timeout { exit 4 } eof { exit 4 } }
+
+    send -- "show running-config | include ^hostname\r"
+    expect {
+      -re {hostname[[:space:]]+.+} { exit 0 }
+      -re {% ?Authorization failed} { exit 9 }
+      -re {% ?Invalid input} { exit 8 }
+      -re $prompt_re { exit 0 }
+      timeout { exit 4 }
+      eof { exit 4 }
+    }
 EXP
   return $?
 }
@@ -139,6 +290,21 @@ MAX_WELCOME_H=$((TERM_LINES - 4))
 [ "$WELCOME_H" -lt 10 ] && WELCOME_H=10
 
 ###############################################################################
+# Switch crypto policy now, before any SSH work
+###############################################################################
+if ! ensure_legacy_crypto_policy; then
+  dlg --clear --backtitle "$BACKTITLE" --title "Crypto Policy Error" --msgbox \
+"Failed to enable temporary legacy crypto compatibility mode.
+
+The wizard needs to temporarily switch this host to:
+  ${LEGACY_CRYPTO_POLICY}
+
+Please verify this script is running as root and that update-crypto-policies is available." \
+  12 "$W_DEF"
+  cleanup_and_exit 1
+fi
+
+###############################################################################
 # Pre-populate wizard defaults from existing ENV_FILE (if present)
 ###############################################################################
 # shellcheck disable=SC1090
@@ -161,6 +327,13 @@ REPORT_IPS_LINES="$(printf '%s' "${REPORT_DISCOVERY_IPS:-}" | tr ' ' '\n')"
 ###############################################################################
 dlg --clear --backtitle "$BACKTITLE" --title "Welcome — Discovery Setup" --msgbox \
 "Welcome to the CMDS Discovery setup wizard.
+
+For compatibility with older Catalyst SSH stacks, this wizard temporarily
+switches the host crypto policy to:
+  ${LEGACY_CRYPTO_POLICY}
+
+The host crypto policy will be restored to:
+  ${DEFAULT_CRYPTO_POLICY}
 
 This will guide you through:
   1) Choose how to provide targets (scan CIDR or manual list)
@@ -194,7 +367,7 @@ else
       list "Use a manual list of IPs (one per line)"
 fi
 rc=$?; MODE="$(trim "${DOUT:-}")"; log "Mode rc=$rc val='$MODE'"
-[ $rc -eq 0 ] || { clear; exit 1; }
+[ $rc -eq 0 ] || cleanup_and_exit 1
 
 ###############################################################################
 # 2) TARGETS
@@ -214,21 +387,20 @@ if [ "$MODE" = "scan" ]; then
   while :; do
     tmpnets="$(mktemp)"; printf '%s\n' "$NETS_PREV" >"$tmpnets"
     dlg --clear --backtitle "$BACKTITLE" --title "Networks to Scan (one per line)" --editbox "$tmpnets" 14 "$W_EDIT"
-    rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"; [ $rc -eq 0 ] || { clear; exit 1; }
+    rc=$?; NETS_RAW="${DOUT:-}"; rm -f "$tmpnets"; [ $rc -eq 0 ] || cleanup_and_exit 1
     NETS_PREV="$NETS_RAW"
 
     tmpin_nets="$(mktemp)"; printf '%s\n' "$NETS_RAW" >"$tmpin_nets"
     DISCOVERY_NETWORKS=""; invalid_line=""
     while IFS= read -r raw; do
       line="$(trim "$raw")"; [ -z "$line" ] && continue
-      case "$line" in \#*) continue;; esac
+      case "$line" in \#*) continue ;; esac
       if ! is_valid_cidr "$line"; then invalid_line="$line"; break; fi
       [ -z "$DISCOVERY_NETWORKS" ] && DISCOVERY_NETWORKS="$line" || DISCOVERY_NETWORKS="$DISCOVERY_NETWORKS,$line"
     done <"$tmpin_nets"
     rm -f "$tmpin_nets"
 
-    [ -z "$invalid_line" ] || { dlg --title "Invalid Network" --msgbox "Invalid: '$invalid_line'\nUse CIDR like 10.0.0.0/24." 8 "$W_DEF"; 
-continue; }
+    [ -z "$invalid_line" ] || { dlg --title "Invalid Network" --msgbox "Invalid: '$invalid_line'\nUse CIDR like 10.0.0.0/24." 8 "$W_DEF"; continue; }
     [ -n "$DISCOVERY_NETWORKS" ] || { dlg --title "No Networks" --msgbox "Provide at least one valid CIDR." 7 "$W_DEF"; continue; }
     break
   done
@@ -246,14 +418,14 @@ else
   while :; do
     tmpips="$(mktemp)"; printf '%s\n' "$IPS_PREV" >"$tmpips"
     dlg --clear --backtitle "$BACKTITLE" --title "Manual IP List (one per line)" --editbox "$tmpips" 16 "$W_EDIT"
-    rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"; [ $rc -eq 0 ] || { clear; exit 1; }
+    rc=$?; IPS_RAW="${DOUT:-}"; rm -f "$tmpips"; [ $rc -eq 0 ] || cleanup_and_exit 1
     IPS_PREV="$IPS_RAW"
 
     ips_file="$(mktemp)"; printf '%s\n' "$IPS_RAW" >"$ips_file"
     DISCOVERY_IPS=""; invalid_ip=""; SEEN_TMP="$(mktemp)"; : >"$SEEN_TMP"
     while IFS= read -r raw; do
       ip="$(trim "$raw")"; [ -z "$ip" ] && continue
-      case "$ip" in \#*) continue;; esac
+      case "$ip" in \#*) continue ;; esac
       if ! is_valid_ip "$ip"; then invalid_ip="$ip"; break; fi
       if ! grep -qx -- "$ip" "$SEEN_TMP" 2>/dev/null; then
         printf '%s\n' "$ip" >>"$SEEN_TMP"
@@ -279,7 +451,7 @@ SSH_TEST_IP="${REPORT_SSH_TEST_IP:-}"
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" \
       --inputbox "Enter SSH switch username:" 8 "$W_DEF" "$SSH_USERNAME"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
   SSH_USERNAME="$(trim "${DOUT:-}")"
   [ -n "$SSH_USERNAME" ] && break
   dlg --title "Missing Username" --msgbox "Username cannot be empty." 7 "$W_DEF"
@@ -288,7 +460,7 @@ done
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" \
       --insecure --passwordbox "Enter SSH switch password (masked with *):" 9 "$W_DEF" "$SSH_PASSWORD"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
   SSH_PASSWORD="$(trim "${DOUT:-}")"
   [ -n "$SSH_PASSWORD" ] && break
   dlg --title "Missing Password" --msgbox "Password cannot be empty." 7 "$W_DEF"
@@ -305,13 +477,13 @@ if [ -n "$DISCOVERY_IPS" ]; then
   # shellcheck disable=SC2086
   dlg --clear --backtitle "$BACKTITLE" --title "Test Device" \
       --menu "We'll verify your SSH credentials on one device.\nSelect an IP:" 16 "$W_DEF" 12 $MENU_ARGS
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
   SSH_TEST_IP="$(trim "${DOUT:-}")"
 else
   while :; do
     dlg --clear --backtitle "$BACKTITLE" --title "Test Device IP" \
         --inputbox "Enter a switch IP address to test the SSH login:" 9 "$W_DEF" "$SSH_TEST_IP"
-    rc=$?; [ $rc -eq 0 ] || { clear; exit 1; }
+    rc=$?; [ $rc -eq 0 ] || cleanup_and_exit 1
     val="$(trim "${DOUT:-}")"
     [ -n "$val" ] && is_valid_ip "$val" && SSH_TEST_IP="$val" && break
     dlg --title "Invalid IP" --msgbox "Please enter a valid IPv4/IPv6 address." 7 "$W_DEF"
@@ -329,16 +501,16 @@ while :; do
   fi
 
   dlg --backtitle "$BACKTITLE" --title "Login Failed" --yesno "Could not log in. Re-enter username and password?" 8 "$W_DEF"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
 
   dlg --clear --backtitle "$BACKTITLE" --title "SSH Username" \
       --inputbox "Enter SSH username:" 8 "$W_DEF" "$SSH_USERNAME"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
   SSH_USERNAME="$(trim "${DOUT:-}")"
 
   dlg --clear --backtitle "$BACKTITLE" --title "SSH Password" \
       --insecure --passwordbox "Enter SSH password (masked with *):" 9 "$W_DEF" "$SSH_PASSWORD"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
   SSH_PASSWORD="$(trim "${DOUT:-}")"
 done
 
@@ -358,8 +530,7 @@ This workflow requires a user that logs in at privilege 15 (prompt ends with #)
 without entering 'enable' first.
 
 Please use an account with privilege 15 and re-run the setup." 16 "$W_DEF"
-  clear
-  exit 1
+  cleanup_and_exit 1
 fi
 
 ###############################################################################
@@ -372,9 +543,9 @@ while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Enable Password (required)" \
       --insecure --passwordbox \
 "Enter the device's ENABLE password.
-We'll verify it now." \
-      10 "$W_DEF" "$ENABLE_PASSWORD"
-  rc=$?; [ $rc -ne 0 ] && { clear; exit 1; }
+We'll verify that this session has privileged EXEC access (# / privilege 15) and can read running-config." \
+      11 "$W_DEF" "$ENABLE_PASSWORD"
+  rc=$?; [ $rc -ne 0 ] && cleanup_and_exit 1
 
   ENABLE_PASSWORD="$(trim "${DOUT:-}")"
   if [ -z "$ENABLE_PASSWORD" ]; then
@@ -384,26 +555,28 @@ We'll verify it now." \
   fi
 
   dlg --backtitle "$BACKTITLE" --title "Testing Enable" \
-      --infobox "Verifying enable password on ${SSH_TEST_IP}…" 6 "$W_DEF"
+      --infobox "Verifying privileged EXEC access on ${SSH_TEST_IP}…" 6 "$W_DEF"
 
   ssh_enable_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD" "$ENABLE_PASSWORD"
   rc=$?
 
-  if [ $rc -eq 0 ] || [ $rc -eq 5 ]; then
+  if [ $rc -eq 0 ]; then
     ENABLE_TEST_OK="1"
     dlg --backtitle "$BACKTITLE" --title "Enable Test" \
-        --msgbox "Enable password verified." 7 "$W_DEF"
+        --msgbox "Privileged EXEC access verified." 7 "$W_DEF"
     break
   fi
 
-  reason="Enable password failed."
-  [ $rc -eq 6 ] && reason="Enable password was rejected by the device."
+  reason="Privilege verification failed."
+  [ $rc -eq 6 ] && reason="Login succeeded, but the session did not land at privilege level 15."
+  [ $rc -eq 8 ] && reason="The privileged command check did not complete successfully."
+  [ $rc -eq 9 ] && reason="The session appears to be blocked by command authorization."
 
   dialog --no-shadow --backtitle "$BACKTITLE" --title "Enable Test Failed" --yesno \
 "${reason}
 
 Do you want to try entering the ENABLE password again?" 10 "$W_DEF"
-  [ $? -eq 0 ] || { clear; exit 1; }
+  [ $? -eq 0 ] || cleanup_and_exit 1
 done
 
 ###############################################################################
@@ -412,7 +585,7 @@ done
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox \
 "Paste your Meraki Dashboard API key:" 8 "$W_DEF"
-  rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
+  rc=$?; [ $rc -eq 1 ] && cleanup_and_exit 1
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
   [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
   printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$' >/dev/null 2>&1 && break
@@ -436,6 +609,7 @@ export DEFAULT_PRIV15_OK DEFAULT_LOGIN_PRIV
 export ENABLE_PASSWORD ENABLE_TEST_OK
 export MERAKI_API_KEY
 export DISC_SCAN_ROOT DISCOVERY_RUN_ID DISCOVERY_RUN_DIR
+export DEFAULT_CRYPTO_POLICY LEGACY_CRYPTO_POLICY
 
 {
   echo "# Generated $(date -u '+%F %T') UTC"
@@ -453,6 +627,8 @@ export DISC_SCAN_ROOT DISCOVERY_RUN_ID DISCOVERY_RUN_DIR
   printf 'export DISC_SCAN_ROOT=%q\n' "$DISC_SCAN_ROOT"
   printf 'export DISCOVERY_RUN_ID=%q\n' "$DISCOVERY_RUN_ID"
   printf 'export DISCOVERY_RUN_DIR=%q\n' "$DISCOVERY_RUN_DIR"
+  printf 'export DEFAULT_CRYPTO_POLICY=%q\n' "$DEFAULT_CRYPTO_POLICY"
+  printf 'export LEGACY_CRYPTO_POLICY=%q\n' "$LEGACY_CRYPTO_POLICY"
 } >"$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
@@ -462,8 +638,11 @@ chmod 600 "$ENV_FILE"
 mask() { n=$(printf '%s' "$1" | wc -c | awk '{print $1}'); [ "$n" -gt 0 ] && { printf "%0.s*" $(seq 1 "$n"); } || printf "(empty)"; }
 mask_last4() {
   s="$1"; n=$(printf '%s' "$s" | wc -c | awk '{print $1}')
-  if [ "$n" -le 4 ]; then printf '****'
-  else printf "%0.s*" $(seq 1 $((n-4))); printf '%s' "$(printf '%s' "$s" | sed -n 's/.*\(....\)$/\1/p')"
+  if [ "$n" -le 4 ]; then
+    printf '****'
+  else
+    printf "%0.s*" $(seq 1 $((n-4)))
+    printf '%s' "$(printf '%s' "$s" | sed -n 's/.*\(....\)$/\1/p')"
   fi
 }
 
@@ -479,8 +658,10 @@ SSH Password: ${PW_MASK}
 Default Login Privilege: ${DEFAULT_LOGIN_PRIV} (${DEFPRIV_SUMMARY})
 Enable Password: ${ENABLE_SUMMARY}
 Meraki API Key: ${API_MASK}
+
+Temporary Crypto Policy Used: ${LEGACY_CRYPTO_POLICY}
+Crypto Policy Restored To: ${DEFAULT_CRYPTO_POLICY}
 "
 
-dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "$summary" 18 90
-clear
-exit 0
+dlg --clear --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "$summary" 20 95
+cleanup_and_exit 0

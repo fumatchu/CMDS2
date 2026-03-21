@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+
+# ============================================================
+# Uplink Suggest Dialog Wrapper
+#
+# Front-end UI for the existing uplink_suggest_cli.sh backend.
+# This script:
+#   - lets operator choose a mapped source/target pair
+#   - runs backend analysis for that one source IP/member
+#   - reads normalized_manifest.json + backend artifacts
+#   - auto-accepts high / medium-high confidence
+#   - prompts operator for medium confidence
+#   - forces manual mapping for low / needs_review
+#   - writes manual pairs JSON and re-runs backend if needed
+#
+# IMPORTANT:
+#   This does NOT replace your backend script. It wraps it.
+# ============================================================
+
+BASE_DIR="/root/.cat_admin"
+BACKEND_SCRIPT="${BASE_DIR}/uplink_suggest_cli.sh"
+MAPPING_JSON_FILE="${BASE_DIR}/runs/mappings/latest/mapping.json"
+RUNS_BASE="${BASE_DIR}/runs/uplink_suggest"
+DIALOG_TMP_DIR="${BASE_DIR}/.tmp_uplink_suggest_dialog"
+
+BACKTITLE="Cloud Migration – Uplink Mapping"
+mkdir -p "$DIALOG_TMP_DIR"
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: missing required command: $1" >&2
+    exit 1
+  }
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+need dialog
+need jq
+need awk
+need sed
+need grep
+need sort
+need mktemp
+need stty
+need readlink
+
+[[ -t 0 && -t 1 && -t 2 ]] || die "This dialog UI must be run from an interactive terminal."
+[[ -x "$BACKEND_SCRIPT" ]] || die "Backend script not found or not executable: $BACKEND_SCRIPT"
+[[ -f "$MAPPING_JSON_FILE" ]] || die "Mapping file not found: $MAPPING_JSON_FILE"
+[[ -d "$RUNS_BASE" ]] || mkdir -p "$RUNS_BASE"
+
+trim() {
+  local s="${1:-}"
+  s="$(printf '%s' "$s" | tr -d '\r')"
+  s="$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  printf '%s' "$s"
+}
+
+safe_name() {
+  printf '%s' "$1" | tr ' /:' '---' | tr -cd 'A-Za-z0-9_.-'
+}
+
+cleanup() {
+  rm -f "${DIALOG_TMP_DIR}/"dialog_* 2>/dev/null || true
+}
+
+trap 'stty sane 2>/dev/null || true; cleanup' EXIT INT TERM
+
+msgbox() {
+  local text="$1"
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "Uplink Suggest" \
+    --msgbox "$text" 20 90 \
+    </dev/tty >/dev/tty
+}
+
+yesno() {
+  local text="$1"
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "Uplink Suggest" \
+    --yes-label "Yes" \
+    --no-label "No" \
+    --yesno "$text" 20 90 \
+    </dev/tty >/dev/tty
+}
+
+infobox() {
+  local text="$1"
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "Uplink Suggest" \
+    --infobox "$text" 8 70 \
+    </dev/tty >/dev/tty
+}
+
+menu() {
+  local title="$1"
+  local prompt="$2"
+  shift 2
+
+  local choice
+  choice="$(
+    dialog \
+      --stdout \
+      --backtitle "$BACKTITLE" \
+      --title "$title" \
+      --menu "$prompt" 22 110 12 \
+      "$@" \
+      </dev/tty
+  )" || return 1
+
+  printf '%s\n' "$choice"
+}
+
+radiolist() {
+  local title="$1"
+  local prompt="$2"
+  shift 2
+
+  local choice
+  choice="$(
+    dialog \
+      --stdout \
+      --backtitle "$BACKTITLE" \
+      --title "$title" \
+      --radiolist "$prompt" 24 120 14 \
+      "$@" \
+      </dev/tty
+  )" || return 1
+
+  printf '%s\n' "$choice"
+}
+
+textbox() {
+  local file="$1"
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "View Report" \
+    --textbox "$file" 28 120 \
+    </dev/tty >/dev/tty
+}
+
+get_mapping_choices() {
+  jq -r '
+    .[]?
+    | select((.source.ip // "") != "" and (.target.cloud_id // "") != "")
+    | [
+        (.source.key // (((.source.ip // "")|tostring) + "|" + (((.source.member_index // 1)|tostring)))),
+        (
+          ((.source.hostname // "UNKNOWN")|tostring)
+          + " | src=" + ((.source.ip // "")|tostring)
+          + " | member=" + (((.source.member_index // 1)|tostring))
+          + " | target=" + ((.target.name // .target.cloud_id // "UNKNOWN")|tostring)
+          + " | model=" + ((.target.model // "UNKNOWN")|tostring)
+        )
+      ] | @tsv
+  ' "$MAPPING_JSON_FILE"
+}
+
+get_mapping_field() {
+  local source_key="$1"
+  local field="$2"
+  jq -r --arg sk "$source_key" "
+    first(.[] | select((.source.key // (((.source.ip // \"\")|tostring) + \"|\" + (((.source.member_index // 1)|tostring)))) == \$sk) | ${field}) // \"\"
+  " "$MAPPING_JSON_FILE"
+}
+
+get_latest_run_dir() {
+  local latest="${RUNS_BASE}/latest"
+  if [[ -L "$latest" || -d "$latest" ]]; then
+    readlink -f "$latest" 2>/dev/null || printf '%s\n' "$latest"
+    return 0
+  fi
+  return 1
+}
+
+compute_base_name() {
+  local source_key="$1"
+  local host ip member
+  host="$(get_mapping_field "$source_key" '.source.hostname // "UNKNOWN"')"
+  ip="$(get_mapping_field "$source_key" '.source.ip // ""')"
+  member="$(get_mapping_field "$source_key" '(.source.member_index // 1)')"
+  safe_name "${host}_${ip}_member${member}"
+}
+
+backend_log_file_for_source() {
+  local source_key="$1"
+  printf '%s/backend_%s.log\n' "$DIALOG_TMP_DIR" "$(safe_name "$source_key")"
+}
+
+run_backend_for_source() {
+  local source_key="$1"
+  local pairs_file="${2:-}"
+  local ip member log_file
+  ip="$(get_mapping_field "$source_key" '.source.ip // ""')"
+  member="$(get_mapping_field "$source_key" '(.source.member_index // 1)')"
+
+  [[ -n "$ip" ]] || die "No source IP found for source_key=$source_key"
+
+  log_file="$(backend_log_file_for_source "$source_key")"
+  : > "$log_file"
+
+  if [[ -n "$pairs_file" ]]; then
+    "$BACKEND_SCRIPT" --ip "$ip" --pairs-file "$pairs_file" \
+      >"$log_file" 2>&1
+  else
+    "$BACKEND_SCRIPT" --ip "$ip" \
+      >"$log_file" 2>&1
+  fi
+}
+
+manifest_entry_json() {
+  local run_dir="$1"
+  local source_key="$2"
+  local manifest="${run_dir}/normalized_manifest.json"
+  [[ -f "$manifest" ]] || return 1
+  jq -c --arg sk "$source_key" 'first(.[] | select(.source_key == $sk))' "$manifest"
+}
+
+report_file_for_source() {
+  local run_dir="$1"
+  local source_key="$2"
+  local base_name
+  base_name="$(compute_base_name "$source_key")"
+  printf '%s/report_%s.txt\n' "$run_dir" "$base_name"
+}
+
+target_json_for_source() {
+  local run_dir="$1"
+  local source_key="$2"
+  local base_name
+  base_name="$(compute_base_name "$source_key")"
+  printf '%s/target_%s.json\n' "$run_dir" "$base_name"
+}
+
+source_json_for_source() {
+  local run_dir="$1"
+  local source_key="$2"
+  local base_name
+  base_name="$(compute_base_name "$source_key")"
+  printf '%s/source_%s.json\n' "$run_dir" "$base_name"
+}
+
+suggest_json_for_source() {
+  local run_dir="$1"
+  local source_key="$2"
+  local base_name
+  base_name="$(compute_base_name "$source_key")"
+  printf '%s/suggest_%s.json\n' "$run_dir" "$base_name"
+}
+
+manual_pairs_file_for_source() {
+  local run_dir="$1"
+  local source_key="$2"
+  local base_name
+  base_name="$(compute_base_name "$source_key")"
+  printf '%s/manual_pairs_%s.json\n' "$run_dir" "$base_name"
+}
+
+show_summary_from_entry() {
+  local entry_json="$1"
+
+  local hostname ip member target_model target_cloud_id status changed conf review effective pair_count reason
+  hostname="$(jq -r '.hostname // ""' <<<"$entry_json")"
+  ip="$(jq -r '.ip // ""' <<<"$entry_json")"
+  member="$(jq -r '.member_index // ""' <<<"$entry_json")"
+  target_model="$(jq -r '.target_model // ""' <<<"$entry_json")"
+  target_cloud_id="$(jq -r '.target_cloud_id // ""' <<<"$entry_json")"
+  status="$(jq -r '.status // ""' <<<"$entry_json")"
+  changed="$(jq -r '.changed // false' <<<"$entry_json")"
+  conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
+  review="$(jq -r '.operator_review_required // true' <<<"$entry_json")"
+  effective="$(jq -r '.effective_config // ""' <<<"$entry_json")"
+  pair_count="$(jq -r '.pair_count // 0' <<<"$entry_json")"
+  reason="$(jq -r '.reason // ""' <<<"$entry_json")"
+
+  msgbox "Source: ${hostname} (${ip}) member ${member}
+
+Target: ${target_model} / ${target_cloud_id}
+
+Status: ${status}
+Changed: ${changed}
+Confidence: ${conf}
+Operator review required: ${review}
+Pair count: ${pair_count}
+
+Reason:
+${reason}
+
+Effective config:
+${effective}"
+}
+
+build_manual_target_choices() {
+  local target_json="$1"
+  local preferred_family="$2"
+
+  jq -r --arg fam "$preferred_family" '
+    .targetModuleCandidates
+    | map(
+        . + {
+          effectiveInterface:
+            (if (.interface // "") != "" then .interface
+             else
+               (
+                 .family
+                 + (
+                     (
+                       .portId
+                       | capture("^(?<member>[0-9]+)_(?<module>[^_]+)_(?<port>[0-9]+)$")
+                     ) as $m
+                     | "\($m.member)/1/\($m.port)"
+                   )
+               )
+             end)
+        }
+      )
+    | map(select((.family // "") != ""))
+    | (if ($fam != "") then map(select(.family == $fam)) else . end)
+    | sort_by(
+        (if (.namedPort // false) then 0 else 1 end),
+        (.effectiveInterface // ""),
+        (.portId // "")
+      )
+    | .[]
+    | [
+        (.portId // ""),
+        (
+          (if (.effectiveInterface // "") != "" then .effectiveInterface else "(unnamed)" end)
+          + " | module=" + (.moduleModel // "")
+          + " | family=" + (.family // "")
+          + " | named=" + ((.namedPort // false)|tostring)
+        )
+      ] | @tsv
+  ' "$target_json"
+}
+
+build_source_iface_choices() {
+  local source_json="$1"
+  jq -r '
+    .configuredSourceUplinks[]
+    | [
+        (.name // ""),
+        (
+          (.name // "")
+          + " | family=" + (.family // "")
+          + " | configCount=" + ((.configCount // 0)|tostring)
+        )
+      ] | @tsv
+  ' "$source_json"
+}
+
+manual_mapping_dialog() {
+  local run_dir="$1"
+  local source_key="$2"
+
+  local source_json target_json suggest_json manual_file preferred_family
+  source_json="$(source_json_for_source "$run_dir" "$source_key")"
+  target_json="$(target_json_for_source "$run_dir" "$source_key")"
+  suggest_json="$(suggest_json_for_source "$run_dir" "$source_key")"
+  manual_file="$(manual_pairs_file_for_source "$run_dir" "$source_key")"
+
+  [[ -f "$source_json" ]] || die "Missing source JSON: $source_json"
+  [[ -f "$target_json" ]] || die "Missing target JSON: $target_json"
+  [[ -f "$suggest_json" ]] || die "Missing suggest JSON: $suggest_json"
+
+  preferred_family="$(jq -r '.preferredTargetFamily // ""' "$suggest_json")"
+
+  local source_lines=()
+  while IFS=$'\t' read -r key desc; do
+    [[ -n "$key" ]] || continue
+    source_lines+=("$key"$'\t'"$desc")
+  done < <(build_source_iface_choices "$source_json")
+
+  [[ "${#source_lines[@]}" -gt 0 ]] || {
+    msgbox "No configured source uplinks found for manual mapping."
+    return 1
+  }
+
+  local manual_json='[]'
+
+  local src_key src_desc
+  for row in "${source_lines[@]}"; do
+    src_key="${row%%$'\t'*}"
+    src_desc="${row#*$'\t'}"
+
+    local choices=()
+    while IFS=$'\t' read -r tkey tdesc; do
+      [[ -n "$tkey" ]] || continue
+      choices+=("$tkey" "$tdesc" "off")
+    done < <(build_manual_target_choices "$target_json" "$preferred_family")
+
+    if [[ "${#choices[@]}" -eq 0 ]]; then
+      msgbox "No valid target candidates were found for source:\n\n${src_key}"
+      return 1
+    fi
+
+    local selected
+    selected="$(radiolist \
+      "Manual Mapping" \
+      "Choose target for source interface:
+
+${src_desc}" \
+      "${choices[@]}")" || return 1
+
+    local target_portid="$selected"
+    local target_iface target_family target_module
+    target_iface="$(jq -r --arg pid "$target_portid" '
+      .targetModuleCandidates
+      | map(
+          . + {
+            effectiveInterface:
+              (if (.interface // "") != "" then .interface
+               else
+                 (
+                   .family
+                   + (
+                       (
+                         .portId
+                         | capture("^(?<member>[0-9]+)_(?<module>[^_]+)_(?<port>[0-9]+)$")
+                       ) as $m
+                       | "\($m.member)/1/\($m.port)"
+                     )
+                 )
+               end)
+          }
+        )
+      | first(.[] | select(.portId == $pid)) | .effectiveInterface // ""
+    ' "$target_json")"
+    target_family="$(jq -r --arg pid "$target_portid" 'first(.targetModuleCandidates[] | select(.portId == $pid) | .family) // ""' "$target_json")"
+    target_module="$(jq -r --arg pid "$target_portid" 'first(.targetModuleCandidates[] | select(.portId == $pid) | .moduleModel) // ""' "$target_json")"
+
+    manual_json="$(jq \
+      --arg source "$src_key" \
+      --arg targetPortId "$target_portid" \
+      --arg targetInterface "$target_iface" \
+      --arg targetFamily "$target_family" \
+      --arg targetModuleModel "$target_module" \
+      '. + [{
+        source: $source,
+        targetPortId: $targetPortId,
+        targetInterface: $targetInterface,
+        targetFamily: $targetFamily,
+        targetModuleModel: $targetModuleModel
+      }]' <<<"$manual_json")"
+  done
+
+  printf '%s\n' "$manual_json" > "$manual_file"
+  printf '%s\n' "$manual_file"
+  return 0
+}
+
+handle_result() {
+  local run_dir="$1"
+  local source_key="$2"
+
+  local entry_json report_file conf review status
+  entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || {
+    msgbox "Could not find manifest entry for source_key=${source_key}"
+    return 1
+  }
+
+  report_file="$(report_file_for_source "$run_dir" "$source_key")"
+  conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
+  review="$(jq -r '.operator_review_required // true' <<<"$entry_json")"
+  status="$(jq -r '.status // "needs_review"' <<<"$entry_json")"
+
+  case "$conf" in
+    high|medium-high)
+      if [[ "$review" == "false" ]]; then
+        show_summary_from_entry "$entry_json"
+        return 0
+      fi
+      ;;
+  esac
+
+  while true; do
+    local choice
+    choice="$(menu \
+      "Uplink Review" \
+      "Confidence: ${conf}
+Status: ${status}
+Review required: ${review}
+
+Choose next action:" \
+      1 "View summary" \
+      2 "View full report" \
+      3 "Accept current result" \
+      4 "Manual edit mapping" \
+      5 "Skip / back")" || return 1
+
+    case "$choice" in
+      1)
+        show_summary_from_entry "$entry_json"
+        ;;
+      2)
+        if [[ -f "$report_file" ]]; then
+          textbox "$report_file"
+        else
+          msgbox "Report file not found:
+${report_file}"
+        fi
+        ;;
+      3)
+        if [[ "$review" == "true" && "$conf" == "low" ]]; then
+          msgbox "This result is low confidence and still needs manual review."
+        else
+          return 0
+        fi
+        ;;
+      4)
+        local manual_file
+        manual_file="$(manual_mapping_dialog "$run_dir" "$source_key")" || continue
+
+        infobox "Applying manual mapping and re-running uplink analysis..."
+        run_backend_for_source "$source_key" "$manual_file"
+        clear
+
+        run_dir="$(get_latest_run_dir)"
+        entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || {
+          msgbox "Re-run completed, but manifest entry was not found."
+          return 1
+        }
+        report_file="$(report_file_for_source "$run_dir" "$source_key")"
+        conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
+        review="$(jq -r '.operator_review_required // true' <<<"$entry_json")"
+        status="$(jq -r '.status // "needs_review"' <<<"$entry_json")"
+        msgbox "Manual mapping saved and backend re-run completed."
+        ;;
+      5)
+        return 1
+        ;;
+    esac
+  done
+}
+
+main() {
+  local mapping_items=()
+  while IFS=$'\t' read -r key desc; do
+    [[ -n "$key" ]] || continue
+    mapping_items+=("$key" "$desc")
+  done < <(get_mapping_choices)
+
+  [[ "${#mapping_items[@]}" -gt 0 ]] || die "No valid mappings found in ${MAPPING_JSON_FILE}"
+
+  local selected
+  selected="$(menu \
+    "Select Switch / Member" \
+    "Choose the mapped source/target entry to analyze:" \
+    "${mapping_items[@]}")" || exit 0
+
+  infobox "Running uplink analysis for selected switch/member..."
+  run_backend_for_source "$selected"
+  clear
+
+  local run_dir
+  run_dir="$(get_latest_run_dir)" || die "Could not locate latest run directory"
+
+  if handle_result "$run_dir" "$selected"; then
+    local entry_json effective_cfg
+    entry_json="$(manifest_entry_json "$run_dir" "$selected")" || exit 1
+    effective_cfg="$(jq -r '.effective_config // ""' <<<"$entry_json")"
+
+    msgbox "Uplink review complete.
+
+Selected source key:
+${selected}
+
+Effective config:
+${effective_cfg}
+
+This entry is now ready for downstream handoff if approved_for_migration=true."
+  fi
+}
+
+main "$@"        

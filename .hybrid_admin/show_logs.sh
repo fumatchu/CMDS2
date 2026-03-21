@@ -5,15 +5,12 @@
 #   • Discovery scans (nmap/SSH discovery + upgrade_plan)
 #   • Meraki migration / switch-claim logs
 #   • AAA / DNS / IP-routing / NTP remediation runs
-#
-# PART 1: stops RIGHT BEFORE "CMDS Patch/Updates"
 
 # NOTE: no -e here on purpose; we want Cancel/Esc to be handled manually.
 set -Euo pipefail
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need dialog; need awk; need sed; need date; need grep; need cut; need sort; need tr
-# atq is used by iosxe menus (scheduled jobs)
 need atq
 
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -22,7 +19,7 @@ SCHED_DIR="$ROOT/schedules"
 
 # Normal roots
 DISC_ROOT="$RUNS_DIR/discoveryscans"
-MIGRATION_DIR="$RUNS_DIR/migration"   # Meraki migration / claim runs
+MIGRATION_DIR="$RUNS_DIR/migration"
 AAA_DIR="$RUNS_DIR/aaafix"
 DNS_DIR="$RUNS_DIR/dnsfix"
 IPR_DIR="$RUNS_DIR/iprfix"
@@ -30,7 +27,6 @@ NTP_DIR="$RUNS_DIR/ntpfix"
 
 # ---------------------------
 # CMDS Patch/Update logs (server)
-# (PART 1 STOP POINT is BEFORE any CMDS Patch code below; keep vars if you want)
 # ---------------------------
 SERVER_ADMIN_ROOT="/root/.server_admin"
 CMDS_UPDATE_ROOT="$SERVER_ADMIN_ROOT/runs/cmds-update"
@@ -46,7 +42,6 @@ ADV_DISC_ROOT="$ADV_RUNS_DIR/discoveryscans"
 BACKTITLE="${BACKTITLE:-Main Menu}"
 DIALOG_OPTS=(--no-shadow --backtitle "$BACKTITLE")
 
-# One consistent local-time display format everywhere
 TS_FMT='+%a %b %d, %Y %I:%M:%S %p %Z'
 
 # -----------------------------------------------------------------------------
@@ -56,11 +51,38 @@ TS_FMT='+%a %b %d, %Y %I:%M:%S %p %Z'
 dlg() {
   local _t; _t="$(mktemp)"
   dialog "${DIALOG_OPTS[@]}" "$@" 2>"$_t"
-  DIALOG_RC=$?            # 0=OK, 1=Cancel, 255=Esc
+  DIALOG_RC=$?
   DOUT=""
   [[ -s "$_t" ]] && DOUT="$(cat "$_t")"
   rm -f "$_t"
-  return 0                # always 0
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# helper: build short picker menu from file list
+# outputs arrays by nameref:
+#   $1 = input file array name
+#   $2 = output menu items array name
+#   $3 = output pick paths array name
+# -----------------------------------------------------------------------------
+build_short_file_menu(){
+  local in_name="$1"
+  local items_name="$2"
+  local picks_name="$3"
+
+  declare -n _in="$in_name"
+  declare -n _items="$items_name"
+  declare -n _picks="$picks_name"
+
+  _items=()
+  _picks=()
+
+  local idx=1 f
+  for f in "${_in[@]}"; do
+    _picks[idx]="$f"
+    _items+=("$idx" "$(basename "$f")")
+    ((idx++))
+  done
 }
 
 # ----- time helpers for IOS-XE run-YYYYmmddHHMMSS (UTC) -----
@@ -95,10 +117,10 @@ to_local_from_migrationid(){
   (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
 }
 
-# ----- time helpers for generic prefix-YYYYmmddHHMMSS dirs (aaa-, dns-, ipr-, ntp-, runall-) -----
+# ----- time helpers for generic prefix-YYYYmmddHHMMSS dirs -----
 epoch_from_genericid(){
   local gid="$1"
-  gid="${gid#*-}"   # strip everything up to first '-'
+  gid="${gid#*-}"
   date -ud "${gid:0:4}-${gid:4:2}-${gid:6:2} ${gid:8:2}:${gid:10:2}:${gid:12:2}" +%s 2>/dev/null || echo 0
 }
 to_local_from_genericid(){
@@ -167,11 +189,13 @@ show_upgrade_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path)
         dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
@@ -463,11 +487,13 @@ show_discovery_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Discovery device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Discovery device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Scan path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -479,7 +505,6 @@ discovery_menu(){
   local have_any=0
   local rows=()
 
-  # Normal discovery scans
   if [[ -d "$DISC_ROOT" ]]; then
     local d base ep loc
     for d in "$DISC_ROOT"/scan-*; do
@@ -492,7 +517,6 @@ discovery_menu(){
     done
   fi
 
-  # Advanced discovery scans
   if [[ -n "${ADV_DISC_ROOT:-}" && -d "$ADV_DISC_ROOT" ]]; then
     local d base ep loc
     for d in "$ADV_DISC_ROOT"/scan-*; do
@@ -578,11 +602,13 @@ show_fix_run_menu(){
           dlg --title "Device logs" --msgbox "No device logs found." 7 50
           continue
         fi
-        local devitems=() d
-        for d in "${devs[@]}"; do devitems+=("$d" "$(basename "$d")"); done
-        dlg --title "Device logs" --menu "Pick a device log" 20 120 12 "${devitems[@]}"
-        local rc2=$DIALOG_RC
-        (( rc2 == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        local devitems=() pick_paths=()
+        build_short_file_menu devs devitems pick_paths
+        dlg --title "Device logs" --menu "Pick a device log" 20 110 12 "${devitems[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -740,9 +766,6 @@ meraki_claims_menu(){
 
 # ---------------------------------------------------------------------------
 # Search by IP / text across runs
-#
-# Rules:
-#   - "<term>" => search BOTH: normal first (cap), then advanced (cap)
 # ---------------------------------------------------------------------------
 ip_search_menu(){
   local NORMAL_ROOT="/root/.hybrid_admin/runs"
@@ -874,59 +897,9 @@ ip_search_menu(){
   done
 }
 
-# ===== STOP HERE (PART 1 ENDS RIGHT BEFORE CMDS Patch/Updates) =====
-
-
-# ===========================
-# PART 1 ENDS ABOVE THIS LINE
-# ===========================
-
-
-
 # ---------------------------------------------------------------------------
-# CMDS Patch/Updates viewer (server logs)
-#   Root: /root/.server_admin/runs/cmds-update
-#     - patch_history.log
-#     - run-YYYYmmddHHMMSS/{cmds_updater.log,stdout.log,stderr.log}
+# CMDS Patch/Updates viewer
 # ---------------------------------------------------------------------------
-
-epoch_from_cmdsupdate_runid(){
-  local rid="$1"; rid="${rid#run-}"
-  date -d "${rid:0:4}-${rid:4:2}-${rid:6:2} ${rid:8:2}:${rid:10:2}:${rid:12:2}" +%s 2>/dev/null || echo 0
-}
-to_local_from_cmdsupdate_runid(){
-  local ep; ep="$(epoch_from_cmdsupdate_runid "$1")"
-  (( ep > 0 )) && date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$1"
-}
-
-show_cmds_update_run_menu(){
-  local rdir="$1" title="$2"
-  while true; do
-    local items=()
-    local ulog="$rdir/cmds_updater.log"
-    local sout="$rdir/stdout.log"
-    local serr="$rdir/stderr.log"
-
-    items+=("ulog" "cmds_updater.log")
-    items+=("sout" "stdout.log")
-    items+=("serr" "stderr.log")
-    items+=("path" "Show run folder path")
-    items+=("back" "Back")
-
-    dlg --title "$title" --menu "Choose what to view" 16 80 8 "${items[@]}"
-    local rc=$DIALOG_RC
-    [[ $rc -ne 0 ]] && return
-
-    case "$DOUT" in
-      ulog) view_file "$ulog" "cmds_updater.log" ;;
-      sout) view_file "$sout" "stdout.log" ;;
-      serr) view_file "$serr" "stderr.log" ;;
-      path) dlg --title "Run path" --msgbox "$rdir" 7 70 ;;
-      back) return ;;
-    esac
-  done
-}
-
 cmds_updates_menu(){
   if [[ ! -d "$CMDS_UPDATE_ROOT" ]]; then
     dlg --title "CMDS Patch/Updates" --msgbox \
@@ -944,8 +917,8 @@ Expected:
   for d in "$CMDS_UPDATE_ROOT"/run-*; do
     [[ -d "$d" ]] || continue
     base="$(basename "$d")"
-    ep="$(epoch_from_cmdsupdate_runid "$base")"
-    loc="$(to_local_from_cmdsupdate_runid "$base")"
+    ep="$(date -d "${base#run-}" +%s 2>/dev/null || echo 0)"
+    loc="$(date -d "@$ep" "$TS_FMT" 2>/dev/null || echo "$base")"
     rows+=("${ep}|R:${base}|${loc}|${d}")
   done
   shopt -u nullglob
@@ -953,14 +926,12 @@ Expected:
   while true; do
     local choices=()
 
-    # Top entry: patch history
     if [[ -s "$CMDS_UPDATE_ROOT/patch_history.log" ]]; then
       choices+=("HISTORY" "patch_history.log")
     else
       choices+=("HISTORY" "patch_history.log (missing/empty)")
     fi
 
-    # Separator line (dialog "tag/desc" needs tag to be unique; we just ignore it)
     choices+=("__SEP__" "------------- Server Logs -----------")
 
     if ((${#rows[@]}==0)); then
@@ -969,7 +940,7 @@ Expected:
       mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
       local line tag txt path
       for line in "${sorted[@]}"; do
-        tag="$(cut -d'|' -f2 <<<"$line")"      # R:run-...
+        tag="$(cut -d'|' -f2 <<<"$line")"
         txt="$(cut -d'|' -f3 <<<"$line")"
         path="$(cut -d'|' -f4- <<<"$line")"
         choices+=("$tag" "$txt")
@@ -984,11 +955,10 @@ Expected:
 
     case "$DOUT" in
       HISTORY) view_file "$CMDS_UPDATE_ROOT/patch_history.log" "patch_history.log" ;;
-      __SEP__) continue ;;  # ignore the separator
+      __SEP__) continue ;;
       NONE) continue ;;
       BACK) return ;;
       R:run-*)
-        # Find selected path
         local sel="$DOUT" path=""
         local line2
         for line2 in "${sorted[@]:-}"; do
@@ -996,25 +966,38 @@ Expected:
           path="$(cut -d'|' -f4- <<<"$line2")"
           break
         done
-        [[ -n "$path" ]] && show_cmds_update_run_menu "$path" "CMDS Update: ${sel#R:}"
+        if [[ -n "$path" ]]; then
+          while true; do
+            local items=()
+            items+=("ulog" "cmds_updater.log")
+            items+=("sout" "stdout.log")
+            items+=("serr" "stderr.log")
+            items+=("path" "Show run folder path")
+            items+=("back" "Back")
+            dlg --title "CMDS Update: ${sel#R:}" --menu "Choose what to view" 16 80 8 "${items[@]}"
+            local rc2=$DIALOG_RC
+            [[ $rc2 -ne 0 ]] && break
+            case "$DOUT" in
+              ulog) view_file "$path/cmds_updater.log" "cmds_updater.log" ;;
+              sout) view_file "$path/stdout.log" "stdout.log" ;;
+              serr) view_file "$path/stderr.log" "stderr.log" ;;
+              path) dlg --title "Run path" --msgbox "$path" 7 70 ;;
+              back) break ;;
+            esac
+          done
+        fi
         ;;
     esac
   done
 }
 
 # ---------------------------------------------------------------------------
-# CMDS Backup viewer (server logs)
-#   Root: /root/.server_admin/runs/cmds-backup
-#     - latest/ (manifest.env, run.env, sha256sums.txt, tar.log)
-#     - <host>_cmds-backup-YYYYMMDD-HHMMSS/ (same files)
+# CMDS Backup viewer
 # ---------------------------------------------------------------------------
-
 CMDS_BACKUP_ROOT="$SERVER_ADMIN_ROOT/runs/cmds-backup"
 
 epoch_from_cmdsbackup_id(){
-  # directory name contains YYYYMMDD-HHMMSS at end
   local b="$1"
-  local ts="${b##*-}"      # HHMMSS? nope, we need both, so parse from last 2 chunks
   local datepart timepart
   datepart="$(echo "$b" | grep -oE '[0-9]{8}-[0-9]{6}$' | cut -d'-' -f1)"
   timepart="$(echo "$b" | grep -oE '[0-9]{8}-[0-9]{6}$' | cut -d'-' -f2)"
@@ -1054,16 +1037,18 @@ show_cmds_backup_run_menu(){
       sha)  view_file "$sha"  "sha256sums.txt" ;;
       tlog) view_file "$tlog" "tar.log" ;;
       sched)
-        # show all files under scheduler/
-        local sitems=() f
+        local sitems=() pick_paths=()
         mapfile -t sfiles < <(find "$sched" -maxdepth 1 -type f 2>/dev/null | sort || true)
         if ((${#sfiles[@]}==0)); then
           dlg --title "scheduler/" --msgbox "No files found under:\n$sched" 8 70
           continue
         fi
-        for f in "${sfiles[@]}"; do sitems+=("$f" "$(basename "$f")"); done
+        build_short_file_menu sfiles sitems pick_paths
         dlg --title "scheduler/" --menu "Pick a file" 20 100 12 "${sitems[@]}"
-        (( DIALOG_RC == 0 )) && view_file "$DOUT" "$(basename "$DOUT")"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
         ;;
       path) dlg --title "Path" --msgbox "$rdir" 7 70 ;;
       back) return ;;
@@ -1083,12 +1068,10 @@ Expected:
 
   local choices=()
 
-  # latest first
   if [[ -d "$CMDS_BACKUP_ROOT/latest" ]]; then
     choices+=("LATEST" "latest/ (most recent backup run)")
   fi
 
-  # other backup folders
   local rows=()
   local d base ep loc
   shopt -s nullglob
@@ -1106,7 +1089,6 @@ Expected:
     return
   fi
 
-  # build menu loop
   while true; do
     local menu_items=("${choices[@]}")
     if ((${#rows[@]} > 0)); then
@@ -1145,11 +1127,8 @@ Expected:
 }
 
 # ---------------------------------------------------------------------------
-# CMDS Restore viewer (server logs)
-#   Root: /root/.server_admin/runs/cmds-restore
-#     - run-YYYYMMDD-HHMMSS/ (restore.log, status.env, stage.log, remote_list.log, staging/)
+# CMDS Restore viewer
 # ---------------------------------------------------------------------------
-
 CMDS_RESTORE_ROOT="$SERVER_ADMIN_ROOT/runs/cmds-restore"
 
 epoch_from_cmdsrestore_runid(){
@@ -1193,23 +1172,21 @@ show_cmds_restore_run_menu(){
       rlist)  view_file "$rlist"  "remote_list.log" ;;
       staging)
         local sroot="$rdir/staging"
-        local bundles=()
-        local b
+        local bitems=() pick_paths=()
         shopt -s nullglob
-        for b in "$sroot"/*; do
-          [[ -d "$b" ]] || continue
-          bundles+=("$b" "$(basename "$b")")
-        done
+        mapfile -t bundles < <(find "$sroot" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort || true)
         shopt -u nullglob
         if ((${#bundles[@]}==0)); then
           dlg --title "staging/" --msgbox "No staging bundles found under:\n$sroot" 8 70
           continue
         fi
-        dlg --title "staging/" --menu "Pick a staged bundle" 20 100 12 "${bundles[@]}"
+        build_short_file_menu bundles bitems pick_paths
+        dlg --title "staging/" --menu "Pick a staged bundle" 20 100 12 "${bitems[@]}"
         local rc2=$DIALOG_RC
         (( rc2 == 0 )) || continue
-        local bdir="$DOUT"
-        # show manifest/shas/tar.log inside
+        local bdir="${pick_paths[$DOUT]:-}"
+        [[ -n "$bdir" ]] || continue
+
         while true; do
           local bit=()
           bit+=("mf" "manifest.env")
@@ -1292,12 +1269,8 @@ Expected:
 }
 
 # ---------------------------------------------------------------------------
-# CMDS Backup Scheduler viewer (server logs)
-#   Root: /root/.server_admin/runs/cmds-cron-scheduler
-#     - cron_proof.log
-#     - latest/, last_success/, run-*/
+# CMDS Backup Scheduler viewer
 # ---------------------------------------------------------------------------
-
 CMDS_SCHED_ROOT="$SERVER_ADMIN_ROOT/runs/cmds-cron-scheduler"
 
 epoch_from_cmdssched_runid(){
@@ -1358,7 +1331,6 @@ Expected:
     local items=()
 
     [[ -s "$CMDS_SCHED_ROOT/cron_proof.log" ]] && items+=("PROOF" "cron_proof.log")
-
     [[ -d "$CMDS_SCHED_ROOT/latest" ]] && items+=("LATEST" "latest/ (most recent scheduler run)")
     [[ -d "$CMDS_SCHED_ROOT/last_success" ]] && items+=("LASTOK" "last_success/ (last successful run)")
 
@@ -1411,7 +1383,7 @@ Expected:
 }
 
 # ---------------------------------------------------------------------------
-# Top-level main menu (UPDATED to include CMDS Backup/Restore/Scheduler)
+# Top-level main menu
 # ---------------------------------------------------------------------------
 main(){
   while true; do
@@ -1445,7 +1417,7 @@ main(){
       7)  iprfix_menu          ;;
       8)  ntpfix_menu          ;;
       9)  ip_search_menu       ;;
-      10) : ;; # header
+      10) : ;;
       11) cmds_updates_menu    ;;
       12) cmds_backup_menu     ;;
       13) cmds_restore_menu    ;;
