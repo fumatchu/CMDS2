@@ -17,6 +17,13 @@ set -Euo pipefail
 #
 # IMPORTANT:
 #   This does NOT replace your backend script. It wraps it.
+#
+# BATCH FIX:
+#   In __ALL__ mode, backend runs are still per-IP, but this wrapper
+#   now builds a COMBINED batch run directory and accumulates every
+#   processed source_key into one normalized_manifest.json.
+#   At the end of batch mode, runs/uplink_suggest/latest points to the
+#   combined batch run, so downstream port_migration sees ALL entries.
 # ============================================================
 
 BASE_DIR="/root/.cat_admin"
@@ -53,6 +60,7 @@ need sort
 need mktemp
 need stty
 need readlink
+need cp
 
 [[ -t 0 && -t 1 && -t 2 ]] || die "This dialog UI must be run from an interactive terminal."
 [[ -x "$BACKEND_SCRIPT" ]] || die "Backend script not found or not executable: $BACKEND_SCRIPT"
@@ -322,6 +330,53 @@ manual_pairs_file_for_source() {
   local base_name
   base_name="$(compute_base_name "$source_key")"
   printf '%s/manual_pairs_%s.json\n' "$run_dir" "$base_name"
+}
+
+create_batch_combined_run() {
+  local batch_run_dir="${RUNS_BASE}/batch-run-${BATCH_TS}"
+  mkdir -p "$batch_run_dir"
+  printf '[]\n' > "${batch_run_dir}/normalized_manifest.json"
+  printf '%s\n' "$batch_run_dir"
+}
+
+copy_source_artifacts_to_batch_run() {
+  local src_run_dir="$1"
+  local dst_run_dir="$2"
+  local source_key="$3"
+
+  local src_manifest entry_json base_name
+  src_manifest="${src_run_dir}/normalized_manifest.json"
+  [[ -f "$src_manifest" ]] || return 1
+
+  entry_json="$(jq -c --arg sk "$source_key" 'first(.[] | select(.source_key == $sk))' "$src_manifest")"
+  [[ -n "$entry_json" && "$entry_json" != "null" ]] || return 1
+
+  base_name="$(compute_base_name "$source_key")"
+  mkdir -p "$dst_run_dir"
+
+  local f
+  for f in \
+    "report_${base_name}.txt" \
+    "target_${base_name}.json" \
+    "source_${base_name}.json" \
+    "suggest_${base_name}.json" \
+    "manual_pairs_${base_name}.json" \
+    "preview_${base_name}.cfg"
+  do
+    if [[ -f "${src_run_dir}/${f}" ]]; then
+      cp -f "${src_run_dir}/${f}" "${dst_run_dir}/${f}"
+    fi
+  done
+
+  local dst_manifest="${dst_run_dir}/normalized_manifest.json"
+  [[ -f "$dst_manifest" ]] || printf '[]\n' > "$dst_manifest"
+
+  local tmp_manifest
+  tmp_manifest="$(mktemp)"
+
+  jq -c --arg sk "$source_key" --argjson entry "$entry_json" '
+    map(select(.source_key != $sk)) + [$entry]
+  ' "$dst_manifest" > "$tmp_manifest" && mv -f "$tmp_manifest" "$dst_manifest"
 }
 
 show_summary_from_entry() {
@@ -707,6 +762,9 @@ process_all_mappings() {
 
   [[ "${#source_keys[@]}" -gt 0 ]] || die "No valid mappings found in ${MAPPING_JSON_FILE}"
 
+  local batch_run_dir
+  batch_run_dir="$(create_batch_combined_run)" || die "Could not create combined batch run dir"
+
   local last_ip=""
   local run_dir=""
   local total_count=0
@@ -715,10 +773,12 @@ process_all_mappings() {
   local apply_count=0
 
   log_batch_line "BATCH_START total_entries=${#source_keys[@]}"
+  log_batch_line "BATCH_COMBINED_RUN ${batch_run_dir}"
 
   for source_key in "${source_keys[@]}"; do
     local ip
     ip="$(get_mapping_field "$source_key" '.source.ip // ""')"
+    ip="$(trim "$ip")"
 
     if [[ "$ip" != "$last_ip" ]]; then
       infobox "Running uplink analysis for source IP ${ip}..."
@@ -746,6 +806,7 @@ process_all_mappings() {
       apply_count=$((apply_count + 1))
       log_skip_entry "$entry_json" "unchanged"
       log_apply_entry "$entry_json"
+      copy_source_artifacts_to_batch_run "$run_dir" "$batch_run_dir" "$source_key" || true
       continue
     fi
 
@@ -756,6 +817,7 @@ process_all_mappings() {
           apply_count=$((apply_count + 1))
           log_skip_entry "$entry_json" "$conf"
           log_apply_entry "$entry_json"
+          copy_source_artifacts_to_batch_run "$run_dir" "$batch_run_dir" "$source_key" || true
           continue
         fi
         ;;
@@ -765,16 +827,20 @@ process_all_mappings() {
     handle_result "$run_dir" "$source_key" 1 || true
 
     entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || true
-    if [[ -n "${entry_json:-}" ]]; then
+    if [[ -n "${entry_json:-}" && "$entry_json" != "null" ]]; then
       review="$(jq -r 'if has("operator_review_required") then .operator_review_required else true end' <<<"$entry_json")"
       if [[ "$review" == "false" ]]; then
         apply_count=$((apply_count + 1))
       fi
+      copy_source_artifacts_to_batch_run "$run_dir" "$batch_run_dir" "$source_key" || true
     fi
   done
 
+  ln -sfn "$batch_run_dir" "${RUNS_BASE}/latest"
+
   log_batch_line "BATCH_COMPLETE total_entries=${total_count} auto_skipped=${skipped_auto} operator_attention=${intervention_count} applied=${apply_count}"
   log_batch_line "BATCH_LOG_FILE ${BATCH_LOG_FILE}"
+  log_batch_line "BATCH_FINAL_LATEST ${RUNS_BASE}/latest -> ${batch_run_dir}"
 
   msgbox "Batch uplink review complete.
 
@@ -782,6 +848,9 @@ Total entries processed: ${total_count}
 Auto-skipped unchanged / no-review entries: ${skipped_auto}
 Entries requiring operator attention: ${intervention_count}
 Apply-ready entries logged: ${apply_count}
+
+Combined batch manifest:
+${batch_run_dir}/normalized_manifest.json
 
 Batch log:
 ${BATCH_LOG_FILE}"
@@ -830,3 +899,4 @@ Batch mode will:
 }
 
 main "$@"
+

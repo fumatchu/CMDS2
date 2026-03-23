@@ -16,6 +16,15 @@
 set -Euo pipefail
 exec 2> >(tee -a "/tmp/cloud_admin_port_mig.stderr.log" >&2)
 
+PORT_MIG_TRACE_LOG="/tmp/port_migration_trace.log"
+
+trace_log() {
+  printf '%s [pid=%s] %s\n' "$(date '+%F %T')" "$$" "$*" >> "$PORT_MIG_TRACE_LOG"
+}
+
+trap 'rc=$?; trace_log "EXIT rc=$rc last_func=${FUNCNAME[0]:-MAIN} line=${LINENO}"' EXIT
+trap 'rc=$?; trace_log "ERR rc=$rc cmd=${BASH_COMMAND@Q} line=${BASH_LINENO[0]} func=${FUNCNAME[1]:-MAIN}"' ERR
+
 : "${DIALOG:=dialog}"
 
 # ------------------------------------------------------------
@@ -646,7 +655,9 @@ load_migrate_context() {
   mkdir -p "$PORT_MIG_ROOT" 2>/dev/null || true
 
   if [[ ! -f "$MAPPING_JSON_FILE" ]]; then
-    dlg --backtitle "$BACKTITLE_PORTS"         --title "No mapping file"         --msgbox "Could not find the Meraki mapping file.
+    dlg --backtitle "$BACKTITLE_PORTS" \
+        --title "No mapping file" \
+        --msgbox "Could not find the Meraki mapping file.
 
 Missing file:
   $MAPPING_JSON_FILE
@@ -669,7 +680,9 @@ Run the mapping wizard first so this module knows which source switches map to w
   SEL_IPS_RAW="$(trim "$SEL_IPS_RAW")"
 
   if [[ -z "$SEL_IPS_RAW" ]]; then
-    dlg --backtitle "$BACKTITLE_PORTS"         --title "No mapped switches"         --msgbox "The mapping file exists, but it does not contain any mapped source IPs.
+    dlg --backtitle "$BACKTITLE_PORTS" \
+        --title "No mapped switches" \
+        --msgbox "The mapping file exists, but it does not contain any mapped source IPs.
 
 File:
   $MAPPING_JSON_FILE
@@ -678,18 +691,14 @@ Run the mapping wizard and save mappings first." 14 90
     return 1
   fi
 
-  if [[ -f "$PORT_MIG_LATEST_ENV" ]]; then
-    set +H
-    # shellcheck disable=SC1090
-    source "$PORT_MIG_LATEST_ENV" 2>/dev/null || true
-    set -H 2>/dev/null || true
-  fi
-
-  if [[ -z "${RUN_ID:-}" ]]; then
+  # Reuse the current in-process run if already established.
+  if [[ -n "${RUN_ID:-}" && -n "${RUN_DIR:-}" && -d "${RUN_DIR:-}" ]]; then
+    :
+  else
     RUN_ID="port-mig-$(date -u +%Y%m%d%H%M%S)"
+    RUN_DIR="${PORT_MIG_ROOT}/${RUN_ID}"
   fi
 
-  RUN_DIR="${PORT_MIG_ROOT}/${RUN_ID}"
   mkdir -p "$RUN_DIR/ports" "$RUN_DIR/devlogs" 2>/dev/null || true
 
   cat >"$PORT_MIG_LATEST_ENV" <<EOF
@@ -701,15 +710,17 @@ MERAKI_ENV_FILE="$MERAKI_ENV_FILE"
 EOF
   chmod 600 "$PORT_MIG_LATEST_ENV" 2>/dev/null || true
 
-  ln -sfn "$RUN_DIR"              "${PORT_MIG_ROOT}/latest"
-  ln -sfn "$RUN_DIR/ports"        "${PORT_MIG_ROOT}/latest.ports"
-  ln -sfn "$RUN_DIR/devlogs"      "${PORT_MIG_ROOT}/latest.devlogs"
-  ln -sfn "$PORT_MIG_LATEST_ENV"  "${PORT_MIG_ROOT}/latest.env"
+  ln -sfn "$RUN_DIR"         "${PORT_MIG_ROOT}/latest"
+  ln -sfn "$RUN_DIR/ports"   "${PORT_MIG_ROOT}/latest.ports"
+  ln -sfn "$RUN_DIR/devlogs" "${PORT_MIG_ROOT}/latest.devlogs"
 
   PORTS_SELECTED_IPS=()
   read -r -a PORTS_SELECTED_IPS <<<"$SEL_IPS_RAW"
+
   if ((${#PORTS_SELECTED_IPS[@]} == 0)); then
-    dlg --backtitle "$BACKTITLE_PORTS"         --title "No mapped switches"         --msgbox "No source IPs were loaded from the mapping file.
+    dlg --backtitle "$BACKTITLE_PORTS" \
+        --title "No mapped switches" \
+        --msgbox "No source IPs were loaded from the mapping file.
 
 File:
   $MAPPING_JSON_FILE" 11 80
@@ -796,26 +807,28 @@ find_meraki_identity_from_mapping_for_ip_member() {
 
   local exact
   exact="$(jq -r --arg ip "$ip" --arg m "$member" '
-    .[]?
-    | select((.source.ip // "") == $ip)
-    | select((((.source.member_index // 1) | tostring)) == $m)
-    | [(.target.cloud_id // .target.serial // ""), (.target.model // "")]
-    | @tsv
-  ' "$MAPPING_JSON_FILE" 2>/dev/null | awk -F'	' '($1!=""){print $1 "|" $2; exit}')"
+    first(
+      .[]?
+      | select((.source.ip // "") == $ip)
+      | select((((.source.member_index // 1) | tostring)) == $m)
+      | "\(.target.cloud_id // .target.serial // "")|\(.target.model // "")"
+    ) // empty
+  ' "$MAPPING_JSON_FILE" 2>/dev/null)"
 
+  exact="$(trim "$exact")"
   if [[ -n "$exact" ]]; then
-    printf '%s
-' "$exact"
+    printf '%s\n' "$exact"
     return 0
   fi
 
   if [[ "$member" == "1" ]]; then
     jq -r --arg ip "$ip" '
-      .[]?
-      | select((.source.ip // "") == $ip)
-      | [(.target.cloud_id // .target.serial // ""), (.target.model // "")]
-      | @tsv
-    ' "$MAPPING_JSON_FILE" 2>/dev/null | awk -F'	' '($1!=""){print $1 "|" $2; exit}'
+      first(
+        .[]?
+        | select((.source.ip // "") == $ip)
+        | "\(.target.cloud_id // .target.serial // "")|\(.target.model // "")"
+      ) // empty
+    ' "$MAPPING_JSON_FILE" 2>/dev/null | awk 'NF{print; exit}'
     return 0
   fi
 
@@ -3217,7 +3230,7 @@ apply_ports_from_diff() {
   local idx=0
 
   for p in "${PORTS_TO_APPLY[@]}"; do
-    ((idx++))
+    ((++idx))
     local pct=$(( idx * 100 / (total == 0 ? 1 : total) ))
 
     apply_ui_update "Port $p ($idx/$total): preparing request" "$pct"
@@ -3235,7 +3248,7 @@ apply_ports_from_diff() {
     matched_count="$(jq -r --arg pid "$p" '[ .[] | select((.portId|tostring) == $pid) ] | length' "$diff_file" 2>/dev/null || echo 0)"
     if [[ "$matched_count" == "0" ]]; then
       echo "NO MATCH in diff_file for portId=$p (cannot compute body)" >>"$apply_log"
-      ((fail_count++))
+      ((++fail_count))
       continue
     fi
 
@@ -3281,7 +3294,7 @@ apply_ports_from_diff() {
     if [[ -z "$body" || "$body" == "null" || "$body" == "{}" ]]; then
       echo "Skipping port $p – computed empty PUT body (no applicable fields)." >>"$apply_log"
       apply_ui_update "Port $p: skipped (empty body)" "$pct"
-      ((fail_count++))
+      ((++fail_count))
       continue
     fi
 
@@ -3302,7 +3315,7 @@ apply_ports_from_diff() {
     if [[ "$code" =~ ^20[0-9]$ ]]; then
       echo "Port $p: SUCCESS (HTTP $code)" >>"$apply_log"
       apply_ui_update "Port $p: SUCCESS (HTTP $code)" "$pct"
-      ((ok_count++))
+      ((++ok_count))
 
       local warn_lines warned_this_port=0
       local is_lag_member
@@ -3349,13 +3362,13 @@ apply_ports_from_diff() {
       fi
 
       if [[ "$warned_this_port" -eq 1 ]]; then
-        ((warn_count++))
+        ((++warn_count))
       fi
     else
       echo "Port $p: FAILED (HTTP $code)" >>"$apply_log"
       apply_ui_update "Port $p: FAILED (HTTP $code)" "$pct"
       sed -n '1,60p' "$tmp_resp" >>"$apply_log" || true
-      ((fail_count++))
+      ((++fail_count))
     fi
 
     rm -f "$tmp_resp" 2>/dev/null || true
@@ -3582,14 +3595,14 @@ build_port_diff_for_ip() {
     [[ -n "$m" ]] || continue
 
     if ! find_meraki_identity_for_ip_member "$ip" "$m" >/dev/null 2>&1; then
-      ((failures++))
+      ((++failures))
       continue
     fi
 
     if merge_ios_intent_with_meraki_ports "$ip" "$cfg" "$m"; then
-      ((built++))
+      ((++built))
     else
-      ((failures++))
+      ((++failures))
     fi
   done < <(get_stack_members_for_ip "$ip" 2>/dev/null || printf '1\n')
 
@@ -3821,7 +3834,7 @@ fi
   local ok=0 fail=0 skipped=0
   for m in "${members[@]}"; do
     if ! find_meraki_identity_for_ip_member "$ip" "$m" >/dev/null 2>&1; then
-      ((skipped++))
+      ((++skipped))
       continue
     fi
 
@@ -3830,14 +3843,14 @@ fi
     diff_file="$(trim "$diff_file")"
 
     if [[ -z "$diff_file" ]]; then
-      ((skipped++))
+      ((++skipped))
       continue
     fi
 
         if apply_ports_from_diff "$ip" "$diff_file" "$m" "STACK"; then
-      ((ok++))
+      ((++ok))
     else
-      ((fail++))
+      ((++fail))
     fi
   done
 
@@ -3858,7 +3871,8 @@ fi
 
    "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
             --title "Whole stack apply complete" \
-            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for that member.)\n\nLog:\n  $st
+            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for t
+hat member.)\n\nLog:\n  $st
 ack_apply_log" \
             16 86
 
@@ -3957,15 +3971,15 @@ run_auto_build_then_apply_from_checklist() {
   for ipx in "${IPS[@]}"; do
     # 1) build-diff
     if ! build_port_diff_for_ip "$ipx"; then
-      ((fail++))
+      ((++fail))
       continue
     fi
 
     # 2) apply-diff
     if apply_port_diff_for_ip "$ipx"; then
-      ((ok++))
+      ((++ok))
     else
-      ((fail++))
+      ((++fail))
     fi
   done
 
@@ -4024,7 +4038,7 @@ auto_run_for_ip() {
       fi
 
       if merge_ios_intent_with_meraki_ports "$ip" "$cfg" "$m"; then
-        ((built++))
+        ((++built))
       fi
     done < <(get_stack_members_for_ip "$ip" 2>/dev/null || printf '1\n')
 
@@ -4128,9 +4142,9 @@ show_main_menu() {
       [[ -n "$ip" ]] || continue
 
       if auto_run_for_ip "$ip"; then
-        ((ok++))
+        ((++ok))
       else
-        ((fail++))
+        ((++fail))
       fi
     done
 
@@ -4150,4 +4164,5 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     apply-diff) apply_port_diff_for_one_switch "$@" ;;
     menu|*)     show_main_menu ;;
   esac
-fi
+fi          
+   
