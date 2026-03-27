@@ -173,6 +173,11 @@ run_target() {
   clear
 
   if [[ -n "$script" && -f "$script" ]]; then
+    # Mark Port Migration immediately when launched from menu
+    if [[ "$label" == "Port Migration" ]]; then
+      : > "$PORT_MIGRATION_OK_FILE" 2>/dev/null || touch "$PORT_MIGRATION_OK_FILE"
+    fi
+
     set +e
     bash "$script"
     local rc=$?
@@ -192,14 +197,6 @@ run_target() {
         : > "$UPLINK_VALIDATION_OK_FILE" 2>/dev/null || touch "$UPLINK_VALIDATION_OK_FILE"
       else
         rm -f -- "$UPLINK_VALIDATION_OK_FILE" 2>/dev/null || true
-      fi
-    fi
-
-    if [[ "$label" == "Port Migration" ]]; then
-      if [[ $rc -eq 0 ]]; then
-        : > "$PORT_MIGRATION_OK_FILE" 2>/dev/null || touch "$PORT_MIGRATION_OK_FILE"
-      else
-        rm -f -- "$PORT_MIGRATION_OK_FILE" 2>/dev/null || true
       fi
     fi
 
