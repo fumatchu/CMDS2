@@ -78,9 +78,8 @@ declare -A HELP_RAW=(
   ["IP Management Migration"]="Migrate management IP settings from IOS-XE configs to Meraki management interfaces."
   ["Clean Configuration (New Batch Deployment)"]="Clear prior selections and files to prepare a new deployment batch."
   ["Logging"]="View CMDS deployment and migration log files."
-  ["Utilities"]="Utility tools for monitoring and quick checks."
-  ["Switch UP/Down Status"]="Monitor switch reachability (UP/DOWN) using continuous ping."
-  ["IOS-XE Image Management"]="Manage IOS-XE image files (list, inspect, and clean up)."
+  ["Utilities"]="Utility tools for config review, ad-hoc command execution, and backup browsing."
+  ["Config Review"]="Browse and review generated or discovered configuration content in a carousel-style viewer."
   ["CLI Updater"]="Run ad-hoc CLI command packs on selected switches."
   ["Backup Config Viewer"]="Browse and search saved switch backup configs."
   ["Server Management"]="Server management tools and utilities."
@@ -297,32 +296,25 @@ submenu_utilities() {
     local -A LABEL_BY_TAG=()
     local i=1
 
-    local lbl1="Switch UP/Down Status"
-    local path1="/root/.cat_admin/ping.sh"
-    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Continuous ping monitor for selected switches (UP/DOWN).")")
+    local lbl1="Config Review"
+    local path1="/root/.cat_admin/config_carousel.sh"
+    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "Browse and review generated or discovered configuration content in a carousel-style viewer.")")
     PATH_BY_TAG["$i"]="$path1"
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    local lbl2="IOS-XE Image Management"
-    local path2="/root/.cat_admin/image_management.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Manage IOS-XE image files (list, inspect, and clean up).")")
+    local lbl2="CLI Updater"
+    local path2="/root/.cat_admin/cli_updater.sh"
+    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
     PATH_BY_TAG["$i"]="$path2"
     LABEL_BY_TAG["$i"]="$lbl2"
     ((i++))
 
-    local lbl3="CLI Updater"
-    local path3="/root/.cat_admin/cli_updater.sh"
-    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Run ad-hoc CLI command packs on selected switches.")")
+    local lbl3="Backup Config Viewer"
+    local path3="/root/.cat_admin/back_config_viewer.sh"
+    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "Browse and search saved switch backup configs.")")
     PATH_BY_TAG["$i"]="$path3"
     LABEL_BY_TAG["$i"]="$lbl3"
-    ((i++))
-
-    local lbl4="Backup Config Viewer"
-    local path4="/root/.cat_admin/back_config_viewer.sh"
-    MENU_ITEMS+=("$i" "$lbl4" "$(color_help "Browse and search saved switch backup configs.")")
-    PATH_BY_TAG["$i"]="$path4"
-    LABEL_BY_TAG["$i"]="$lbl4"
     ((i++))
 
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
