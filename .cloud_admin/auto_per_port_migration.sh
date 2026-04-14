@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # ============================================================
 # Cloud Migration – IOS Port Intent → Meraki Switch Ports
@@ -431,6 +432,24 @@ warn_if_meraki_ignored_fields() {
       elif (v|type) == "string" then v
       else v end;
 
+    #NEW: normalize VLAN lists (handles ranges vs lists)
+    def expand_vlans(s):
+      if s == null or s == "" then []
+      else
+        (s | split(","))
+        | map(
+            if test("-") then
+              (split("-") | map(tonumber)) as [$a,$b]
+              | range($a; $b + 1)
+            else
+              tonumber
+            end
+          )
+        | flatten
+        | unique
+        | sort
+      end;
+
     ($r[0]) as $resp
     | if ($resp|type) != "object" then
         "WARN: Meraki PUT response did not include a port object; cannot verify applied fields."
@@ -486,6 +505,18 @@ warn_if_meraki_ignored_fields() {
                     | "WARN: Meraki ignored/changed name: requested=" + ($want|@json) + " got=" + ($got|@json)
                   )
                 end
+              end
+
+            # NEW: SMART VLAN COMPARISON (fixes your issue)
+            elif $k == "allowedVlans" then
+              if ($resp|has("allowedVlans")|not) then
+                ("WARN: Meraki response omitted allowedVlans; cannot verify applied value.")
+              else
+                ( ($req.allowedVlans // "") as $want
+                  | ($resp.allowedVlans // "") as $got
+                  | select(expand_vlans($want) != expand_vlans($got))
+                  | "WARN: Meraki ignored/changed allowedVlans: requested=" + ($want|@json) + " got=" + ($got|@json)
+                )
               end
 
             else
@@ -1319,7 +1350,20 @@ in_if {
   if ($1 == "switchport" && $2 == "access" && $3 == "vlan") { access_vlan=$4; next }
   if ($1 == "switchport" && $2 == "voice" && $3 == "vlan") { voice_vlan=$4; next }
   if ($1 == "switchport" && $2 == "trunk" && $3 == "native" && $4 == "vlan") { native_vlan=$5; next }
-  if ($1 == "switchport" && $2 == "trunk" && $3 == "allowed" && $4 == "vlan") { allowed_vlans=$5; next }
+  if ($1 == "switchport" && $2 == "trunk" && $3 == "allowed" && $4 == "vlan") {
+  line = $0
+  sub(/^[[:space:]]*switchport[[:space:]]+trunk[[:space:]]+allowed[[:space:]]+vlan[[:space:]]+/, "", line)
+  sub(/^[[:space:]]*add[[:space:]]+/, "", line)
+
+  gsub(/[[:space:]]+/, "", line)
+
+  if (allowed_vlans == "") {
+    allowed_vlans = line
+  } else {
+    allowed_vlans = allowed_vlans "," line
+  }
+  next
+}
 
   if ($1 == "channel-group") {
     portchannel_id = $2
@@ -3659,7 +3703,8 @@ fi
 
    "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
             --title "Whole stack apply complete" \
-            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for that member.)\n\nLog:\n  $stack_apply_log" \
+            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for th
+at member.)\n\nLog:\n  $stack_apply_log" \
             16 86
 
   sleep 4

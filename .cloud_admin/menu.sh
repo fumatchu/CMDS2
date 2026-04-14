@@ -21,7 +21,9 @@ MARK_CHECK="${MARK_CHECK:-\Z2\Zb[✓]\Zn}"          # bold green [✓]
 MIGRATION_OK_FILE="/root/.cloud_admin/migration.ok"
 IOSXE_CONFIG_MIG_OK_FILE="/root/.cloud_admin/iosxe_config_migration.ok"
 IOSXE_UPGRADE_OK_FILE="/root/.cloud_admin/iosxe_upgrade.ok"
-
+VLAN_CHECK_OK_FILE="/root/.cloud_admin/vlan_consistency.ok"
+PORT_MIG_OK_FILE="/root/.cloud_admin/port_migration.ok"
+IP_MIG_OK_FILE="/root/.cloud_admin/ip_migration.ok"
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
   ["Cloud Support Matrix (Models ↔ IOS-XE)"]="/root/.cloud_admin/cloud_firmware_report.env"
@@ -290,7 +292,29 @@ submenu_iosxe(){
 # ---------- IOS-XE config Migration submenu (UPDATED: 3 options) ----------
 submenu_iosxe_config_migration(){
   local SUB_TITLE="IOS-XE config Migration"
+
   color_help(){ printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"; }
+
+  # NEW: match main menu "(Completed)" behavior
+  colorize_submenu_help(){
+    local label="$1"
+    local text="$2"
+    local extra=""
+
+    case "$label" in
+      "VLAN Consistency Checker (Mandatory)")
+        [[ -f "$VLAN_CHECK_OK_FILE" || -s "$VLAN_CHECK_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+      "Port Migration")
+        [[ -f "$PORT_MIG_OK_FILE" || -s "$PORT_MIG_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+      "IP management Migration")
+        [[ -f "$IP_MIG_OK_FILE" || -s "$IP_MIG_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+    esac
+
+    printf '%b%s%b%b' "$HELP_COLOR_PREFIX" "$text" "$HELP_COLOR_RESET" "$extra"
+  }
 
   while true; do
     local MENU_ITEMS=()
@@ -298,26 +322,35 @@ submenu_iosxe_config_migration(){
     local -A LABEL_BY_TAG=()
     local i=1
 
-    # 1) Automated -> auto_per_port_migration.sh
-    local lbl1="Automated"
+    # 1 VLAN checker
+    local lbl0="VLAN Consistency Checker (Mandatory)"
+    local path0="/root/.cloud_admin/vlan_checker_dialog.sh"
+    local shown0="$lbl0"
+    [[ -f "$VLAN_CHECK_OK_FILE" || -s "$VLAN_CHECK_OK_FILE" ]] && shown0="$shown0  $MARK_CHECK"
+
+    MENU_ITEMS+=("$i" "$shown0" "$(colorize_submenu_help "$lbl0" "Validate VLAN consistency between source configs and target Meraki configuration")")
+    PATH_BY_TAG["$i"]="$path0"
+    LABEL_BY_TAG["$i"]="$lbl0"
+    ((i++))
+
+    # 2 Port Migration
+    local lbl1="Port Migration"
     local path1="/root/.cloud_admin/auto_per_port_migration.sh"
-    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "${HELP_RAW[$lbl1]:-}")")
+    local shown1="$lbl1"
+    [[ -f "$PORT_MIG_OK_FILE" || -s "$PORT_MIG_OK_FILE" ]] && shown1="$shown1  $MARK_CHECK"
+
+    MENU_ITEMS+=("$i" "$shown1" "$(colorize_submenu_help "$lbl1" "Automated port migration (non-interactive)")")
     PATH_BY_TAG["$i"]="$path1"
     LABEL_BY_TAG["$i"]="$lbl1"
     ((i++))
 
-    # 2) Per Switch/Per Port Selection -> per_port_migration.sh
-    local lbl2="Per Switch/Per Port Selection"
-    local path2="/root/.cloud_admin/per_port_migration.sh"
-    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "${HELP_RAW[$lbl2]:-}")")
-    PATH_BY_TAG["$i"]="$path2"
-    LABEL_BY_TAG["$i"]="$lbl2"
-    ((i++))
-
-    # 3) IP management Migration -> per_switch_ip_migration.sh
+    # 3 IP Migration
     local lbl3="IP management Migration"
     local path3="/root/.cloud_admin/per_switch_ip_migration.sh"
-    MENU_ITEMS+=("$i" "$lbl3" "$(color_help "${HELP_RAW[$lbl3]:-}")")
+    local shown3="$lbl3"
+    [[ -f "$IP_MIG_OK_FILE" || -s "$IP_MIG_OK_FILE" ]] && shown3="$shown3  $MARK_CHECK"
+
+    MENU_ITEMS+=("$i" "$shown3" "$(colorize_submenu_help "$lbl3" "${HELP_RAW[$lbl3]:-}")")
     PATH_BY_TAG["$i"]="$path3"
     LABEL_BY_TAG["$i"]="$lbl3"
     ((i++))
@@ -331,15 +364,24 @@ submenu_iosxe_config_migration(){
         --title "$SUB_TITLE" \
         --ok-label "OK" \
         --cancel-label "Back" \
-        --menu "Select an option:" 16 92 10 \
+        --menu "Select an option:" 17 92 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
-    ) || { return 0; }
+    ) || return 0
 
     [[ "$CHOICE" == "0" ]] && return 0
 
     local script="${PATH_BY_TAG[$CHOICE]}"
     local label="${LABEL_BY_TAG[$CHOICE]}"
+
+    # enforce VLAN first
+    if [[ "$label" == "Port Migration" && ! -f "$VLAN_CHECK_OK_FILE" ]]; then
+      dialog --no-shadow \
+        --backtitle "$BACKTITLE" \
+        --title "Validation Required" \
+        --msgbox "Please run VLAN Consistency Checker (Option 1) first." 8 62
+      continue
+    fi
 
     clear
     if [[ -n "$script" && -f "$script" ]]; then
@@ -348,25 +390,44 @@ submenu_iosxe_config_migration(){
       local rc=$?
       set -e
 
-      # Stamp completion marker for IOS-XE config Migration (main menu item) on success
-      if [[ $rc -eq 0 ]]; then
-        : > "$IOSXE_CONFIG_MIG_OK_FILE" 2>/dev/null || touch "$IOSXE_CONFIG_MIG_OK_FILE"
-      elif [[ $rc -ne 1 && $rc -ne 255 && $rc -ne 130 && $rc -ne 143 ]]; then
-        rm -f -- "$IOSXE_CONFIG_MIG_OK_FILE" 2>/dev/null || true
+      # VLAN marker
+      if [[ "$label" == "VLAN Consistency Checker (Mandatory)" ]]; then
+        [[ $rc -eq 0 ]] && : > "$VLAN_CHECK_OK_FILE" || rm -f "$VLAN_CHECK_OK_FILE"
+      fi
+
+      # Port Migration marker
+      if [[ "$label" == "Port Migration" ]]; then
+        [[ $rc -eq 0 ]] && : > "$PORT_MIG_OK_FILE" || rm -f "$PORT_MIG_OK_FILE"
+      fi
+
+      # IP Migration marker
+      if [[ "$label" == "IP management Migration" ]]; then
+        [[ $rc -eq 0 ]] && : > "$IP_MIG_OK_FILE" || rm -f "$IP_MIG_OK_FILE"
+      fi
+
+      # main marker
+      if [[ "$label" != "VLAN Consistency Checker (Mandatory)" ]]; then
+        if [[ $rc -eq 0 ]]; then
+          : > "$IOSXE_CONFIG_MIG_OK_FILE"
+        elif [[ $rc -ne 1 && $rc -ne 255 && $rc -ne 130 && $rc -ne 143 ]]; then
+          rm -f "$IOSXE_CONFIG_MIG_OK_FILE"
+        fi
       fi
 
       case "$rc" in
-        0) : ;;
-        1|255|130|143) : ;;  # cancel/back/ctrl-c: ignore
+        0) ;;
+        1|255|130|143) ;;
         *) dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
-              --msgbox "Script exited with status $rc.\n\n$script" 8 78 ;;
+             --msgbox "Script exited with status $rc.\n\n$script" 8 78 ;;
       esac
     else
       dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
-            --msgbox "Cannot find:\n${script:-<none>}" 7 60
+        --msgbox "Cannot find:\n${script:-<none>}" 7 60
     fi
   done
 }
+
+
 
 # ---------- Utilities submenu ----------
 submenu_utilities(){

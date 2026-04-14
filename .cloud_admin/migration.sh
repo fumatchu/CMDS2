@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -Euo pipefail
 
@@ -2446,46 +2447,104 @@ fi
     claimed=1
   fi
 
-  # --- First claim attempt (before polling) ---
-  if [[ -n "$net_id" && -n "${MERAKI_API_KEY:-}" && $claimed -eq 0 ]]; then
-    if (( stack_count > 1 )) && [[ -n "$stack_cloud_ids" ]]; then
-      mc_log "[$ip] STACK: At least one member switch detected; attempting to claim ALL member Cloud IDs into network ${net_id}…"
 
-      if meraki_claim_stack_devices "$ip" "$net_id" "$stack_cloud_ids"; then
-        claimed=1
-        mc_log "[$ip] STACK: Stack member claim attempts completed (see logs for per-member status)."
+# --- First claim attempt (before polling) ---
+if [[ -n "$net_id" && -n "${MERAKI_API_KEY:-}" && $claimed -eq 0 ]]; then
+  if (( stack_count > 1 )) && [[ -n "$stack_cloud_ids" ]]; then
+
+    mc_log "[$ip] STACK: Detected stack members — claiming all devices into network ${net_id}…"
+
+    if meraki_claim_stack_devices "$ip" "$net_id" "$stack_cloud_ids"; then
+      claimed=1
+      mc_log "[$ip] STACK: Stack member claim attempts completed."
+
+      # ============================================================
+      # CREATE STACK (THIS IS THE FIX)
+      # ============================================================
+
+      mc_log "[$ip] STACK: Preparing to create Meraki stack..."
+
+      # Convert CSV → JSON array safely
+      serials_json="$(printf '%s\n' "$stack_cloud_ids" \
+        | tr ',' '\n' \
+        | sed '/^$/d' \
+        | jq -R . | jq -s .)"
+
+      # Build friendly stack name
+      base_hostname="$(get_hostname_for_ip "$ip" 2>/dev/null || echo "switch")"
+      stack_name="${base_hostname}-stack"
+
+      # 🔍 Check if stack already exists (prevents duplicates)
+      existing_stack="$(
+        curl -sS \
+          -X GET "https://api.meraki.com/api/v1/networks/${net_id}/switch/stacks" \
+          -H "X-Cisco-Meraki-API-Key: ${MERAKI_API_KEY}" \
+        | jq -r --argjson want "$serials_json" '
+            .[]
+            | select((.serials | sort) == ($want | sort))
+            | .id
+          ' | head -n1
+      )"
+
+      if [[ -n "$existing_stack" && "$existing_stack" != "null" ]]; then
+        mc_log "[$ip] STACK: Already exists → $existing_stack"
       else
-        mc_log "[$ip] STACK: All member claims failed – falling back to single-device claim using Cloud ID ${cloud_id:-unknown}."
-        if [[ -n "$cloud_id" ]]; then
-          if meraki_claim_device "$ip" "$cloud_id" "$net_id"; then
-            claimed=1
-            mc_log "[$ip] STACK: Fallback single-device claim succeeded."
-          else
-            mc_log "[$ip] STACK: Fallback single-device claim also failed."
-          fi
+        mc_log "[$ip] STACK: Creating stack '${stack_name}'..."
+
+        payload=$(jq -n \
+          --arg name "$stack_name" \
+          --argjson serials "$serials_json" '
+          { name: $name, serials: $serials }
+        ')
+
+        resp="$(
+          curl -sS \
+            -X POST "https://api.meraki.com/api/v1/networks/${net_id}/switch/stacks" \
+            -H "X-Cisco-Meraki-API-Key: ${MERAKI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$payload"
+        )"
+
+        mc_log "[$ip] STACK: Stack create response: $resp"
+
+        # Give Meraki time to actually form the stack
+        sleep 10
+      fi
+
+    else
+      mc_log "[$ip] STACK: All member claims failed — falling back to single-device claim using Cloud ID ${cloud_id:-unknown}."
+
+      if [[ -n "$cloud_id" ]]; then
+        if meraki_claim_device "$ip" "$cloud_id" "$net_id"; then
+          claimed=1
+          mc_log "[$ip] STACK: Fallback single-device claim succeeded."
+        else
+          mc_log "[$ip] STACK: Fallback single-device claim also failed."
         fi
       fi
+    fi
 
-    elif [[ -n "$cloud_id" ]]; then
-      mc_log "[$ip] Attempting Dashboard claim using Cloud ID ${cloud_id} into network ${net_id}…"
-      if meraki_claim_device "$ip" "$cloud_id" "$net_id"; then
-        claimed=1
-        mc_log "[$ip] Claim successful (Cloud ID ${cloud_id} into network ${net_id})."
-      else
-        mc_log "[$ip] Claim attempt failed – will retry while polling."
-      fi
+  elif [[ -n "$cloud_id" ]]; then
+    mc_log "[$ip] Attempting Dashboard claim using Cloud ID ${cloud_id} into network ${net_id}…"
+
+    if meraki_claim_device "$ip" "$cloud_id" "$net_id"; then
+      claimed=1
+      mc_log "[$ip] Claim successful (Cloud ID ${cloud_id} into network ${net_id})."
+    else
+      mc_log "[$ip] Claim attempt failed — will retry while polling."
     fi
   fi
+fi
 
-  # If everything is already perfect + claimed, we’re done.
-  if (( fetch_ok && tunnels_ok && reg_ok )); then
-    if (( claimed )) || [[ -z "${MERAKI_API_KEY:-}" ]]; then
-      mc_log "[$ip] All Meraki connect checks passed and device is claimed."
-      mc_log "[$ip] Switch released and under Meraki Dashboard connection control."
-      echo "READY"
-      return 0
-    fi
+# If everything is already perfect + claimed, we’re done.
+if (( fetch_ok && tunnels_ok && reg_ok )); then
+  if (( claimed )) || [[ -z "${MERAKI_API_KEY:-}" ]]; then
+    mc_log "[$ip] All Meraki connect checks passed and device is claimed."
+    mc_log "[$ip] Switch released and under Meraki Dashboard connection control."
+    echo "READY"
+    return 0
   fi
+fi
 
   # ----- Poll loop -----
   local max_polls="${MERAKI_CONNECT_MAX_POLLS:-8}"
