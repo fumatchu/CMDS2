@@ -1,4 +1,3 @@
-[root@cmds .cloud_admin]# more vlan_checker_dialog.sh
 #!/usr/bin/env bash
 # ============================================================
 # CMDS VLAN PIPELINE - FULLSCREEN DIALOG UI (FINAL)
@@ -154,4 +153,3 @@ else
 fi
 
 clear
-[root@cmds .cloud_admin]#
