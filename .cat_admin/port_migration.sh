@@ -1235,6 +1235,53 @@ function expand_vlans(list, p) {
   }
 }
 
+function compress_vlans(vlan_str,    n, arr, tmp, i, start, prev, out) {
+  if (vlan_str == "") return ""
+
+  # Split and normalize
+  n = split(vlan_str, arr, ",")
+
+  # Remove empty + dedupe
+  delete tmp
+  for (i=1; i<=n; i++) {
+    if (arr[i] != "") tmp[arr[i]] = 1
+  }
+
+  # Sort
+  n = 0
+  for (i in tmp) {
+    n++
+    arr[n] = i + 0
+  }
+  asort(arr)
+
+  start = prev = arr[1]
+  out = ""
+
+  for (i=2; i<=n; i++) {
+    if (arr[i] == prev + 1) {
+      prev = arr[i]
+    } else {
+      if (out != "") out = out ","
+      if (start == prev)
+        out = out start
+      else
+        out = out start "-" prev
+
+      start = prev = arr[i]
+    }
+  }
+
+  if (out != "") out = out ","
+  if (start == prev)
+    out = out start
+  else
+    out = out start "-" prev
+
+  return out
+}
+
+
 function flush_if() {
   if (ifname == "") return
 
@@ -1314,7 +1361,8 @@ function flush_if() {
     printf ",\"nativeVlan\":%d", native_vlan
   }
   if (allowed_vlans != "") {
-    printf ",\"allowedVlans\":\"%s\"", allowed_vlans
+  compressed = compress_vlans(allowed_vlans)
+  printf ",\"allowedVlans\":\"%s\"", compressed
   }
   if (portfast) {
     printf ",\"portfast\":true"
@@ -1439,8 +1487,25 @@ in_if {
   if ($1 == "switchport" && $2 == "access" && $3 == "vlan") { access_vlan=$4; next }
   if ($1 == "switchport" && $2 == "voice" && $3 == "vlan") { voice_vlan=$4; next }
   if ($1 == "switchport" && $2 == "trunk" && $3 == "native" && $4 == "vlan") { native_vlan=$5; next }
-  if ($1 == "switchport" && $2 == "trunk" && $3 == "allowed" && $4 == "vlan") { allowed_vlans=$5; next }
+  if ($1 == "switchport" && $2 == "trunk" && $3 == "allowed" && $4 == "vlan") {
+  vlan_str=""
+  for (i=5; i<=NF; i++) {
+    vlan_str = vlan_str (vlan_str ? " " : "") $i
+  }
 
+  # Handle "add" syntax
+  if (vlan_str ~ /^add /) {
+    sub(/^add /, "", vlan_str)
+    if (allowed_vlans == "")
+      allowed_vlans = vlan_str
+    else
+      allowed_vlans = allowed_vlans "," vlan_str
+  } else {
+    allowed_vlans = vlan_str
+  }
+
+  next
+}
   if ($1 == "channel-group") {
     portchannel_id = $2
     if ($3 == "mode" && $4 != "") portchannel_mode = $4
@@ -4164,5 +4229,4 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     apply-diff) apply_port_diff_for_one_switch "$@" ;;
     menu|*)     show_main_menu ;;
   esac
-fi          
-   
+fi

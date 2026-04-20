@@ -31,6 +31,7 @@ SWITCH_MAPPING_OK_FILE="/root/.cat_admin/switch_mapping.ok"
 UPLINK_VALIDATION_OK_FILE="/root/.cat_admin/uplink_validation.ok"
 PORT_MIGRATION_OK_FILE="/root/.cat_admin/port_migration.ok"
 IP_MGMT_MIGRATION_OK_FILE="/root/.cat_admin/ip_management_migration.ok"
+VLAN_CHECK_OK_FILE="/root/.cat_admin/vlan_consistency.ok"
 
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
@@ -40,6 +41,7 @@ declare -A DONE_FILE=(
   ["Uplink Port Validation (Optional but Recommended)"]="$UPLINK_VALIDATION_OK_FILE"
   ["Port Migration"]="$PORT_MIGRATION_OK_FILE"
   ["IP Management Migration"]="$IP_MGMT_MIGRATION_OK_FILE"
+  ["VLAN Consistency Checker (Mandatory)"]="$VLAN_CHECK_OK_FILE"
 )
 
 # Items: label -> script path
@@ -233,55 +235,152 @@ submenu_ios_xe_config_migration() {
     printf '%b%s%b' "$HELP_COLOR_PREFIX" "$1" "$HELP_COLOR_RESET"
   }
 
+  colorize_submenu_help(){
+    local label="$1"
+    local text="$2"
+    local extra=""
+
+    case "$label" in
+      "VLAN Consistency Checker (Mandatory)")
+        [[ -f "$VLAN_CHECK_OK_FILE" || -s "$VLAN_CHECK_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+      "Port Migration")
+        [[ -f "$PORT_MIGRATION_OK_FILE" || -s "$PORT_MIGRATION_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+      "IP Management Migration")
+        [[ -f "$IP_MGMT_MIGRATION_OK_FILE" || -s "$IP_MGMT_MIGRATION_OK_FILE" ]] && extra="  \Z2\Zb(Completed)\Zn"
+        ;;
+    esac
+
+    printf '%b%s%b%b' "$HELP_COLOR_PREFIX" "$text" "$HELP_COLOR_RESET" "$extra"
+  }
+
   while true; do
     local MENU_ITEMS=()
     local -A PATH_BY_TAG=()
     local -A LABEL_BY_TAG=()
     local i=1
 
-    local lbl1="Port Migration"
-    local path1="/root/.cat_admin/port_migration.sh"
-    local desc1="Run the Catalyst-to-Meraki port migration workflow."
-    if is_done "$lbl1"; then
-      lbl1="$lbl1  $MARK_CHECK"
-      desc1="${desc1}  \Z2\Zb(Completed)\Zn"
-    fi
-    MENU_ITEMS+=("$i" "$lbl1" "$(color_help "$desc1")")
-    PATH_BY_TAG["$i"]="$path1"
-    LABEL_BY_TAG["$i"]="Port Migration"
+    # 1️⃣ VLAN CHECK (NEW)
+    local lbl0="VLAN Consistency Checker (Mandatory)"
+    local path0="/root/.cat_admin/vlan_checker_dialog.sh"
+    local shown0="$lbl0"
+    [[ -f "$VLAN_CHECK_OK_FILE" || -s "$VLAN_CHECK_OK_FILE" ]] && shown0="$shown0  $MARK_CHECK"
+
+    MENU_ITEMS+=("$i" "$shown0" "$(colorize_submenu_help "$lbl0" "Validate VLAN consistency before migration")")
+    PATH_BY_TAG["$i"]="$path0"
+    LABEL_BY_TAG["$i"]="$lbl0"
     ((i++))
 
+    # 2️⃣ PORT MIGRATION
+    local lbl1="Port Migration"
+    local path1="/root/.cat_admin/port_migration.sh"
+
+    local shown1="$lbl1"
+    local help1="Run Catalyst → Meraki port migration"
+
+    if [[ -f "$PORT_MIGRATION_OK_FILE" || -s "$PORT_MIGRATION_OK_FILE" ]]; then
+    shown1="$shown1  $MARK_CHECK"
+    fi
+
+    MENU_ITEMS+=("$i" "$shown1" "$(colorize_submenu_help "$lbl1" "$help1")")
+    PATH_BY_TAG["$i"]="$path1"
+    LABEL_BY_TAG["$i"]="$lbl1"
+    ((i++))
+
+    # 3️⃣ IP MANAGEMENT MIGRATION
     local lbl2="IP Management Migration"
     local path2="/root/.cat_admin/per_switch_ip_migration.sh"
-    local desc2="Migrate management IP settings from IOS-XE configs to Meraki management interfaces."
-    if is_done "IP Management Migration"; then
-      lbl2="$lbl2  $MARK_CHECK"
-      desc2="${desc2}  \Z2\Zb(Completed)\Zn"
+
+    local shown2="$lbl2"
+    local help2="${HELP_RAW[$lbl2]:-Migrate management IP settings}"
+
+    if [[ -f "$IP_MGMT_MIGRATION_OK_FILE" || -s "$IP_MGMT_MIGRATION_OK_FILE" ]]; then
+    shown2="$shown2  $MARK_CHECK"
     fi
-    MENU_ITEMS+=("$i" "$lbl2" "$(color_help "$desc2")")
-    PATH_BY_TAG["$i"]="$path2"
-    LABEL_BY_TAG["$i"]="IP Management Migration"
-    ((i++))
+
+MENU_ITEMS+=("$i" "$shown2" "$(colorize_submenu_help "$lbl2" "$help2")")
+PATH_BY_TAG["$i"]="$path2"
+LABEL_BY_TAG["$i"]="$lbl2"
+((i++))
 
     MENU_ITEMS+=("0" "Back" "$(color_help "Return to main menu")")
 
-    local CHOICE
-    CHOICE=$(
+    local CHOICE=$(
       dialog --no-shadow --colors --item-help \
         --backtitle "$BACKTITLE" \
         --title "$SUB_TITLE" \
         --ok-label "OK" \
         --cancel-label "Back" \
-        --menu "Select a migration workflow:" 15 88 8 \
+        --menu "Select a migration workflow:" 17 92 10 \
         "${MENU_ITEMS[@]}" \
         3>&1 1>&2 2>&3
     ) || return 0
 
     [[ "$CHOICE" == "0" ]] && return 0
-    run_target "${PATH_BY_TAG[$CHOICE]}" "${LABEL_BY_TAG[$CHOICE]}"
+
+    local script="${PATH_BY_TAG[$CHOICE]}"
+    local label="${LABEL_BY_TAG[$CHOICE]}"
+
+    #ENFORCEMENT (same as cloud)
+    if [[ "$label" == "Port Migration" && ! -f "$VLAN_CHECK_OK_FILE" ]]; then
+      dialog --no-shadow \
+        --backtitle "$BACKTITLE" \
+        --title "Validation Required" \
+        --msgbox "You must run VLAN Consistency Checker first." 8 62
+      continue
+    fi
+
+    clear
+    if [[ -n "$script" && -f "$script" ]]; then
+      set +e
+      bash "$script"
+      local rc=$?
+      set -e
+
+      # VLAN marker
+      if [[ "$label" == "VLAN Consistency Checker (Mandatory)" ]]; then
+        [[ $rc -eq 0 ]] && : > "$VLAN_CHECK_OK_FILE" || rm -f "$VLAN_CHECK_OK_FILE"
+      fi
+
+      # Port marker
+      # Port marker (treat dialog exits as success)
+if [[ "$label" == "Port Migration" ]]; then
+  case "$rc" in
+    0|1|255|130|143)
+      : > "$PORT_MIGRATION_OK_FILE"
+      ;;
+    *)
+      rm -f "$PORT_MIGRATION_OK_FILE"
+      ;;
+  esac
+fi
+
+      # IP marker
+      # IP marker (treat dialog exits as success)
+if [[ "$label" == "IP Management Migration" ]]; then
+  case "$rc" in
+    0|1|255|130|143)
+      : > "$IP_MGMT_MIGRATION_OK_FILE"
+      ;;
+    *)
+      rm -f "$IP_MGMT_MIGRATION_OK_FILE"
+      ;;
+  esac
+fi
+
+      case "$rc" in
+        0) ;;
+        1|255|130|143) ;;
+        *) dialog --no-shadow --backtitle "$BACKTITLE" --title "$label" \
+             --msgbox "Script exited with status $rc.\n\n$script" 8 78 ;;
+      esac
+    else
+      dialog --no-shadow --backtitle "$BACKTITLE" --title "Not Found" \
+        --msgbox "Cannot find:\n${script:-<none>}" 7 60
+    fi
   done
 }
-
 # ---------- Utilities submenu ----------
 submenu_utilities() {
   local SUB_TITLE="Utilities"
