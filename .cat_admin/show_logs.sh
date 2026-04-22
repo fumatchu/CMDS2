@@ -670,13 +670,17 @@ port_migration_menu(){
 # Management IP Migration viewer (runs/mgmt_ip/mgmtip-*)
 # ---------------------------------------------------------------------------
 mgmtip_epoch_from_id(){
-  local mid="$1"; mid="${mid#mgmtip-}"
-  date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
+  local mid="$1"
+  mid="${mid#mgmtip-}"
+
+  date -d "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s 2>/dev/null || echo 0
 }
+
 mgmtip_local_from_id(){
-  local mid="$1"; mid="${mid#mgmtip-}"
-  date -d "@$(date -ud "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" +%s)" \
-       '+%F %T %Z' 2>/dev/null || echo "$mid"
+  local mid="$1"
+  mid="${mid#mgmtip-}"
+
+  date -d "${mid:0:4}-${mid:4:2}-${mid:6:2} ${mid:8:2}:${mid:10:2}:${mid:12:2}" '+%F %T %Z' 2>/dev/null || echo "$mid"
 }
 
 show_mgmtip_run_menu(){
@@ -687,32 +691,112 @@ show_mgmtip_run_menu(){
   local report="$rdir/report.json"
   local stats="$rdir/stats.env"
   local swidx="$rdir/switch_index.tsv"
-  local grpidx="$rdir/group_index.tsv"
 
   while true; do
     local menu=()
 
-    [[ -s "$actions" ]] && menu+=("act"  "actions.log")
-    [[ -s "$report"  ]] && menu+=("rep"  "report.json")
-    [[ -s "$items"   ]] && menu+=("it"   "items.jsonl")
-    [[ -s "$stats"   ]] && menu+=("st"   "stats.env")
+    # ---- Core files ----
+    [[ -s "$actions" ]] && menu+=("act"  "actions.log (timeline)")
+    [[ -s "$report"  ]] && menu+=("rep"  "report.json (summary)")
+    [[ -s "$items"   ]] && menu+=("it"   "items.jsonl (per-device)")
+    [[ -s "$stats"   ]] && menu+=("st"   "stats.env (counts)")
     [[ -s "$swidx"   ]] && menu+=("sw"   "switch_index.tsv")
-    [[ -s "$grpidx"  ]] && menu+=("gr"   "group_index.tsv")
+
+    # ---- Dynamic: curl outputs ----
+    mapfile -t CURL_FILES < <(ls -1 "$rdir"/curl_*.out 2>/dev/null || true)
+    if ((${#CURL_FILES[@]} > 0)); then
+      menu+=("curl" "Meraki API responses (curl_*.out)")
+    fi
+
+    # ---- Dynamic: DHCP cutover logs ----
+    mapfile -t DHCP_FILES < <(ls -1 "$rdir"/source_dhcp_*.out 2>/dev/null || true)
+    if ((${#DHCP_FILES[@]} > 0)); then
+      menu+=("dhcp" "Source DHCP cutover logs")
+    fi
+
+    # ---- Catch-all ----
+    mapfile -t OTHER_FILES < <(
+      find "$rdir" -maxdepth 1 -type f \
+        ! -name "actions.log" \
+        ! -name "items.jsonl" \
+        ! -name "report.json" \
+        ! -name "stats.env" \
+        ! -name "switch_index.tsv" \
+        ! -name "curl_*.out" \
+        ! -name "source_dhcp_*.out" \
+        2>/dev/null || true
+    )
+    if ((${#OTHER_FILES[@]} > 0)); then
+      menu+=("other" "Other files")
+    fi
 
     menu+=("path" "Show run folder path")
     menu+=("back" "Back")
 
-    dlg --title "$title" --menu "Choose what to view" 20 100 12 "${menu[@]}"
+    dlg --title "$title" --menu "Choose what to view" 22 110 14 "${menu[@]}"
     local rc=$DIALOG_RC
     [[ $rc -ne 0 ]] && return
 
     case "$DOUT" in
-      act)  view_file "$actions" "actions.log" ;;
-      rep)  view_file "$report"  "report.json" ;;
-      it)   view_file "$items"   "items.jsonl" ;;
-      st)   view_file "$stats"   "stats.env" ;;
-      sw)   view_file "$swidx"   "switch_index.tsv" ;;
-      gr)   view_file "$grpidx"  "group_index.tsv" ;;
+      act) view_file "$actions" "actions.log" ;;
+      rep) view_file "$report"  "report.json" ;;
+      it)  view_file "$items"   "items.jsonl" ;;
+      st)  view_file "$stats"   "stats.env" ;;
+      sw)  view_file "$swidx"   "switch_index.tsv" ;;
+
+      curl)
+        local items2=() pick_paths=()
+        build_short_file_menu CURL_FILES items2 pick_paths
+        dlg --title "Meraki API Responses" --menu "Select a file" 22 110 14 "${items2[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
+        ;;
+
+      dhcp)
+        if ((${#DHCP_FILES[@]}==0)); then
+          dlg --title "DHCP logs" --msgbox "No DHCP logs found." 7 60
+          continue
+        fi
+
+        local items2=() pick_paths=()
+        build_short_file_menu DHCP_FILES items2 pick_paths
+
+        dlg --title "DHCP Cutover Logs" --menu "Select a device log" 22 110 14 "${items2[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] || continue
+
+          local tmp; tmp="$(mktemp)"
+
+          # ---- FILTER THE NOISE ----
+          awk '
+            !/terminal length 0/ &&
+            !/StrictHostKeyChecking/ &&
+            !/Warning: Permanently added/ &&
+            !/client_loop:/ &&
+            !/Broken pipe/ &&
+            !/^$/ {
+              print
+            }
+          ' "$pick" > "$tmp"
+
+          dlg --title "$(basename "$pick") (cleaned)" --textbox "$tmp" 0 0
+          rm -f "$tmp"
+        fi
+        ;;
+
+      other)
+        local items2=() pick_paths=()
+        build_short_file_menu OTHER_FILES items2 pick_paths
+        dlg --title "Other Files" --menu "Select a file" 22 110 14 "${items2[@]}"
+        if (( DIALOG_RC == 0 )); then
+          local pick="${pick_paths[$DOUT]:-}"
+          [[ -n "$pick" ]] && view_file "$pick" "$(basename "$pick")"
+        fi
+        ;;
+
       path) dlg --title "Run path" --msgbox "$rdir" 7 80 ;;
       back) return ;;
     esac

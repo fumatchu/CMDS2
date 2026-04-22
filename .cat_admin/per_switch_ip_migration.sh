@@ -50,6 +50,35 @@ LATEST_LINK="${RUNS_ROOT}/latest"
 SWITCH_INDEX_TSV="${RUN_DIR}/switch_index.tsv"
 
 MGMT_VLAN_ID=""
+SOURCE_TO_DHCP_AFTER_VERIFY=0
+
+###############################################################################
+# Legacy crypto policy handling (same as setup wizard)
+###############################################################################
+DEFAULT_CRYPTO_POLICY="DEFAULT"
+CRYPTO_MODULE_DIR="/etc/crypto-policies/policies/modules"
+CRYPTO_MODULE_FILE="$CRYPTO_MODULE_DIR/RSA-OPENSSH-1024.pmod"
+LEGACY_CRYPTO_POLICY="LEGACY:RSA-OPENSSH-1024"
+
+restore_crypto_policy() {
+  update-crypto-policies --set "$DEFAULT_CRYPTO_POLICY" >/dev/null 2>&1 || true
+}
+
+ensure_legacy_crypto_policy() {
+  mkdir -p "$CRYPTO_MODULE_DIR" || return 1
+
+  if [ ! -f "$CRYPTO_MODULE_FILE" ]; then
+    cat >"$CRYPTO_MODULE_FILE" <<'EOF'
+min_rsa_size@openssh = 1024
+EOF
+    chmod 644 "$CRYPTO_MODULE_FILE" || true
+  fi
+
+  update-crypto-policies --set "$LEGACY_CRYPTO_POLICY" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+trap 'restore_crypto_policy' EXIT
 
 # ----------------------------
 # dialog helpers
@@ -129,6 +158,8 @@ load_discovery_env() {
   : "${MERAKI_API_KEY:=}"
   : "${DNS_PRIMARY:=}"
   : "${DNS_SECONDARY:=}"
+  : "${SSH_USERNAME:=}"
+  : "${SSH_PASSWORD:=}"
 
   [[ -n "$MERAKI_API_KEY" ]] || die "MERAKI_API_KEY missing in meraki_discovery.env"
 }
@@ -234,6 +265,145 @@ parse_default_route_nexthop_from_cfg() {
   local cfg="$1"
   awk '$1=="ip" && $2=="route" && $3=="0.0.0.0" && $4=="0.0.0.0" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $5; exit }' "$cfg"
 }
+prompt_for_source_dhcp_cutover() {
+  if "$DIALOG" --backtitle "$BACKTITLE" --title "$TITLE" \
+      --yesno "After the Meraki management IP is successfully verified,\nwould you like this tool to convert the SOURCE Catalyst switch\nmanagement SVI to DHCP as well?\n\nThis helps avoid duplicate IP conflicts.\n\nChoose:\n  Yes = after Meraki is verified, source Catalyst Vlan${MGMT_VLAN_ID} will be changed to DHCP\n  No  = Meraki will be updated, but source Catalyst will be left unchanged" \
+      16 78; then
+    SOURCE_TO_DHCP_AFTER_VERIFY=1
+    log "Operator selected: YES - convert source Catalyst SVI to DHCP after Meraki verification."
+  else
+    SOURCE_TO_DHCP_AFTER_VERIFY=0
+    log "Operator selected: NO - leave source Catalyst SVI unchanged after Meraki verification."
+  fi
+}
+check_eem_support() {
+  local switch_ip="$1"
+
+  sshpass -p "$SSH_PASSWORD" \
+    ssh -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        -o PreferredAuthentications=password,keyboard-interactive \
+        -o KbdInteractiveAuthentication=yes \
+        -o PubkeyAuthentication=no \
+        -o HostKeyAlgorithms=+ssh-rsa \
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+        "${SSH_USERNAME}@${switch_ip}" \
+        "show event manager version" 2>/dev/null | grep -qi "Embedded Event Manager"
+}
+
+source_switch_set_vlan_dhcp() {
+  local switch_ip="$1"
+  local vlan_id="$2"
+
+  [[ -n "${SSH_USERNAME:-}" ]] || { log "SOURCE_DHCP: SSH_USERNAME missing"; return 1; }
+  [[ -n "${SSH_PASSWORD:-}" ]] || { log "SOURCE_DHCP: SSH_PASSWORD missing"; return 1; }
+
+  local out_file="${RUN_DIR}/source_dhcp_${switch_ip}.out"
+  local rc=0
+
+  log "SOURCE_DHCP: starting DHCP cutover for $switch_ip Vlan${vlan_id}"
+
+  #############################################################
+  # Step 1: Detect EEM support
+  #############################################################
+  local use_eem=0
+
+  if check_eem_support "$switch_ip"; then
+    use_eem=1
+    log "SOURCE_DHCP: EEM detected on $switch_ip — will use post-cutover auto-save"
+  else
+    use_eem=0
+    log "SOURCE_DHCP: EEM NOT supported on $switch_ip — falling back to pre-save method"
+  fi
+
+  #############################################################
+  # Step 2: Execute config (ALL RAW OUTPUT → out_file ONLY)
+  #############################################################
+
+  if (( use_eem == 1 )); then
+    sshpass -p "$SSH_PASSWORD" \
+      ssh -tt -o StrictHostKeyChecking=accept-new \
+          -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=20 \
+          -o PreferredAuthentications=password,keyboard-interactive \
+          -o KbdInteractiveAuthentication=yes \
+          -o PubkeyAuthentication=no \
+          -o HostKeyAlgorithms=+ssh-rsa \
+          -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+          "${SSH_USERNAME}@${switch_ip}" >"$out_file" 2>&1 <<EOF || rc=$?
+terminal length 0
+conf t
+event manager applet CMDS_SAVE
+ event timer countdown time 10
+ action 1.0 cli command "enable"
+ action 1.1 cli command "write memory"
+ action 1.2 cli command "no event manager applet CMDS_SAVE"
+ action 1.3 syslog msg "CMDS: Config saved after DHCP cutover"
+!
+interface Vlan${vlan_id}
+ ip address dhcp
+EOF
+
+  else
+    sshpass -p "$SSH_PASSWORD" \
+      ssh -tt -o StrictHostKeyChecking=accept-new \
+          -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=20 \
+          -o PreferredAuthentications=password,keyboard-interactive \
+          -o KbdInteractiveAuthentication=yes \
+          -o PubkeyAuthentication=no \
+          -o HostKeyAlgorithms=+ssh-rsa \
+          -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+          "${SSH_USERNAME}@${switch_ip}" >"$out_file" 2>&1 <<EOF || rc=$?
+terminal length 0
+write memory
+conf t
+interface Vlan${vlan_id}
+ ip address dhcp
+EOF
+  fi
+
+  #############################################################
+  # Step 3: Evaluate result (CLEAN LOGGING ONLY)
+  #############################################################
+
+  # Expected disconnect case (this is SUCCESS)
+  if (( rc != 0 )); then
+    if grep -q "interface Vlan${vlan_id}" "$out_file"; then
+      log "SOURCE_DHCP: SUCCESS (expected disconnect) for $switch_ip Vlan${vlan_id}"
+
+      if (( use_eem == 1 )); then
+        log "SOURCE_DHCP: EEM will save config shortly on $switch_ip"
+      else
+        log "SOURCE_DHCP: Config saved BEFORE cutover (fallback mode)"
+      fi
+
+      log "SOURCE_DHCP: raw session saved to $(basename "$out_file")"
+      return 0
+    fi
+
+    log "SOURCE_DHCP: FAILURE — disconnect occurred before config applied (rc=$rc)"
+    log "SOURCE_DHCP: raw session saved to $(basename "$out_file")"
+    return 1
+  fi
+
+  #############################################################
+  # Step 4: Rare case — no disconnect (still success)
+  #############################################################
+
+  log "SOURCE_DHCP: SUCCESS (no disconnect observed) for $switch_ip Vlan${vlan_id}"
+
+  if (( use_eem == 1 )); then
+    log "SOURCE_DHCP: EEM will handle config save"
+  else
+    log "SOURCE_DHCP: Config saved BEFORE cutover"
+  fi
+
+  log "SOURCE_DHCP: raw session saved to $(basename "$out_file")"
+  return 0
+}
+
 
 # ----------------------------
 # meraki_switch_map.json: map mgmt IP -> cloud_id(s)
@@ -601,10 +771,10 @@ want=[]
 if d1: want.append(d1)
 if d2 and d2 != d1: want.append(d2)
 
-if set(dns) != set(want):
-  sys.exit(1)
-
-sys.exit(0)
+#Only enforce DNS match IF we actually provided DNS
+if want:
+  if set(dns) != set(want):
+    sys.exit(1)
 PY
 }
 
@@ -829,12 +999,17 @@ PY
 
       echo "XXX"; echo "$((base + span*75/100 + 1))"; echo "[$idx/$total] Checking if Meraki already matches"; echo "XXX"
 
-      local any_updated=0 any_error=0 any_skipped=0
+            local any_updated=0 any_error=0 any_skipped=0
+      local all_verified=1
+      local had_targets=0
+
       while IFS= read -r cid; do
         [[ -n "$cid" ]] || continue
+        had_targets=1
 
         local cur_json=""
         cur_json="$(meraki_get_mgmt_interface "$cid")"
+
         if [[ -n "$cur_json" ]] && meraki_already_has_static "$cur_json" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2"; then
           log "SKIP: Meraki already set (no change) for $cid"
           any_skipped=1
@@ -847,22 +1022,42 @@ PY
           continue
         fi
 
-        echo "XXX"; echo "$((base + span*90/100 + 1))"; echo "[$idx/$total] Updating Meraki management interface"; echo "XXX"
+        echo "XXX"; echo "$((base + span*85/100 + 1))"; echo "[$idx/$total] Updating Meraki management interface"; echo "XXX"
         local http_code
         http_code="$(meraki_update_mgmt_static "$cid" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2")"
+
         if [[ "$http_code" == "200" ]]; then
           log "OK: Meraki updated managementInterface to STATIC for $cid ($ip -> $mgmt_ip)"
-          any_updated=1
-          python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
+
+          local verify_json=""
+          verify_json="$(meraki_get_mgmt_interface "$cid")"
+
+          if [[ -n "$verify_json" ]] && meraki_already_has_static "$verify_json" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2"; then
+            log "VERIFY: Meraki managementInterface confirmed for $cid"
+            any_updated=1
+            python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
 import json,sys
 ip,cid,cfg,mip,mask,gw,d1,d2,code=sys.argv[1:10]
-print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"UPDATED_STATIC",
+print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"UPDATED_STATIC_VERIFIED",
                   "mgmt_ip":mip,"mask":mask,"gateway":gw,"dns":[x for x in [d1,d2] if x],
                   "http_code":int(code)}))
 PY
+          else
+            log "ERROR: Meraki update returned 200 but verification FAILED for $cid"
+            any_error=1
+            all_verified=0
+            python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
+import json,sys
+ip,cid,cfg,mip,mask,gw,d1,d2,code=sys.argv[1:10]
+print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"ERROR_VERIFY_AFTER_UPDATE",
+                  "mgmt_ip":mip,"mask":mask,"gateway":gw,"dns":[x for x in [d1,d2] if x],
+                  "http_code":int(code)}))
+PY
+          fi
         else
           log "ERROR: Meraki update failed for $cid (HTTP $http_code). Response saved to curl_${cid}.out"
           any_error=1
+          all_verified=0
           python3 - "$ip" "$cid" "$cfg" "$mgmt_ip" "$mgmt_mask" "$gw" "$dns1" "$dns2" "$http_code" <<'PY' >>"$items_json"
 import json,sys
 ip,cid,cfg,mip,mask,gw,d1,d2,code=sys.argv[1:10]
@@ -875,6 +1070,40 @@ print(json.dumps({"ip":ip,"cloud_id":cid,"cfg":cfg,"action":"ERROR_MERAKI_UPDATE
 PY
         fi
       done <<<"$cloud_list"
+
+      if [[ $had_targets -eq 0 ]]; then
+        all_verified=0
+      fi
+
+      # Optional source Catalyst DHCP cutover only AFTER Meraki verification succeeded
+      if [[ $SOURCE_TO_DHCP_AFTER_VERIFY -eq 1 ]]; then
+        if [[ $all_verified -eq 1 && $any_error -eq 0 ]]; then
+          echo "XXX"; echo "$((base + span*95/100 + 1))"; echo "[$idx/$total] Converting source Catalyst Vlan${MGMT_VLAN_ID} to DHCP"; echo "XXX"
+
+          if source_switch_set_vlan_dhcp "$ip" "$MGMT_VLAN_ID"; then
+            python3 - "$ip" "$cfg" "$MGMT_VLAN_ID" <<'PY' >>"$items_json"
+import json,sys
+ip,cfg,vid=sys.argv[1:4]
+print(json.dumps({"ip":ip,"cfg":cfg,"action":"SOURCE_SWITCH_SET_TO_DHCP","vlan_id":int(vid)}))
+PY
+          else
+            log "ERROR: Failed converting source Catalyst $ip Vlan${MGMT_VLAN_ID} to DHCP after Meraki verification"
+            any_error=1
+            python3 - "$ip" "$cfg" "$MGMT_VLAN_ID" <<'PY' >>"$items_json"
+import json,sys
+ip,cfg,vid=sys.argv[1:4]
+print(json.dumps({"ip":ip,"cfg":cfg,"action":"ERROR_SOURCE_SWITCH_DHCP","vlan_id":int(vid)}))
+PY
+          fi
+        else
+          log "SAFEGUARD: Source Catalyst NOT changed to DHCP because Meraki verification did not fully pass for $ip"
+          python3 - "$ip" "$cfg" "$MGMT_VLAN_ID" <<'PY' >>"$items_json"
+import json,sys
+ip,cfg,vid=sys.argv[1:4]
+print(json.dumps({"ip":ip,"cfg":cfg,"action":"SKIPPED_SOURCE_SWITCH_DHCP_NOT_VERIFIED","vlan_id":int(vid)}))
+PY
+        fi
+      fi
 
       if [[ $any_error -eq 1 ]]; then
         python3 - "$stats_file" <<'PY'
@@ -971,8 +1200,13 @@ main() {
   : >"$LOG_FILE"
   ln -sfn "$RUN_DIR" "$LATEST_LINK" || true
 
+  if ! ensure_legacy_crypto_policy; then
+  die "Failed to enable legacy crypto policy (required for older Catalyst switches)"
+  fi
+
   load_discovery_env
   prompt_for_mgmt_vlan
+  prompt_for_source_dhcp_cutover
 
   [[ -f "$SELECTED_UPGRADE_ENV" ]] || die "Missing ${SELECTED_UPGRADE_ENV} (run the upgrade selection step first)."
   [[ -f "$SELECTED_UPGRADE_JSON" ]] || die "Missing ${SELECTED_UPGRADE_JSON}"
