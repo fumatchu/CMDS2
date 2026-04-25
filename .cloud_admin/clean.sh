@@ -37,14 +37,7 @@ $(readlink -f "$TARGET_DIR")" 11 76
 fi
 
 dialog --no-shadow --title "Prepare for next migration" --yesno \
-"This will clean up CMDS migration and preflight artifacts in:
-
-$(readlink -f "$TARGET_DIR")
-
-• Remove previous migration result/working files
-• Remove Meraki claim log symlink (if present)
-• Remove ALL .ok state files
-• Free up space and reset state
+"This will clean up CMDS migration and preflight artifacts
 
 Use this when you are finished with one batch of switches
 and want to prepare the system for the NEXT migration.
@@ -133,9 +126,6 @@ hr() {
 
 dialog --no-shadow --title "Configuration cleanup complete" --msgbox \
 "Cleanup finished successfully.
-
-Stale migration/preflight artifacts removed: $deleted
-Approximate space reclaimed: $(hr "$freed")
 
 System is now ready for the NEXT set of switches.
 

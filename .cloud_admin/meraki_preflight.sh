@@ -860,7 +860,7 @@ meraki_preflight(){
 
   if (( DIALOG )); then
     # Main summary dialog (unchanged except for mgmt-only line)
-    dlg --title "Preflight complete" --msgbox \
+dlg --title "Preflight complete" --msgbox \
 "Scanned: ${scanned}
 Ready:   ${ready_count}
 
@@ -870,21 +870,14 @@ Auto-fixes applied:
   HTTP client source-if set:  ${http_changed}
 
 Meraki reachability failures (ping dashboard.meraki.com): ${meraki_ping_fail}
-Devices using dedicated Management interface for Internet (i.e gi0/0 – NOT supported): ${mgmt_only_count}
-
-Outputs:
-  ${RUN_DIR}
-  ${RUN_ROOT}/latest.csv" 20 88
+Devices using dedicated Management interface for Internet (gi0/0 NOT supported): ${mgmt_only_count}" 18 100
 
     # Second dialog: pass/fail statement for the user
     if (( overall_ok )); then
       dlg --title "Preflight status" --msgbox \
 "All ${scanned} selected switches passed preflight checks.
 
-A preflight OK flag has been written in:
-  ${PREFLIGHT_OK_FLAG}
-
-You may proceed to the Meraki onboarding step." 12 78
+You may proceed to the Meraki onboarding step." 10 70
     else
       dlg --title "Preflight status" --msgbox \
 "Preflight completed, but NOT all switches are ready.

@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Euo pipefail
 
@@ -388,8 +387,6 @@ cloud_migration_select_switches() {
       printf "  - %-16s %-24s %-12s %-16s\n" "$sel" "$h" "$p" "$s"
     done
     echo
-    echo "Run directory:"
-    echo "  $RUN_DIR"
   } >"$SUMMARY_TXT"
 
   local LATEST_ENV="$RUN_ROOT/latest.env"
@@ -1498,8 +1495,6 @@ review the Meraki Dashboard and the log file for details."
     echo "Meraki mapping summary for this migration run"
     echo "============================================"
     echo
-    echo "Run ID:    $RUN_ID"
-    echo "Run dir:   $RUN_DIR"
     echo
     echo "Organization:"
     echo "  $ORG_NAME ($ORG_ID)"
@@ -1533,10 +1528,6 @@ review the Meraki Dashboard and the log file for details."
       printf "  %s (%s): %s\n" "$nname2" "$nid" "${NET_ADDR[$nid]:-<none>}"
     done
     echo
-    echo "Files written:"
-    echo "  Per-run mapping JSON:  $MAP_RUN_JSON"
-    echo "  Global map JSON:       $MAP_JSON"
-    echo "  Global map ENV:        $MAP_ENV"
   } >"$MAP_RUN_TXT"
 
   dlg --backtitle "$BACKTITLE_M" \
@@ -2737,18 +2728,19 @@ cloud_migration_enable_meraki_connect() {
   MERAKI_API_KEY="$(printf '%s' "$MERAKI_API_KEY" | tr -d '\r' | awk '{$1=$1;print}')"
 
   # ---------- Summary file ----------
-  local SUMMARY_TXT="$RUN_DIR/meraki_connect_summary.txt"
-  : >"$SUMMARY_TXT"
-  {
-    echo "Meraki connect onboarding summary for this migration run"
-    echo "========================================================"
-    echo
-    echo "Run ID:  $RUN_ID"
-    echo "Run dir: $RUN_DIR"
-    echo
-    printf "%-16s %-16s %-18s\n" "IP" "SSH" "Final status"
-    printf "%-16s %-16s %-18s\n" "----------------" "----------------" "------------------"
-  } >>"$SUMMARY_TXT"
+local SUMMARY_TXT="$RUN_DIR/meraki_connect_summary.txt"
+: >"$SUMMARY_TXT"
+{
+  echo "Meraki connect onboarding summary for this migration run"
+  echo "========================================================"
+  echo
+  echo "*Note: If an SSH failure is reported,"
+  echo " the switch may have disconnected before the poller could verify status."
+  echo " This can occur when the Meraki Dashboard has already taken control and begun the conversion process (e.g., flash wipe)."
+  echo
+  printf "%-16s %-16s %-18s\n" "IP" "SSH" "Final status"
+  printf "%-16s %-16s %-18s\n" "----------------" "----------------" "------------------"
+} >>"$SUMMARY_TXT"
 
   # ---------- Split-screen UI ----------
   MC_STATUS_FILE="$RUN_DIR/meraki_connect_status.log"

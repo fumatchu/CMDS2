@@ -966,7 +966,7 @@ PY
   errors="$(python3 -c "import json;print(json.load(open('$REPORT_JSON'))['errors'])" 2>/dev/null || echo 0)"
 
   "$DIALOG" --backtitle "$BACKTITLE" --title "$TITLE" --msgbox \
-"Completed: ${RUN_ID}\n\nUpdated to STATIC in Meraki: ${updated}\nDHCP (no change): ${dhcp}\nSkipped: ${skipped}\nErrors: ${errors}" \
+"Completed:\n\nUpdated to STATIC in Meraki: ${updated}\nDHCP (no change): ${dhcp}\nSkipped: ${skipped}\nErrors: ${errors}" \
 12 70 || true
 }
 

@@ -682,16 +682,15 @@ dlg --clear --backtitle "$BACKTITLE" --title "Welcome — Discovery & Preflight"
 
 This will guide you through:
   1) Choose how to provide targets (scan CIDR or manual list)
-  2) Provide targets (networks/IPs)
-  3) Enter SSH credentials and verify login
-  4) Verify your account lands in privileged EXEC (#) by default (required)
-  5) Capture and verify the device ENABLE password
-  6) Paste your Meraki Dashboard API key
-  7) Enter DNS fallback resolvers (2) and validate reachability
-  8) Provide VLAN SVI for 'ip http client source-interface Vlan<N>'
-  9) Select IOS XE firmware image(s) (MULTI-select supported)
- 10) Set the minimum IOS XE version required for hybrid onboarding
- 11) Save all choices to ${ENV_FILE} and show a summary
+  2) Enter SSH credentials and verify login
+  3) Verify your account lands in privileged EXEC (#) by default (required)
+  4) Capture and verify the device ENABLE password
+  5) Paste your Meraki Dashboard API key
+  6) Enter DNS fallback resolvers (2) and validate reachability
+  7) Provide VLAN SVI for 'ip http client source-interface Vlan<N>'
+   →  Must have internet access
+  8) Select IOS XE firmware image(s) (MULTI-select supported)
+  9) Set the minimum IOS XE version required for onboarding
 
 Have these ready:
   • Target networks/IPs
@@ -699,8 +698,8 @@ Have these ready:
   • ENABLE password (required; used later for Meraki claim)
   • Meraki Dashboard API key
   • Two DNS server IPs (fallbacks)
-  • VLAN ID (1–4094) for HTTP client source-interface
-  • Firmware file(s) in ${FIRMWARE_DIR} or upload to ${COCKPIT_UPLOAD_DIR}" \
+  • VLAN ID (1–4094) for HTTP client source-interface (Should be your Management VLAN)
+  • Firmware file(s) available for upload to the server" \
   "$WELCOME_H" "$WELCOME_W"
 
 ###############################################################################
@@ -930,6 +929,41 @@ Do you want to try entering the ENABLE password again?" 10 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
 done
 
+
+test_meraki_api_key() {
+  key="$1"
+
+  resp="$(curl -sS \
+    -H "Authorization: Bearer $key" \
+    -H "Content-Type: application/json" \
+    --connect-timeout 5 \
+    --max-time 10 \
+    https://api.meraki.com/api/v1/organizations 2>/dev/null)"
+
+  rc=$?
+
+  # curl failed (network/DNS/etc)
+  if [ $rc -ne 0 ] || [ -z "$resp" ]; then
+    echo "CURL_FAIL"
+    return
+  fi
+
+  # invalid key usually returns JSON with errors
+  if printf '%s' "$resp" | grep -qi '"errors"'; then
+    echo "API_FAIL"
+    return
+  fi
+
+  # success = array of orgs
+  org_count="$(printf '%s' "$resp" | jq 'length' 2>/dev/null)"
+
+  if [ -n "$org_count" ] && [ "$org_count" -ge 0 ]; then
+    echo "OK:$org_count"
+    return
+  fi
+
+  echo "UNKNOWN"
+}
 ###############################################################################
 # 3b) MERAKI API KEY
 ###############################################################################
@@ -937,12 +971,65 @@ while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox \
 "Paste your Meraki Dashboard API key:" 8 "$W_DEF"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
-  MERAKI_API_KEY="$(trim "${DOUT:-}")"
-  [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
-  printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$' >/dev/null 2>&1 && break
-  dlg --yesno "The key format looks unusual.\nUse it anyway?" 9 "$W_DEF"; [ $? -eq 0 ] && break
-done
 
+  MERAKI_API_KEY="$(trim "${DOUT:-}")"
+
+  [ -n "$MERAKI_API_KEY" ] || {
+    dlg --msgbox "API key cannot be empty." 7 "$W_DEF"
+    continue
+  }
+
+  dlg --backtitle "$BACKTITLE" --title "Validating API Key" \
+      --infobox "Testing connectivity to Meraki Dashboard…" 5 "$W_DEF"
+  sleep 1
+
+  result="$(test_meraki_api_key "$MERAKI_API_KEY")"
+
+  case "$result" in
+    OK:*)
+      orgs="${result#OK:}"
+      dlg --backtitle "$BACKTITLE" --title "API Key Valid" --msgbox \
+"Success!
+
+Connected to Meraki Dashboard.
+Organizations found: $orgs
+
+API key is valid and working." 10 "$W_DEF"
+      break
+      ;;
+
+    API_FAIL)
+      dlg --backtitle "$BACKTITLE" --title "Invalid API Key" --yesno \
+"The API key was rejected by Meraki.
+
+Would you like to re-enter it?" 9 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      ;;
+
+    CURL_FAIL)
+      dlg --backtitle "$BACKTITLE" --title "Connection Failed" --yesno \
+"Could not reach Meraki API.
+
+Possible issues:
+  • No internet connectivity
+  • DNS not working yet
+  • Firewall blocking outbound HTTPS
+
+Re-enter API key anyway?" 12 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      break
+      ;;
+
+    *)
+      dlg --backtitle "$BACKTITLE" --title "Unknown Response" --yesno \
+"Unexpected response from Meraki API.
+
+Continue anyway?" 9 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      break
+      ;;
+  esac
+done
 ###############################################################################
 # 3c) DNS — REQUIRED
 ###############################################################################
@@ -969,12 +1056,12 @@ HTTP_CLIENT_VLAN_ID=""
 HTTP_CLIENT_SOURCE_IFACE=""
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "HTTP Client Source SVI (required)" \
-      --inputbox "Enter the VLAN SVI number of the current Management interface.
+      --inputbox "Enter the Management VLAN ID.
 
-This should match the SVI the switch is currently using for management.
-(We can migrate static IP addressing later if needed.)
+Use the VLAN currently assigned to the switch’s management SVI.
+This VLAN MUST have internet access.
 
-We will bind the following command to this interface:
+Command applied:
   ip http client source-interface Vlan<N>
 
 Examples: 10, 20, 4094" 16 78 "$HTTP_CLIENT_VLAN_ID"

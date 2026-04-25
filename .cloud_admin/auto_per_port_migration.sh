@@ -3282,7 +3282,7 @@ apply_ports_from_diff() {
 Success:  $ok_count port(s)\n\
 Warnings: $warn_count port(s)\n\
 Failed:   $fail_count port(s)\n\n\
-See log file for details:\n  $apply_log"
+"
 
     "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
             --title "Port apply results" \
