@@ -33,6 +33,40 @@ need dialog; need python3; need ssh; need sshpass; need timeout; need expect; ne
 log() { [ "${DEBUG:-0}" = "1" ] && printf '[%s] %s\n' "$(date -u '+%F %T')" "$*" >>"$DEBUG_LOG"; }
 trim() { printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
+test_meraki_api_key() {
+  local key="$1"
+  local resp
+
+  resp="$(curl -sS \
+    -H "X-Cisco-Meraki-API-Key: $key" \
+    -H "Content-Type: application/json" \
+    --connect-timeout 10 \
+    --max-time 15 \
+    https://api.meraki.com/api/v1/organizations 2>/dev/null)"
+
+  # Curl failure (network/DNS/etc)
+  if [ $? -ne 0 ] || [ -z "$resp" ]; then
+    echo "CURL_FAIL"
+    return
+  fi
+
+  # API returned error (invalid key, etc)
+  if echo "$resp" | jq -e '.errors' >/dev/null 2>&1; then
+    echo "API_FAIL"
+    return
+  fi
+
+  # Count orgs
+  local count
+  count="$(echo "$resp" | jq 'length' 2>/dev/null)"
+
+  if [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo "OK:$count"
+  else
+    echo "API_FAIL"
+  fi
+}
+
 dlg() {
   _tmp="$(mktemp)"
   dialog "$@" 2>"$_tmp"
@@ -342,7 +376,6 @@ This will guide you through:
   4) Verify your account lands in privileged EXEC (#) by default (required)
   5) Capture and verify the device ENABLE password
   6) Paste your Meraki Dashboard API key
-  7) Save all choices to ${ENV_FILE} and show a summary
 
 Have these ready:
   • Target networks/IPs
@@ -541,21 +574,22 @@ ENABLE_TEST_OK="0"
 
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Enable Password (required)" \
-      --insecure --passwordbox \
+    --insecure --passwordbox \
 "Enter the device's ENABLE password.
-We'll verify that this session has privileged EXEC access (# / privilege 15) and can read running-config." \
-      11 "$W_DEF" "$ENABLE_PASSWORD"
+
+Verify this session has privileged EXEC access (# / privilege 15)." \
+    12 70 "$ENABLE_PASSWORD"
   rc=$?; [ $rc -ne 0 ] && cleanup_and_exit 1
 
   ENABLE_PASSWORD="$(trim "${DOUT:-}")"
   if [ -z "$ENABLE_PASSWORD" ]; then
     dlg --no-shadow --backtitle "$BACKTITLE" --title "Missing Enable Password" \
-        --msgbox "The ENABLE password is required.\n\nPlease enter a non-empty password." 8 "$W_DEF"
+        --msgbox "The ENABLE password is required.\n\nPlease enter a non-empty password." 8 70
     continue
   fi
 
   dlg --backtitle "$BACKTITLE" --title "Testing Enable" \
-      --infobox "Verifying privileged EXEC access on ${SSH_TEST_IP}…" 6 "$W_DEF"
+      --infobox "Verifying privileged EXEC access on ${SSH_TEST_IP}…" 6 70
 
   ssh_enable_ok "$SSH_TEST_IP" "$SSH_USERNAME" "$SSH_PASSWORD" "$ENABLE_PASSWORD"
   rc=$?
@@ -563,7 +597,7 @@ We'll verify that this session has privileged EXEC access (# / privilege 15) and
   if [ $rc -eq 0 ]; then
     ENABLE_TEST_OK="1"
     dlg --backtitle "$BACKTITLE" --title "Enable Test" \
-        --msgbox "Privileged EXEC access verified." 7 "$W_DEF"
+        --msgbox "Privileged EXEC access verified." 7 70
     break
   fi
 
@@ -582,16 +616,72 @@ done
 ###############################################################################
 # 3b) MERAKI API KEY
 ###############################################################################
+###############################################################################
+# 3b) MERAKI API KEY (WITH VALIDATION)
+###############################################################################
 while :; do
   dlg --clear --backtitle "$BACKTITLE" --title "Meraki API Key" --insecure --passwordbox \
 "Paste your Meraki Dashboard API key:" 8 "$W_DEF"
-  rc=$?; [ $rc -eq 1 ] && cleanup_and_exit 1
-  MERAKI_API_KEY="$(trim "${DOUT:-}")"
-  [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
-  printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$' >/dev/null 2>&1 && break
-  dlg --yesno "The key format looks unusual.\nUse it anyway?" 9 "$W_DEF"; [ $? -eq 0 ] && break
-done
+  rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
 
+  MERAKI_API_KEY="$(trim "${DOUT:-}")"
+
+  [ -n "$MERAKI_API_KEY" ] || {
+    dlg --msgbox "API key cannot be empty." 7 "$W_DEF"
+    continue
+  }
+
+  dlg --backtitle "$BACKTITLE" --title "Validating API Key" \
+      --infobox "Testing connectivity to Meraki Dashboard…" 5 "$W_DEF"
+  sleep 1
+
+  result="$(test_meraki_api_key "$MERAKI_API_KEY")"
+
+  case "$result" in
+    OK:*)
+      orgs="${result#OK:}"
+      dlg --backtitle "$BACKTITLE" --title "API Key Valid" --msgbox \
+"Success!
+
+Connected to Meraki Dashboard.
+Organizations found: $orgs
+
+API key is valid and working." 10 "$W_DEF"
+      break
+      ;;
+
+    API_FAIL)
+      dlg --backtitle "$BACKTITLE" --title "Invalid API Key" --yesno \
+"The API key was rejected by Meraki.
+
+Would you like to re-enter it?" 9 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      ;;
+
+    CURL_FAIL)
+      dlg --backtitle "$BACKTITLE" --title "Connection Failed" --yesno \
+"Could not reach Meraki API.
+
+Possible issues:
+  • No internet connectivity
+  • DNS not working yet
+  • Firewall blocking outbound HTTPS
+
+Re-enter API key anyway?" 12 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      break
+      ;;
+
+    *)
+      dlg --backtitle "$BACKTITLE" --title "Unknown Response" --yesno \
+"Unexpected response from Meraki API.
+
+Continue anyway?" 9 "$W_DEF"
+      [ $? -eq 0 ] || { clear; exit 1; }
+      break
+      ;;
+  esac
+done
 ###############################################################################
 # 5) DISCOVERY SCAN RUN DIR (runs/discoveryscans)
 ###############################################################################

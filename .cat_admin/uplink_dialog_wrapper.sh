@@ -88,7 +88,22 @@ log_batch_line() {
   local text="$1"
   printf '%s %s\n' "$(date '+%F %T')" "$text" >> "$BATCH_LOG_FILE"
 }
+wide_textbox() {
+  local file="$1"
 
+  local rows cols
+  rows=$(tput lines)
+  cols=$(tput cols)
+
+  local height=$((rows - 4))
+  local width=$((cols - 6))
+
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "View Report" \
+    --textbox "$file" "$height" "$width" \
+    </dev/tty >/dev/tty
+}
 entry_log_prefix() {
   local entry_json="$1"
   local target_model ip member
@@ -382,35 +397,38 @@ copy_source_artifacts_to_batch_run() {
 show_summary_from_entry() {
   local entry_json="$1"
 
-  local hostname ip member target_model target_cloud_id status changed conf review effective pair_count reason
-  hostname="$(jq -r '.hostname // ""' <<<"$entry_json")"
+  local hostname ip member target_model target_cloud_id status changed conf review pair_count reason
+  hostname="$(jq -r '.hostname // "UNKNOWN"' <<<"$entry_json")"
   ip="$(jq -r '.ip // ""' <<<"$entry_json")"
-  member="$(jq -r '.member_index // ""' <<<"$entry_json")"
+  member="$(jq -r '.member_index // 1' <<<"$entry_json")"
   target_model="$(jq -r '.target_model // ""' <<<"$entry_json")"
   target_cloud_id="$(jq -r '.target_cloud_id // ""' <<<"$entry_json")"
   status="$(jq -r '.status // ""' <<<"$entry_json")"
   changed="$(jq -r '.changed // false' <<<"$entry_json")"
   conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
   review="$(jq -r 'if has("operator_review_required") then .operator_review_required else true end' <<<"$entry_json")"
-  effective="$(jq -r '.effective_config // ""' <<<"$entry_json")"
   pair_count="$(jq -r '.pair_count // 0' <<<"$entry_json")"
   reason="$(jq -r '.reason // ""' <<<"$entry_json")"
 
-  msgbox "Source: ${hostname} (${ip}) member ${member}
+  dialog \
+    --backtitle "$BACKTITLE" \
+    --title "Uplink Summary" \
+    --msgbox "Source: ${hostname} (${ip}) member ${member}
 
 Target: ${target_model} / ${target_cloud_id}
 
+----------------------------------------
 Status: ${status}
 Changed: ${changed}
 Confidence: ${conf}
 Operator review required: ${review}
 Pair count: ${pair_count}
+----------------------------------------
 
 Reason:
 ${reason}
-
-Effective config:
-${effective}"
+" 22 120 \
+    </dev/tty >/dev/tty
 }
 
 operator_intervention_msg() {
@@ -605,123 +623,131 @@ handle_result() {
   local source_key="$2"
   local batch_mode="${3:-0}"
 
-  local entry_json report_file conf review status changed
+  local entry_json report_file conf review status
   entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || {
     msgbox "Could not find manifest entry for source_key=${source_key}"
     return 1
   }
 
   report_file="$(report_file_for_source "$run_dir" "$source_key")"
+
   conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
   review="$(jq -r 'if has("operator_review_required") then .operator_review_required else true end' <<<"$entry_json")"
   status="$(jq -r '.status // "needs_review"' <<<"$entry_json")"
-  changed="$(jq -r '.changed // false' <<<"$entry_json")"
 
-  if [[ "$batch_mode" == "1" ]]; then
-    if [[ "$status" == "unchanged" && "$review" == "false" ]]; then
-      log_skip_entry "$entry_json" "unchanged"
-      log_apply_entry "$entry_json"
-      return 0
-    fi
+  local hostname ip member
+  hostname="$(jq -r '.hostname // "UNKNOWN"' <<<"$entry_json")"
+  ip="$(jq -r '.ip // ""' <<<"$entry_json")"
+  member="$(jq -r '.member_index // 1' <<<"$entry_json")"
 
-    case "$conf" in
-      high|medium-high)
-        if [[ "$review" == "false" ]]; then
-          log_skip_entry "$entry_json" "$conf"
-          log_apply_entry "$entry_json"
-          return 0
-        fi
-        ;;
-    esac
-
-    if [[ "$review" == "true" || "$status" == "needs_review" ]]; then
-      log_review_entry "$entry_json"
-      operator_intervention_msg "$entry_json" "$source_key"
-    fi
-  else
-    case "$conf" in
-      high|medium-high)
-        if [[ "$review" == "false" ]]; then
-          show_summary_from_entry "$entry_json"
-          return 0
-        fi
-        ;;
-    esac
-  fi
+  local uplink_preview
+  uplink_preview="$(
+    jq -r '
+      if (.final_pairs // [] | length) > 0 then
+        .final_pairs[]
+        | "  " + (.source // "?") + " → " + (.targetInterface // "?")
+      else
+        "  (none detected)"
+      end
+    ' <<<"$entry_json"
+  )"
 
   while true; do
-    local choice
-    choice="$(menu \
-      "Uplink Review" \
-      "Confidence: ${conf}
+
+    # ✅ FIXED SIZE (clean + readable)
+    local height=28
+    local width=110
+    local list_height=12
+
+    local prompt
+    prompt="Device: ${hostname} (${ip})  [member ${member}]
+
+----------------------------------------
+Confidence: ${conf}
 Status: ${status}
 Review required: ${review}
+----------------------------------------
 
-Choose next action:" \
-      1 "View summary" \
-      2 "View full report" \
-      3 "$( [[ "$batch_mode" == "1" ]] && printf 'Accept and continue' || printf 'Accept current result' )" \
-      4 "Manual edit mapping" \
-      5 "$( [[ "$batch_mode" == "1" ]] && printf 'Skip / next' || printf 'Skip / back' )")" || return 1
+Detected uplink:
+${uplink_preview}
+
+----------------------------------------
+Select an option:"
+
+    local choice
+    choice="$(
+      dialog --stdout \
+        --backtitle "$BACKTITLE" \
+        --title "Uplink Review" \
+        --menu "$prompt" \
+        "$height" "$width" "$list_height" \
+        1  "---------------- Logging ----------------" \
+        2  "View summary" \
+        3  "View full report" \
+        4  "---------------- Actions ----------------" \
+        5  "Edit mapping (manual)" \
+        6  "$( [[ "$batch_mode" == "1" ]] && echo 'Accept and continue' || echo 'Accept current result' )" \
+        7  "$( [[ "$batch_mode" == "1" ]] && echo 'Skip / next' || echo 'Back' )" \
+        </dev/tty
+    )" || continue
 
     case "$choice" in
-      1)
+      2)
         show_summary_from_entry "$entry_json"
         ;;
-      2)
-        if [[ -f "$report_file" ]]; then
-          textbox "$report_file"
-        else
-          msgbox "Report file not found:
-${report_file}"
-        fi
-        ;;
       3)
-        if [[ "$review" == "true" && "$conf" == "low" ]]; then
-          msgbox "This result is low confidence and still needs manual review."
+        if [[ -f "$report_file" ]]; then
+          wide_textbox "$report_file"
         else
-          if [[ "$batch_mode" == "1" ]]; then
-            log_apply_entry "$entry_json"
-          fi
-          return 0
+          msgbox "Report not found"
         fi
         ;;
-      4)
+      5)
         local manual_file
         manual_file="$(manual_mapping_dialog "$run_dir" "$source_key")" || continue
 
-        infobox "Applying manual mapping and re-running uplink analysis..."
+        infobox "Re-running uplink analysis..."
         run_backend_for_source "$source_key" "$manual_file"
         clear
 
         run_dir="$(get_latest_run_dir)"
         entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || {
-          msgbox "Re-run completed, but manifest entry was not found."
+          msgbox "Re-run failed"
           return 1
         }
-        report_file="$(report_file_for_source "$run_dir" "$source_key")"
+
+        # refresh values
         conf="$(jq -r '.match_confidence // "low"' <<<"$entry_json")"
         review="$(jq -r 'if has("operator_review_required") then .operator_review_required else true end' <<<"$entry_json")"
         status="$(jq -r '.status // "needs_review"' <<<"$entry_json")"
-        changed="$(jq -r '.changed // false' <<<"$entry_json")"
 
-        if [[ "$batch_mode" == "1" && "$review" == "false" ]]; then
-          log_apply_entry "$entry_json"
-          msgbox "Manual mapping saved and backend re-run completed.
+        uplink_preview="$(
+          jq -r '
+            if (.final_pairs // [] | length) > 0 then
+              .final_pairs[]
+              | "  " + (.source // "?") + " → " + (.targetInterface // "?")
+            else
+              "  (none detected)"
+            end
+          ' <<<"$entry_json"
+        )"
 
-This switch/member is now resolved and batch processing will continue."
-          return 0
-        fi
-
-        msgbox "Manual mapping saved and backend re-run completed."
+        msgbox "Manual mapping applied."
         ;;
-      5)
+      6)
+        if [[ "$batch_mode" == "1" ]]; then
+          log_apply_entry "$entry_json"
+        fi
+        return 0
+        ;;
+      7)
         if [[ "$batch_mode" == "1" ]]; then
           log_batch_line "SKIP_OPERATOR ${source_key}"
         fi
         return 1
         ;;
     esac
+
   done
 }
 
@@ -738,6 +764,9 @@ process_single_mapping() {
   if handle_result "$run_dir" "$source_key" 0; then
     local entry_json effective_cfg
     entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || exit 1
+    hostname="$(jq -r '.hostname // "UNKNOWN"' <<<"$entry_json")"
+    ip="$(jq -r '.ip // ""' <<<"$entry_json")"
+    member="$(jq -r '.member_index // 1' <<<"$entry_json")"
     effective_cfg="$(jq -r '.effective_config // ""' <<<"$entry_json")"
 
     msgbox "Uplink review complete.
@@ -792,6 +821,9 @@ process_all_mappings() {
 
     local entry_json conf review status
     entry_json="$(manifest_entry_json "$run_dir" "$source_key")" || {
+    hostname="$(jq -r '.hostname // "UNKNOWN"' <<<"$entry_json")"
+    ip="$(jq -r '.ip // ""' <<<"$entry_json")"
+    member="$(jq -r '.member_index // 1' <<<"$entry_json")"
       msgbox "Could not find manifest entry for source_key=${source_key}"
       log_batch_line "ERROR_MISSING_MANIFEST ${source_key}"
       continue
@@ -842,18 +874,125 @@ process_all_mappings() {
   log_batch_line "BATCH_LOG_FILE ${BATCH_LOG_FILE}"
   log_batch_line "BATCH_FINAL_LATEST ${RUNS_BASE}/latest -> ${batch_run_dir}"
 
-  msgbox "Batch uplink review complete.
+  while :; do
+
+  # -------- BUILD REVIEW PREVIEW --------
+  preview="$(
+  jq -r '
+    .[]
+    | . as $e
+    | (
+        ($e.hostname // "-") + " (" + ($e.ip // "-") + ") m" + (($e.member_index // 1)|tostring)
+      ) as $header
+    | (
+        if ($e.final_pairs // [] | length) > 0 then
+          $e.final_pairs[]
+          | "    " + (.source // "?") + "  ->  " + (.targetInterface // "?")
+        else
+          "    (no uplink mapping)"
+        end
+      ) as $pairs
+    | [$header, $pairs]
+    | @tsv
+  ' "${batch_run_dir}/normalized_manifest.json" 2>/dev/null |
+  awk -F'\t' '
+    {
+      if ($1 != last) {
+        if (NR > 1) print ""
+        print $1
+        last=$1
+      }
+      print $2
+    }
+  '
+)"
+
+  line_count=$(echo "$preview" | wc -l)
+
+  # -------- SMALL LIST --------
+  if (( line_count <= 20 )); then
+
+    preview_msg="Review uplink mappings before finalizing?
+
+Current results:
+────────────────────────────────────────
+
+$preview
+
+────────────────────────────────────────
+"
+
+    height=$((line_count + 14))
+    (( height > 24 )) && height=24
+
+    dialog \
+      --backtitle "$BACKTITLE" \
+      --title "Review uplinks" \
+      --yes-label "Re-run Review" \
+      --no-label "Finalize" \
+      --yesno "$preview_msg" "$height" 100
+
+    rc=$?
+
+  else
+
+    # -------- LARGE LIST --------
+    tmpfile="${DIALOG_TMP_DIR}/uplink_preview.txt"
+
+    {
+      echo "Review uplink mappings before finalizing?"
+      echo
+      echo "Current results:"
+      echo "────────────────────────────────────────"
+      echo
+      echo "$preview"
+      echo
+      echo "────────────────────────────────────────"
+      echo
+      echo "Scroll with ↑/↓. Press ENTER to continue."
+    } > "$tmpfile"
+
+    dialog \
+      --backtitle "$BACKTITLE" \
+      --title "Review uplinks (scrollable)" \
+      --textbox "$tmpfile" 28 110
+
+    dialog \
+      --backtitle "$BACKTITLE" \
+      --title "Confirm uplinks" \
+      --yes-label "Re-run Review" \
+      --no-label "Finalize" \
+      --yesno "Proceed with these uplink mappings?
+
+Choose 'Re-run Review' to run analysis again." 10 70
+
+    rc=$?
+  fi
+
+  # -------- HANDLE DECISION --------
+  if [[ $rc -eq 0 ]]; then
+    msgbox "Re-running uplink analysis..."
+    process_all_mappings
+    return 0
+  fi
+
+  # -------- FINALIZE --------
+  dialog \
+    --clear \
+    --backtitle "$BACKTITLE" \
+    --title "Uplink mapping complete" \
+    --msgbox "Uplink mapping finalized.
 
 Total entries processed: ${total_count}
-Auto-skipped unchanged / no-review entries: ${skipped_auto}
-Entries requiring operator attention: ${intervention_count}
-Apply-ready entries logged: ${apply_count}
+Auto-skipped: ${skipped_auto}
+Operator reviewed: ${intervention_count}
+Apply-ready: ${apply_count}
+" 14 80
 
-Combined batch manifest:
-${batch_run_dir}/normalized_manifest.json
+  clear
+  return 0
 
-Batch log:
-${BATCH_LOG_FILE}"
+done
 }
 
 main() {
@@ -899,4 +1038,3 @@ Batch mode will:
 }
 
 main "$@"
-

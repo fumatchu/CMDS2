@@ -1032,16 +1032,33 @@ choose_network_for_source() {
   local source_label="$1"
 
   local -a items=()
-  local i
-  for i in "${!ORG_NET_IDS[@]}"; do
-    items+=( "${ORG_NET_IDS[$i]}" "${ORG_NET_LABELS[$i]}" )
-  done
-  items+=( "__DONE__" "Finish mapping now (leave remaining unmapped)" )
 
-  local choice
-  choice="$(dlg --backtitle "Meraki Mapping" --title "Choose target network" \
-    --menu "Select the target Meraki network for this source.\n\nSOURCE:\n$source_label\n\nOrg:\n  $ORG_NAME" \
-    24 100 16 "${items[@]}")" || exit 1
+# DONE FIRST (moved to top)
+items+=( "__DONE__" ">>> Finish mapping now (leave remaining unmapped)" )
+
+# Networks after
+local i
+for i in "${!ORG_NET_IDS[@]}"; do
+  items+=( "${ORG_NET_IDS[$i]}" "${ORG_NET_LABELS[$i]}" )
+done
+
+# Dynamic sizing (bigger but not full screen)
+local lines cols dlg_h dlg_w dlg_list
+if read -r lines cols < <(stty size 2>/dev/null); then :; else lines=30; cols=120; fi
+
+dlg_h=$(( lines - 6 ))
+dlg_w=$(( cols - 10 ))
+dlg_list=$(( dlg_h - 10 ))
+
+# caps so it doesn’t go full screen
+(( dlg_h > 28 )) && dlg_h=28
+(( dlg_w > 120 )) && dlg_w=120
+(( dlg_list > 20 )) && dlg_list=20
+
+local choice
+choice="$(dlg --backtitle "Meraki Mapping" --title "Choose target network" \
+  --menu "Select the target Meraki network for this source.\n\nSOURCE:\n$source_label\n\nOrg:\n  $ORG_NAME" \
+  "$dlg_h" "$dlg_w" "$dlg_list" "${items[@]}")" || exit 1
 
   printf '%s' "$choice"
 }
@@ -1377,9 +1394,6 @@ write_outputs() {
     echo "Meraki mapping saved"
     echo "===================="
     echo
-    echo "Run file:"
-    echo "  $MAP_JSON"
-    echo
     echo "Mappings:"
     echo
     jq -r '
@@ -1423,10 +1437,113 @@ main() {
     show_remaining_sources
   fi
 
-  map_each_source
+  while :; do
+    # Run mapping pass
+    map_each_source
+    write_outputs
+
+    # ---------------- REVIEW MAPPINGS ----------------
+
+    preview="$(
+      jq -r '
+        .[] |
+        [
+          (.source.hostname_disp // .source.hostname // "-"),
+          (.target.name // "(unnamed)"),
+          (.target.model // "-")
+        ] | @tsv
+      ' "$MAP_JSON" 2>/dev/null |
+      awk -F'\t' '{printf "  %-25s -> %-25s [%s]\n", $1, $2, $3}'
+    )"
+
+    line_count="$(printf '%s\n' "$preview" | wc -l | awk '{print $1}')"
+
+    if (( line_count <= 20 )); then
+      preview_msg="Do you want to review/edit these mappings again?
+
+Choose YES to edit again.
+Choose NO to finalize and save.
+
+Current mappings:
+────────────────────────────────────────
+
+$preview
+
+────────────────────────────────────────
+"
+
+      height=$((line_count + 16))
+      (( height < 16 )) && height=16
+      (( height > 26 )) && height=26
+
+      set +e
+      "$DIALOG" --clear \
+        --backtitle "Meraki Mapping" \
+        --title "Review mappings" \
+        --yesno "$preview_msg" "$height" 120
+      rc=$?
+      set -e
+    else
+      tmpfile="$TMPDIR/mapping_preview.txt"
+
+      {
+        echo "Do you want to review/edit these mappings again?"
+        echo
+        echo "Choose YES on the next screen to edit again."
+        echo "Choose NO on the next screen to finalize and save."
+        echo
+        echo "Current mappings:"
+        echo "────────────────────────────────────────"
+        echo
+        printf '%s\n' "$preview"
+        echo
+        echo "────────────────────────────────────────"
+      } > "$tmpfile"
+
+      set +e
+      "$DIALOG" --clear \
+        --backtitle "Meraki Mapping" \
+        --title "Review mappings" \
+        --textbox "$tmpfile" 28 120
+
+      "$DIALOG" --clear \
+        --backtitle "Meraki Mapping" \
+        --title "Confirm mappings" \
+        --yesno "Do you want to review/edit these mappings again?
+
+Choose YES to edit again.
+Choose NO to finalize and save." 10 70
+      rc=$?
+      set -e
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+      # YES = edit again
+      "$DIALOG" --clear \
+        --backtitle "Meraki Mapping" \
+        --title "Current mappings" \
+        --textbox "$MAP_SUMMARY" 20 120 || true
+
+      SOURCE_DONE=()
+      continue
+    fi
+
+    # NO / Cancel / ESC = finalize
+    break
+  done
 
   write_outputs
-  dlg --backtitle "Meraki Mapping" --title "Mapping saved" --textbox "$MAP_SUMMARY" 18 120 || true
+  map_count="$(jq 'length' "$MAP_JSON" 2>/dev/null || echo 0)"
+
+  "$DIALOG" --clear \
+    --backtitle "Meraki Mapping" \
+    --title "Mapping complete" \
+    --msgbox "Mapping complete.
+
+$map_count mappings saved successfully." 14 90
+
+  clear
+  exit 0
 }
 
 main "$@"

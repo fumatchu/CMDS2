@@ -31,7 +31,6 @@ else
 fi
 
 [[ -n "${ENV_FILE:-}" ]] || { echo "No ENV found in $SCRIPT_DIR; pass path explicitly." >&2; exit 1; }
-echo "Using ENV file: $ENV_FILE" >&2
 
 set +H
 # shellcheck disable=SC1090

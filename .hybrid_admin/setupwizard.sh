@@ -1,3 +1,4 @@
+
 #!/bin/sh
 # discovery_prompt.sh — targets + SSH creds (+ login test) + Meraki API key
 # + DNS (required; fallbacks) + NTP (at least one) fallbacks + mandatory HTTP client SVI + firmware selection
@@ -309,17 +310,15 @@ This will guide you through:
   9) Provide VLAN SVI for 'ip http client source-interface Vlan<N>'
  10) Select IOS XE firmware image(s) (or upload via Cockpit)
  11) Set the minimum IOS XE version required for hybrid onboarding
- 12) Save all choices to ${ENV_FILE} and show a summary
 
 Have these ready:
   • Target networks/IPs
-  • SSH username and password (must land at privilege 15 — prompt '#')
+  • SSH username and password (must land at privileged exec 15 — prompt '#')
   • ENABLE password (required; used later for Meraki claim)
   • Meraki Dashboard API key
   • Two DNS server IPs (fallbacks)
   • At least one NTP server (hostname or IP)
-  • VLAN ID (1–4094) for HTTP client source-interface (for IOS-XE image downloading)
-  • (Optional) Firmware file(s) in ${FIRMWARE_DIR} or upload to ${COCKPIT_UPLOAD_DIR}" \
+  • Firmware file(s) in ${FIRMWARE_DIR} or upload to ${COCKPIT_UPLOAD_DIR}" \
   "$WELCOME_H" "$WELCOME_W"
 
 ###############################################################################
@@ -510,8 +509,36 @@ Do you want to try entering the ENABLE password again?" 10 "$W_DEF"
   [ $? -eq 0 ] || { clear; exit 1; }
 done
 
+meraki_api_validate() {
+  key="$1"
+
+  [ -n "$key" ] || return 1
+
+  RESP="$(
+    curl -sS --connect-timeout 5 --max-time 10 \
+      -H "X-Cisco-Meraki-API-Key: $key" \
+      -H "Content-Type: application/json" \
+      https://api.meraki.com/api/v1/organizations
+  )"
+
+  # Debug (optional)
+  [ "${DEBUG:-0}" = "1" ] && {
+    printf '[API DEBUG] response:\n%s\n' "$RESP" >>"$DEBUG_LOG"
+  }
+
+  # Detect failure
+  echo "$RESP" | grep -qi '"errors"' && return 1
+  echo "$RESP" | grep -qi 'invalid api key' && return 1
+  echo "$RESP" | grep -qi 'unauthorized' && return 1
+
+  # Must be JSON array
+  echo "$RESP" | grep -q '^\[' || return 1
+
+  return 0
+}
+
 ###############################################################################
-# 3b) MERAKI API KEY
+# 3b) MERAKI API KEY (WITH LIVE VALIDATION)
 ###############################################################################
 while :; do
   dlg --clear --backtitle "$BACKTITLE" \
@@ -520,11 +547,44 @@ while :; do
 "Paste your Meraki Dashboard API key:" \
       8 "$W_DEF"
   rc=$?; [ $rc -eq 1 ] && { clear; exit 1; }
+
   MERAKI_API_KEY="$(trim "${DOUT:-}")"
-  [ -n "$MERAKI_API_KEY" ] || { dlg --msgbox "API key cannot be empty." 7 "$W_DEF"; continue; }
-  printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$' >/dev/null 2>&1 && break
-  dlg --yesno "The key format looks unusual.\nUse it anyway?" 9 "$W_DEF"; [ $? -eq 0 ] && break
+
+  # empty check
+  [ -n "$MERAKI_API_KEY" ] || {
+    dlg --msgbox "API key cannot be empty." 7 "$W_DEF"
+    continue
+  }
+
+  # format warning (non-blocking)
+  if ! printf '%s' "$MERAKI_API_KEY" | grep -Eq '^[A-Za-z0-9]{28,64}$'; then
+    dlg --yesno "The key format looks unusual.\n\nContinue anyway?" 9 "$W_DEF" || continue
+  fi
+
+  # LIVE VALIDATION
+  dlg --backtitle "$BACKTITLE" --title "Validating API Key" \
+      --infobox "Connecting to Meraki Dashboard API..." 5 "$W_DEF"
+  sleep 1
+
+  if meraki_api_validate "$MERAKI_API_KEY"; then
+    dlg --backtitle "$BACKTITLE" --title "API Validation" \
+        --msgbox "Meraki API key validated successfully." 6 "$W_DEF"
+    break
+  fi
+
+  dlg --backtitle "$BACKTITLE" --title "API Validation Failed" --yesno \
+"Failed to validate API key.
+
+Possible causes:
+  • Invalid API key
+  • No internet connectivity
+  • Firewall blocking api.meraki.com
+
+Do you want to re-enter the API key?" 12 "$W_DEF"
+
+  [ $? -eq 0 ] || { clear; exit 1; }
 done
+
 ###############################################################################
 # 3c) DNS — REQUIRED (validated with dig; fallbacks)
 ###############################################################################

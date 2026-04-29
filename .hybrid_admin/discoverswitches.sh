@@ -970,18 +970,21 @@ do_selection_dialog() {
     fi
 
     items+=("$ip" "$text" "$def")
-  done < <(jq -r '.[] |
-           [
-             .ip,
-             (.hostname//"-"),
-             (.pid//"-"),
-             (.current_version//"?"),
-             (.target_version//"?"),
-             (.plan_action//"UNKNOWN"),
-             (.needs_upgrade//false),
-             (.blacklisted//false),
-             (.blacklist_reason//"")
-           ] | @tsv' "$UP_JSON_OUT")
+  done < <(
+  jq -r '.[] |
+    [
+      .ip,
+      (.hostname//"-"),
+      (.pid//"-"),
+      (.current_version//"?"),
+      (.target_version//"?"),
+      (.plan_action//"UNKNOWN"),
+      (.needs_upgrade//false),
+      (.blacklisted//false),
+      (.blacklist_reason//"")
+    ] | @tsv' "$UP_JSON_OUT" \
+  | sort -t $'\t' -k1,1V
+)
 
   if (( ${#items[@]} == 0 )); then
     dialog --no-shadow --infobox \

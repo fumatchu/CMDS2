@@ -26,17 +26,16 @@ if (( TOTAL == 0 )); then
   dialog --no-shadow --title "Cleanup" --msgbox \
 "Nothing to clean.
 
-No .csv/.env/.json files or Meraki claim log symlink were found in:
-$(readlink -f "$TARGET_DIR")" 10 70
+System is ready to run the Setup Wizard!
+" 10 70
   clear
   exit 0
 fi
 
 # High-level confirmation (no file list)
 dialog --no-shadow --title "Prepare for next migration" --yesno \
-"This will clean up CMDS migration artifacts in:
+"This will clean up CMDS migration arifacts:
 
-$(readlink -f "$TARGET_DIR")
 
 • Remove previous migration result/working files
 • Remove Meraki claim log symlink (if present)
@@ -136,9 +135,6 @@ hr() {
 # Final summary — waits for user to press OK (no timeout)
 dialog --no-shadow --title "Configuration cleanup complete" --msgbox \
 "Cleanup finished successfully.
-
-Stale migration artifacts removed: $deleted
-Approximate space reclaimed: $(hr "$freed")
 
 System is now ready for the NEXT set of switches.
 

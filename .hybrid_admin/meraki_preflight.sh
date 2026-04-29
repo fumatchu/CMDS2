@@ -13,15 +13,13 @@
 #
 # Usage:
 #   ./script                # same as "all"
-#   ./script all            # run preflight, then DNS+NTP+AAA+Routing fixes for switches that need it
+#   ./script all            # run preflight, then DNS+NTP+AAA+Routing fixes — all in ONE window
 #   ./script preflight      # just preflight
 #   ./script fix-dns        # just DNS fixes (reads runs/preflight/latest.csv)
 #   ./script fix-ntp        # just NTP fixes (reads runs/preflight/latest.csv)
 #   ./script fix-aaa        # just AAA fixes (reads runs/preflight/latest.csv)
 #   ./script fix-routing    # just IP routing / default route fixes (reads runs/preflight/latest.csv)
 
-# Be strict about pipelines, but do NOT use 'set -u' here:
-# this script relies on lots of optional env vars that may be unset.
 set -o pipefail
 
 # ---------- prerequisites ----------
@@ -45,7 +43,6 @@ now(){ date +%H:%M:%S; }
 
 # CSV append with flock (safe for parallel writers)
 append_csv(){
-  # Usage: append_csv "/path/to/file.csv" "row,comma,separated"
   local csv="$1"; shift
   local line="$*"
   { flock -x 9
@@ -53,11 +50,20 @@ append_csv(){
   } 9>>"$csv"
 }
 
+# Phase separator — writes a visible delimiter into the scrolling tailbox log
+log_sep(){
+  local label="${1:-}"
+  log ""
+  log "============================================================"
+  [[ -n "$label" ]] && log "  $label"
+  log "============================================================"
+  log ""
+}
+
 # ---------- IOS-XE minimum version check ----------
 MIN_IOS_VERSION="17.15.03"
 
 ios_meets_min(){
-  # returns 0 if $1 >= MIN_IOS_VERSION, else 1
   local v_raw="${1:-}"
   [[ -z "$v_raw" ]] && return 1
 
@@ -81,13 +87,13 @@ ios_meets_min(){
   if   (( b > mb )); then return 0
   elif (( b < mb )); then return 1
   fi
-  if   (( c >= mc )); then return 0
-  else                    return 1
-  fi
+  (( c >= mc )) && return 0 || return 1
 }
 
 enforce_min_ios_or_abort(){
-  # $1 = path to preflight summary CSV (PRE_FLIGHT_SUMMARY)
+  # $1 = path to preflight summary CSV
+  # When the shared UI is running (DPID is set) failures are written to the tailbox.
+  # When called standalone they are shown in a dialog textbox.
   local sum="$1"
   local CHECK_ROOT="$SCRIPT_DIR/runs/ioscheck"
   mkdir -p "$CHECK_ROOT"
@@ -100,18 +106,13 @@ enforce_min_ios_or_abort(){
 
   local bad=0
   local -a BAD_LINES=()
-
   local first=1
   local ip host ios_ver rest
+
   while IFS=, read -r ip host ios_ver rest; do
-    if (( first )); then
-      first=0
-      continue
-    fi
+    if (( first )); then first=0; continue; fi
     [[ -z "$ip" ]] && continue
-
     ios_ver="${ios_ver:-unknown}"
-
     if ios_meets_min "$ios_ver"; then
       echo "$ip,$host,$ios_ver,yes" >> "$LOG"
     else
@@ -122,26 +123,32 @@ enforce_min_ios_or_abort(){
   done < "$sum"
 
   if (( bad > 0 )); then
-    local tmp
-    tmp="$(mktemp)"
-    {
-      echo "The following switches do NOT meet the minimum IOS-XE version ${MIN_IOS_VERSION}:"
-      echo
-      printf "%-16s %-25s %s\n" "IP" "Hostname" "IOS Version"
-      printf "%-16s %-25s %s\n" "----------------" "------------------------" "-----------"
-      for line in "${BAD_LINES[@]}"; do
-        echo "$line"
-      done
-      echo
-      echo "No DNS/NTP/AAA/IP routing changes were made."
-      echo
-      echo "A detailed CSV log has been saved to:"
-      echo "  $LOG"
-    } > "$tmp"
-
-    dlg --title "IOS-XE Minimum Version Check FAILED" --textbox "$tmp" 20 90
-    rm -f "$tmp"
-    clear
+    if [[ -n "${DPID:-}" ]]; then
+      # UI is running — log to tailbox, no dialog
+      log "ERROR: IOS-XE minimum version check FAILED (required: ${MIN_IOS_VERSION})"
+      log "$(printf '%-16s %-25s %s' 'IP' 'Hostname' 'IOS Version')"
+      log "$(printf '%-16s %-25s %s' '----------------' '------------------------' '-----------')"
+      for line in "${BAD_LINES[@]}"; do log "  $line"; done
+      log "No DNS/NTP/AAA/IP routing changes were made."
+      log "CSV log: $LOG"
+    else
+      local tmp; tmp="$(mktemp)"
+      {
+        echo "The following switches do NOT meet the minimum IOS-XE version ${MIN_IOS_VERSION}:"
+        echo
+        printf "%-16s %-25s %s\n" "IP" "Hostname" "IOS Version"
+        printf "%-16s %-25s %s\n" "----------------" "------------------------" "-----------"
+        for line in "${BAD_LINES[@]}"; do echo "$line"; done
+        echo
+        echo "No DNS/NTP/AAA/IP routing changes were made."
+        echo
+        echo "A detailed CSV log has been saved to:"
+        echo "  $LOG"
+      } > "$tmp"
+      dlg --title "IOS-XE Minimum Version Check FAILED" --textbox "$tmp" 20 90
+      rm -f "$tmp"
+      clear
+    fi
     return 1
   fi
 
@@ -158,8 +165,6 @@ dlg(){ local t; t="$(mktemp)"; dialog "${DOPTS[@]}" "$@" 2>"$t"; local rc=$?; DO
 # ---------- UI (tailbox + gauge) ----------
 DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
 STATUS_FILE=""; GAUGE_PIPE=""; GAUGE_FD=""; DPID=""; MAIN=$$
-DIALOG=0; command -v dialog >/dev/null 2>&1 && DIALOG=1
-STATUS_FILE=""; GAUGE_PIPE=""; GAUGE_FD=""; DPID=""; MAIN=$$
 
 ui_calc(){
   local L=24 C=80
@@ -167,18 +172,12 @@ ui_calc(){
   ((L<20)) && L=20
   ((C<80)) && C=80
 
-  local TOP_PAD=2
-  local BOT_PAD=2
-  local SIDE_PAD=2
-  local SPACE=1
-
+  local TOP_PAD=2 BOT_PAD=2 SIDE_PAD=2 SPACE=1
   GAUGE_H=6
   TAIL_W=$(( C - SIDE_PAD*2 ))
   GAUGE_W=$TAIL_W
-
   TAIL_H=$(( L - TOP_PAD - BOT_PAD - GAUGE_H - SPACE - 2 ))
   (( TAIL_H < 8 )) && TAIL_H=8
-
   TAIL_ROW=$TOP_PAD
   GAUGE_ROW=$(( TOP_PAD + TAIL_H + SPACE ))
   GAUGE_COL=$SIDE_PAD
@@ -229,6 +228,7 @@ build_ssh_arr(){
              -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1)
   fi
 }
+
 is_priv15_for_ip(){
   local ip="$1" raw out ok=1
   build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
@@ -240,6 +240,7 @@ is_priv15_for_ip(){
   grep -Eiq 'Current privilege level is[[:space:]]*15' "$out" && ok=0
   rm -f "$raw" "$out"; return $ok
 }
+
 emit_enable(){
   printf 'enable\r\n'; sleep 0.2
   if [[ -n "${ENABLE_PASSWORD-}" ]]; then printf '%s\r\n' "$ENABLE_PASSWORD"; else printf '\r\n'; fi
@@ -270,7 +271,6 @@ probe_one(){
     printf 'show install summary\r\n'
     printf 'show running-config | include ^ip name-server\r\n'
     printf 'show running-config | include ^ntp server\r\n'
-    # routing / default route / domain lookup / aaa
     printf 'show running-config | include ^ip routing\r\n'
     printf 'show running-config | include ^no ip routing\r\n'
     printf 'show running-config | include ^ip route 0.0.0.0 0.0.0.0\r\n'
@@ -280,7 +280,6 @@ probe_one(){
     printf 'show running-config | include ^aaa new-model\r\n'
     printf 'show running-config | include ^aaa authentication login default\r\n'
     printf 'show running-config | include ^aaa authorization exec default\r\n'
-    # Meraki state
     printf 'show meraki migration\r\n'
     printf 'show meraki connect\r\n'
     printf 'exit\r\n'
@@ -289,37 +288,30 @@ probe_one(){
   tr -d '\r' < "$raw" > "$out"; mkdir -p "$RUN_DIR/devlogs"
   cat "$out" >> "$RUN_DIR/devlogs/${ip}.session.log"; rm -f "$raw"
 
-  # hostname
   host="$(awk 'match($0,/^([[:alnum:]_.:-]+)[>#][[:space:]]*$/,m){print m[1]; exit}' "$out")"
   [[ -z "$host" ]] && host="$(awk '/^hostname[[:space:]]+/{print $2; exit}' "$out")"
   [[ -z "$host" ]] && host="$ip"
 
-  # IOS-XE version
   ios="$(awk '
     match($0,/Cisco IOS XE Software, Version[[:space:]]+([^ ,]+)/,m){print m[1]; exit}
     match($0,/Version[[:space:]]+([0-9]+\.[0-9]+(\.[0-9A-Za-z]+)?)/,m){print m[1]; exit}
   ' "$out")"
 
-  # INSTALL/BUNDLE
   install_mode="$(awk -F: 'BEGIN{IGNORECASE=1}/Running[[:space:]]+mode/ {gsub(/^[ \t]+/,"",$2); print toupper($2); exit}' "$out")"
   [[ -z "$install_mode" ]] && install_mode="$(grep -Eio '(INSTALL|BUNDLE)' "$out" | head -n1 | tr '[:lower:]' '[:upper:]')"
 
-  # Meraki booted mode
   meraki_mode="$(awk -F: 'BEGIN{IGNORECASE=1}
     /^Meraki Mode Migration Status/ {seen=1}
     seen && /Current Booted Mode/ {gsub(/^[ \t]+/,"",$2); print $2; exit}
   ' "$out")"
 
-  # DNS/NTP presence (or planned via env)
   grep -Eq '^[[:space:]]*ip[[:space:]]+name-server' "$out" && dns_ok="yes" || { [[ -n "${DNS_PRIMARY:-}" ]] && dns_ok="planned"; }
   grep -Eq '^[[:space:]]*ntp[[:space:]]+server'     "$out" && ntp_ok="yes"  || { [[ -n "${NTP_PRIMARY:-}" ]] && ntp_ok="planned"; }
 
-  # ip routing
   if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then iprt="no"
   elif grep -Eq '^ip[[:space:]]+routing' "$out"; then iprt="yes"
   else iprt="unknown"; fi
 
-  # default route
   if grep -Eq '^ip[[:space:]]+route[[:space:]]+0\.0\.0\.0[[:space:]]+0\.0\.0\.0[[:space:]]+' "$out"; then
     defrt="yes"
   elif grep -Eq '^ip[[:space:]]+default-gateway[[:space:]]+' "$out"; then
@@ -328,15 +320,12 @@ probe_one(){
     defrt="no"
   fi
 
-  # domain lookup
   if grep -Eq '^no[[:space:]]+ip[[:space:]]+domain[[:space:]]+lookup' "$out"; then domlkp="disabled"; else domlkp="enabled"; fi
 
-  # AAA checks
   grep -Eq '^aaa[[:space:]]+new-model(\s|$)' "$out" && aaa_nm="on" || aaa_nm="off"
   grep -Eq '^aaa[[:space:]]+authentication[[:space:]]+login[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && aaa_login="yes" || aaa_login="no"
   grep -Eq '^aaa[[:space:]]+authorization[[:space:]]+exec[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && aaa_exec="yes" || aaa_exec="no"
 
-  # Meraki registration/tunnel (best-effort)
   if awk 'BEGIN{IGNORECASE=1} /^Meraki Device Registration/{s=1} s && /Status:[[:space:]]+Registered/ {print "1"; exit}' "$out" | grep -q 1; then reg="registered"; fi
   if awk 'BEGIN{IGNORECASE=1} /^Meraki Tunnel State/{s=1} s && /Primary:[[:space:]]+Up/ {print "1"; exit}' "$out" | grep -q 1; then
     tunnel="up"
@@ -347,7 +336,6 @@ probe_one(){
     notes+="already_onboarded;"
   fi
 
-  # gating + notes
   [[ "$install_mode" == "INSTALL" ]] || notes+="mode_${install_mode:-?};"
   [[ "$dns_ok" == "yes" || "$dns_ok" == "planned" ]] || notes+="dns_missing;"
   [[ "$ntp_ok" == "yes" || "$ntp_ok" == "planned" ]] || notes+="ntp_missing;"
@@ -372,7 +360,6 @@ meraki_preflight(){
   trap 'ui_stop' EXIT
   set_backtitle "Meraki Preflight"
 
-  # env
   [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
   SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
   SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
@@ -388,7 +375,6 @@ meraki_preflight(){
   fi
   [[ -n "$SSH_USERNAME" ]] || { dlg --title "Missing" --msgbox "SSH_USERNAME is empty in meraki_discovery.env" 7 60; clear; trap - EXIT; return 1; }
 
-  # ─── Determine source (selected first, then discovery) ──────────────────────
   local SRC=""
   local have_disc="" have_sel_json="" have_sel_ips=""
 
@@ -402,113 +388,63 @@ meraki_preflight(){
 
   [[ -s "$DISC_JSON" ]] && have_disc=1
 
-  if [[ -n "$have_sel_json" ]]; then
-    SRC="seljson"
-  elif [[ -n "$have_sel_ips" ]]; then
-    SRC="selips"
-  elif [[ -n "$have_disc" ]]; then
-    SRC="disc"
+  if   [[ -n "$have_sel_json" ]]; then SRC="seljson"
+  elif [[ -n "$have_sel_ips"  ]]; then SRC="selips"
+  elif [[ -n "$have_disc"     ]]; then SRC="disc"
   else
     dlg --title "Nothing to pick" --msgbox "No selected_upgrade.json, selected_upgrade.env, or discovery_results.json found.\nRun the IOS-XE upgrader or Discovery first." 10 75
     clear; trap - EXIT; return 1
   fi
 
-  # ─── Build discovery gate maps (ip -> ssh/login/blacklisted) ────────────────
   declare -A DISC_SSH DISC_LOGIN DISC_BL DISC_BLR
   if [[ -s "$DISC_JSON" ]]; then
     while IFS=$'\t' read -r ip ssh login bl blr; do
-      DISC_SSH["$ip"]="$ssh"
-      DISC_LOGIN["$ip"]="$login"
-      DISC_BL["$ip"]="$bl"
-      DISC_BLR["$ip"]="$blr"
-    done < <(jq -r '.[] |
-                   [
-                     .ip,
-                     (.ssh//false),
-                     (.login//false),
-                     (.blacklisted//false),
-                     (.blacklist_reason//"")
-                   ] | @tsv' "$DISC_JSON")
+      DISC_SSH["$ip"]="$ssh"; DISC_LOGIN["$ip"]="$login"
+      DISC_BL["$ip"]="$bl";   DISC_BLR["$ip"]="$blr"
+    done < <(jq -r '.[] | [.ip, (.ssh//false), (.login//false), (.blacklisted//false), (.blacklist_reason//"")] | @tsv' "$DISC_JSON")
   fi
 
-  # ─── Load device lists from the chosen source ───────────────────────────────
   declare -a IPS HOSTS PIDS VERS SER
 
   if [[ "$SRC" == "disc" ]]; then
-    mapfile -t IPS   < <(jq -r '.[].ip' "$DISC_JSON" 2>/dev/null)
+    mapfile -t IPS   < <(jq -r '.[].ip'             "$DISC_JSON" 2>/dev/null)
     mapfile -t HOSTS < <(jq -r '.[].hostname // ""' "$DISC_JSON" 2>/dev/null)
-    mapfile -t PIDS  < <(jq -r '.[].pid // ""' "$DISC_JSON" 2>/dev/null)
-    mapfile -t VERS  < <(jq -r '.[].version // ""' "$DISC_JSON" 2>/dev/null)
-    mapfile -t SER   < <(jq -r '.[].serial // ""' "$DISC_JSON" 2>/dev/null)
-
+    mapfile -t PIDS  < <(jq -r '.[].pid // ""'      "$DISC_JSON" 2>/dev/null)
+    mapfile -t VERS  < <(jq -r '.[].version // ""'  "$DISC_JSON" 2>/dev/null)
+    mapfile -t SER   < <(jq -r '.[].serial // ""'   "$DISC_JSON" 2>/dev/null)
   elif [[ "$SRC" == "seljson" ]]; then
-    mapfile -t IPS   < <(jq -r '.[].ip' "$SEL_JSON" 2>/dev/null)
-    mapfile -t HOSTS < <(jq -r '.[].hostname // ""' "$SEL_JSON" 2>/dev/null)
-    mapfile -t PIDS  < <(jq -r '.[].pid // ""' "$SEL_JSON" 2>/dev/null)
+    mapfile -t IPS   < <(jq -r '.[].ip'                      "$SEL_JSON" 2>/dev/null)
+    mapfile -t HOSTS < <(jq -r '.[].hostname // ""'          "$SEL_JSON" 2>/dev/null)
+    mapfile -t PIDS  < <(jq -r '.[].pid // ""'               "$SEL_JSON" 2>/dev/null)
     mapfile -t VERS  < <(jq -r '.[].installed_version // ""' "$SEL_JSON" 2>/dev/null)
-    mapfile -t SER   < <(jq -r '.[].serial // ""' "$SEL_JSON" 2>/dev/null)
-
+    mapfile -t SER   < <(jq -r '.[].serial // ""'            "$SEL_JSON" 2>/dev/null)
   else
-    # SRC = "selips" — only have UPGRADE_SELECTED_IPS. Enrich from discovery.
     read -r -a IPS <<<"${UPGRADE_SELECTED_IPS:-}"
-
     HOSTS=(); PIDS=(); VERS=(); SER=()
-
     if [[ -s "$DISC_JSON" ]]; then
       declare -A HMAP VMAP PMAP SMAP
       while IFS=$'\t' read -r ip h v p s; do
-        HMAP["$ip"]="$h"
-        VMAP["$ip"]="$v"
-        PMAP["$ip"]="$p"
-        SMAP["$ip"]="$s"
-      done < <(jq -r '.[] | [
-                    .ip,
-                    (.hostname // ""),
-                    (.version  // ""),
-                    (.pid      // ""),
-                    (.serial   // "")
-                  ] | @tsv' "$DISC_JSON")
-
+        HMAP["$ip"]="$h"; VMAP["$ip"]="$v"; PMAP["$ip"]="$p"; SMAP["$ip"]="$s"
+      done < <(jq -r '.[] | [.ip, (.hostname // ""), (.version // ""), (.pid // ""), (.serial // "")] | @tsv' "$DISC_JSON")
       for ip in "${IPS[@]}"; do
-        HOSTS+=( "${HMAP[$ip]:-}" )
-        VERS+=(  "${VMAP[$ip]:-}" )
-        PIDS+=(  "${PMAP[$ip]:-}" )
-        SER+=(   "${SMAP[$ip]:-}" )
+        HOSTS+=( "${HMAP[$ip]:-}" ); VERS+=( "${VMAP[$ip]:-}" )
+        PIDS+=(  "${PMAP[$ip]:-}" ); SER+=(  "${SMAP[$ip]:-}" )
       done
     else
-      # No discovery metadata; keep descriptions minimal.
-      for _ in "${IPS[@]}"; do
-        HOSTS+=("")
-        PIDS+=("")
-        VERS+=("")
-        SER+=("")
-      done
+      for _ in "${IPS[@]}"; do HOSTS+=(""); PIDS+=(""); VERS+=(""); SER+=(""); done
     fi
   fi
 
   (( ${#IPS[@]} > 0 )) || { dlg --title "No devices" --msgbox "The chosen source has zero devices." 7 60; clear; trap - EXIT; return 1; }
 
-  # ─── Build checklist, filtered by discovery_results.json ───────────────────
   local CHK=()
   for i in "${!IPS[@]}"; do
-    local ip="${IPS[$i]}"
-    local h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
-
-    # If we have discovery info for this IP, enforce:
-    #   ssh==true AND login==true AND blacklisted==false
+    local ip="${IPS[$i]}" h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
     if [[ -n "${DISC_SSH[$ip]+x}" ]]; then
-      local ssh_ok="${DISC_SSH[$ip]:-false}"
-      local login_ok="${DISC_LOGIN[$ip]:-false}"
-      local bl="${DISC_BL[$ip]:-false}"
-
-      if [[ "$ssh_ok" != "true" || "$login_ok" != "true" || "$bl" == "true" ]]; then
-        # Skip things we can't safely touch:
-        #  - ssh/login failed
-        #  - explicitly blacklisted (e.g. meraki-user exists or unknown device)
-        continue
-      fi
+      [[ "${DISC_SSH[$ip]:-false}"   != "true" ]] && continue
+      [[ "${DISC_LOGIN[$ip]:-false}" != "true" ]] && continue
+      [[ "${DISC_BL[$ip]:-false}"   == "true"  ]] && continue
     fi
-
     local desc; desc="$(trim "${h:-$ip}  ${p:+($p) }${s:+SN:$s}")"
     CHK+=( "$ip" "$desc" "on" )
   done
@@ -523,7 +459,6 @@ meraki_preflight(){
   read -r -a TARGETS <<<"$DOUT"
   (( ${#TARGETS[@]} )) || { clear; trap - EXIT; return 0; }
 
-  # ─── Run directory & summary wiring ────────────────────────────────────────
   RUN_ID="run-$(date -u +%Y%m%d%H%M%S)"
   RUN_ROOT="$SCRIPT_DIR/runs/preflight"; mkdir -p "$RUN_ROOT"
   RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
@@ -542,7 +477,6 @@ meraki_preflight(){
   printf 'export PRE_FLIGHT_SUMMARY=%q\n' "$PRE_FLIGHT_SUMMARY" >> "$RUN_ROOT/latest.env"
   ln -sfn "$PRE_FLIGHT_SUMMARY" "$RUN_ROOT/latest.csv"
 
-  # ─── Run probes in parallel ────────────────────────────────────────────────
   UI_TITLE="Preflight"
   ui_start
   log "Preflight Run: $RUN_ID"
@@ -565,7 +499,6 @@ meraki_preflight(){
       ((ACTIVE--))
     fi
   done
-
   while (( DONE < TOTAL )); do
     if wait -n; then :; fi
     ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "Probed $DONE / $TOTAL"
@@ -575,30 +508,19 @@ meraki_preflight(){
   log "Summary: $SUMMARY_CSV"
   ui_stop
 
-  # ─── Build validated_switches.env + validated_ips.json ─────────────────────
   local VAL_ENV="$SCRIPT_DIR/validated_switches.env"
   local VAL_JSON="$SCRIPT_DIR/validated_ips.json"
-
   local validated_ips
   validated_ips="$(awk -F, 'NR>1 && $12=="yes" {print $1}' "$SUMMARY_CSV" | xargs)"
-
   if [[ -n "$validated_ips" ]]; then
     printf 'export VALIDATED_SWITCH_IPS=%q\n' "$validated_ips" > "$VAL_ENV"
-
     awk -F, 'NR>1 && $12=="yes" {printf "%s,%s\n",$1,$2}' "$SUMMARY_CSV" \
-      | jq -R -s '
-          split("\n")
-          | map(
-              select(length>0)
-              | split(",")
-              | {ip: .[0], hostname: .[1]}
-            )
-        ' > "$VAL_JSON" 2>/dev/null || true
+      | jq -R -s 'split("\n") | map(select(length>0) | split(",") | {ip: .[0], hostname: .[1]})' \
+      > "$VAL_JSON" 2>/dev/null || true
   else
     rm -f "$VAL_ENV" "$VAL_JSON" 2>/dev/null || true
   fi
 
-  # mark batch as validated for menu checkmark
   local BATCH_FLAG="$SCRIPT_DIR/preflight_validated.flag"
   {
     echo "RUN_ID=$RUN_ID"
@@ -624,7 +546,6 @@ fix_dns_one(){
   log "[${ip}] CONNECT…"
   is_priv15_for_ip "$ip" || need_en=1
 
-  # pre-read current state
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
@@ -639,7 +560,7 @@ fix_dns_one(){
 
   local have_dns="no" domlkp_state="enabled"
   grep -Eq '^[[:space:]]*ip[[:space:]]+name-server' "$out" && have_dns="yes"
-  if grep -Eq '^no[[:space:]]+ip[[:space:]]+domain[[:space:]]+lookup' "$out"; then domlkp_state="disabled"; fi
+  grep -Eq '^no[[:space:]]+ip[[:space:]]+domain[[:space:]]+lookup' "$out" && domlkp_state="disabled"
 
   log "[${ip}] Current: DNS=${have_dns} DOMAIN_LOOKUP=${domlkp_state}"
 
@@ -661,9 +582,7 @@ fix_dns_one(){
         [[ -n "${DNS_PRIMARY:-}"   ]] && printf 'ip name-server %s\r\n' "$DNS_PRIMARY"
         [[ -n "${DNS_SECONDARY:-}" ]] && printf 'ip name-server %s\r\n' "$DNS_SECONDARY"
       fi
-      if (( need_dl )); then
-        printf 'ip domain lookup\r\n'
-      fi
+      if (( need_dl )); then printf 'ip domain lookup\r\n'; fi
       printf 'end\r\n'
       printf 'write memory\r\n'
       printf 'exit\r\n'
@@ -673,7 +592,6 @@ fix_dns_one(){
     log "[${ip}] Nothing to change."
   fi
 
-  # verify config actually present after write
   {
     printf '\r\n'
     (( need_en )) && emit_enable
@@ -689,7 +607,6 @@ fix_dns_one(){
     [[ $need_dl -eq 1 ]] && notes+="domain_lookup_not_enabled;"
   fi
 
-  # verify resolution: accept any success
   {
     printf '\r\n'
     (( need_en )) && emit_enable
@@ -715,7 +632,6 @@ meraki_fix_dns(){
   trap 'ui_stop' EXIT
   set_backtitle "Meraki DNS Updater"
 
-  # env
   [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
   SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
   SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
@@ -723,42 +639,30 @@ meraki_fix_dns(){
   DNS_PRIMARY="$(__deq "${DNS_PRIMARY-}")"
   DNS_SECONDARY="$(__deq "${DNS_SECONDARY-}")"
 
-  # latest preflight CSV
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
   local LATEST_ENV="$PRE_ROOT/latest.env"
   local SUM=""
   if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
   [[ -z "${SUM:-}" || ! -f "$SUM" ]] && { dlg --title "No Preflight Summary" --msgbox "Could not find runs/preflight/latest.csv.\nRun preflight first." 9 70; clear; trap - EXIT; return 1; }
 
-  # IOS-XE minimum version check (unless already done in 'all' pipeline)
   if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
-    if ! enforce_min_ios_or_abort "$SUM"; then
-      trap - EXIT
-      return 1
-    fi
+    if ! enforce_min_ios_or_abort "$SUM"; then trap - EXIT; return 1; fi
   fi
 
-  # targets needing DNS or domain-lookup change
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($6!="yes" || $10=="disabled") print $1 }' "$SUM")
   if (( ${#TARGETS[@]} == 0 )); then
     dialog --no-shadow --backtitle "$BACKTITLE" --infobox "All switches already have DNS and domain lookup enabled.\nNothing to do." 7 70
-    sleep 2
-    clear; trap - EXIT; return 0
+    sleep 2; clear; trap - EXIT; return 0
   fi
 
-  # run directory
   RUN_ID="dns-$(date -u +%Y%m%d%H%M%S)"
   RUN_ROOT="$SCRIPT_DIR/runs/dnsfix"; mkdir -p "$RUN_ROOT"
   RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
   ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
 
-  # CSV for results
   DNSFIX_CSV="$RUN_DIR/dnsfix.csv"
   echo "ip,changed_dns,enabled_domain_lookup,resolution_ok,notes" > "$DNSFIX_CSV"
 
-  # UI
-  dialog --no-shadow --backtitle "$BACKTITLE" --infobox "Updating DNS entries and domain lookup if needed..." 7 70
-  sleep 2
   UI_TITLE="DNS Fix"
   ui_start
   log "DNS Fix Run: $RUN_ID"
@@ -781,7 +685,6 @@ meraki_fix_dns(){
       ((ACTIVE--))
     fi
   done
-
   while (( DONE < TOTAL )); do
     if wait -n; then :; fi
     ((DONE++)); local pct=$(( 100 * DONE / TOTAL )); gauge "$pct" "Fixed $DONE / $TOTAL"
@@ -791,8 +694,7 @@ meraki_fix_dns(){
   log "Results: $DNSFIX_CSV"
   ui_stop
   sleep 0.5
-  dialog --no-shadow --backtitle "$BACKTITLE" --infobox "DNS entries updated (if applicable)." 5 60
-  sleep 2
+  clear
   trap - EXIT
   return 0
 }
@@ -831,8 +733,8 @@ fix_ntp_one(){
       printf '\r\n'
       (( need_en )) && emit_enable
       printf 'configure terminal\r\n'
-      [[ -n "${NTP_PRIMARY:-}"   ]] && [[ "$have_p" != "yes"   ]] && printf 'ntp server %s\r\n' "$NTP_PRIMARY"
-      [[ -n "${NTP_SECONDARY:-}" ]] && [[ "$have_s" != "yes" ]] && printf 'ntp server %s\r\n' "$NTP_SECONDARY"
+      [[ -n "${NTP_PRIMARY:-}"   && "$have_p" != "yes" ]] && printf 'ntp server %s\r\n' "$NTP_PRIMARY"
+      [[ -n "${NTP_SECONDARY:-}" && "$have_s" != "yes" ]] && printf 'ntp server %s\r\n' "$NTP_SECONDARY"
       printf 'end\r\n'
       printf 'write memory\r\n'
       printf 'exit\r\n'
@@ -892,12 +794,8 @@ meraki_fix_ntp(){
            --msgbox "Could not find runs/preflight/latest.csv.\nRun preflight first." 9 70
     clear; trap - EXIT; return 1; }
 
-  # IOS-XE minimum version check (unless already done in 'all' pipeline)
   if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
-    if ! enforce_min_ios_or_abort "$SUM"; then
-      trap - EXIT
-      return 1
-    fi
+    if ! enforce_min_ios_or_abort "$SUM"; then trap - EXIT; return 1; fi
   fi
 
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($7!="yes") print $1 }' "$SUM")
@@ -914,10 +812,6 @@ meraki_fix_ntp(){
 
   NTPFIX_CSV="$RUN_DIR/ntpfix.csv"
   echo "ip,changed_ntp,synced,notes" > "$NTPFIX_CSV"
-
-  dialog --no-shadow --backtitle "Meraki NTP Updater" \
-         --infobox "Updating NTP servers if needed…\n\nHold for 2 seconds." 7 55
-  sleep 2
 
   UI_TITLE="NTP Fix"; set_backtitle "Meraki NTP Updater"
   ui_start
@@ -947,10 +841,9 @@ meraki_fix_ntp(){
   done
 
   gauge 100 "Done"
+  log "Results: $NTPFIX_CSV"
   ui_stop
   sleep 0.5
-  dialog --no-shadow --backtitle "Meraki NTP Updater" --infobox "NTP entries updated if applicable." 5 48
-  sleep 2
   clear
   trap - EXIT
   return 0
@@ -967,7 +860,6 @@ fix_aaa_one(){
   log "[${ip}] CONNECT…"
   is_priv15_for_ip "$ip" || need_en=1
 
-  # Read current AAA
   {
     printf '\r\nterminal length 0\r\nterminal width 511\r\n'
     (( need_en )) && emit_enable
@@ -985,7 +877,6 @@ fix_aaa_one(){
   grep -Eq '^aaa[[:space:]]+authentication[[:space:]]+login[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && has_login_exact="yes"
   grep -Eq '^aaa[[:space:]]+authorization[[:space:]]+exec[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && has_exec_exact="yes"
 
-  # If we need any of them, configure idempotently.
   if [[ "$has_nm" != "yes" || "$has_login_exact" != "yes" || "$has_exec_exact" != "yes" ]]; then
     changed="yes"
     {
@@ -993,7 +884,6 @@ fix_aaa_one(){
       (( need_en )) && emit_enable
       printf 'configure terminal\r\n'
       [[ "$has_nm" != "yes" ]] && printf 'aaa new-model\r\n'
-      # For default method lists, replace definitively to the Meraki-required form
       if [[ "$has_login_exact" != "yes" ]]; then
         printf 'no aaa authentication login default\r\n'
         printf 'aaa authentication login default local\r\n'
@@ -1011,7 +901,6 @@ fix_aaa_one(){
     log "[${ip}] AAA already compliant."
   fi
 
-  # Verify after
   {
     printf '\r\n'
     (( need_en )) && emit_enable
@@ -1027,9 +916,9 @@ fix_aaa_one(){
   grep -Eq '^aaa[[:space:]]+authentication[[:space:]]+login[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && login_ok="yes" || login_ok="no"
   grep -Eq '^aaa[[:space:]]+authorization[[:space:]]+exec[[:space:]]+default[[:space:]]+local(\s|$)' "$out" && exec_ok="yes" || exec_ok="no"
 
-  if [[ "$nm" != "on" ]]; then notes+="aaa_new_model_verify_failed;"; fi
-  if [[ "$login_ok" != "yes" ]]; then notes+="aaa_login_default_local_missing;"; fi
-  if [[ "$exec_ok"  != "yes" ]]; then notes+="aaa_exec_default_local_missing;"; fi
+  [[ "$nm"       != "on"  ]] && notes+="aaa_new_model_verify_failed;"
+  [[ "$login_ok" != "yes" ]] && notes+="aaa_login_default_local_missing;"
+  [[ "$exec_ok"  != "yes" ]] && notes+="aaa_exec_default_local_missing;"
 
   log "[${ip}] RESULT: CHANGED=${changed} NM=${nm} LOGIN_DEFAULT_LOCAL=${login_ok} AUTHZ_EXEC_DEFAULT_LOCAL=${exec_ok} ${notes:+NOTES=}${notes}"
   append_csv "$AAAFIX_CSV" "${ip},${changed},${nm},${login_ok},${exec_ok},${notes}"
@@ -1039,52 +928,30 @@ fix_aaa_one(){
 }
 
 meraki_fix_aaa(){
-  # Relax strict mode inside this function so an unset var
-  # doesn’t kill the whole script.
-  set +e
-  set +u
-  set +o pipefail
-
+  set +e; set +u; set +o pipefail
   trap 'ui_stop' EXIT
 
-  # env
   [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
   SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
   SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
   ENABLE_PASSWORD="$(__deq "${ENABLE_PASSWORD-}")"
 
-  # latest preflight summary
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
   local LATEST_ENV="$PRE_ROOT/latest.env"
   local SUM=""
-  if [[ -f "$LATEST_ENV" ]]; then
-    # shellcheck disable=SC1090
-    source "$LATEST_ENV"
-    SUM="${PRE_FLIGHT_SUMMARY:-}"
-  fi
+  if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
 
   if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
     dialog --no-shadow --infobox "No preflight summary found.\nRun preflight first." 6 60
-    sleep 2
-    clear
-    trap - EXIT
-    # restore stricter mode before returning
-    set -u
-    set -o pipefail
-    return 1
+    sleep 2; clear; trap - EXIT; set -u; set -o pipefail; return 1
   fi
 
-  # IOS-XE minimum version check (unless already done in 'all' pipeline)
   if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
     if ! enforce_min_ios_or_abort "$SUM"; then
-      trap - EXIT
-      set -u
-      set -o pipefail
-      return 1
+      trap - EXIT; set -u; set -o pipefail; return 1
     fi
   fi
 
-  # targets: any with aaa_*_missing in notes (col 13)
   mapfile -t TARGETS < <(
     awk -F, 'NR>1 {
       if (index($13,"aaa_new_model_missing;")>0 ||
@@ -1095,12 +962,7 @@ meraki_fix_aaa(){
 
   if (( ${#TARGETS[@]} == 0 )); then
     dialog --no-shadow --infobox "All switches already have required AAA.\nNothing to do." 6 60
-    sleep 2
-    clear
-    trap - EXIT
-    set -u
-    set -o pipefail
-    return 0
+    sleep 2; clear; trap - EXIT; set -u; set -o pipefail; return 0
   fi
 
   RUN_ID="aaa-$(date -u +%Y%m%d%H%M%S)"
@@ -1108,11 +970,9 @@ meraki_fix_aaa(){
   RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
   ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
 
+  # Fixed: was $AAFIX_CSV (typo) — now correctly $AAAFIX_CSV
   AAAFIX_CSV="$RUN_DIR/aaafix.csv"
-  echo "ip,changed_aaa,new_model,auth_login_default_local,authz_exec_default_local,notes" > "$AAFIX_CSV"
-
-  dialog --no-shadow --infobox "Enforcing Meraki AAA settings where needed…\nPlease wait." 6 60
-  sleep 2
+  echo "ip,changed_aaa,new_model,auth_login_default_local,authz_exec_default_local,notes" > "$AAAFIX_CSV"
 
   UI_TITLE="AAA Fix"
   ui_start
@@ -1130,33 +990,27 @@ meraki_fix_aaa(){
     sleep "$(rand_ms)"
     if (( ACTIVE >= MAX_CONCURRENCY )); then
       if wait -n; then :; fi
-      ((DONE++))
-      local pct=$(( 100 * DONE / TOTAL ))
+      ((DONE++)); local pct=$(( 100 * DONE / TOTAL ))
       gauge "$pct" "AAA fixed: $DONE / $TOTAL"
       ((ACTIVE--))
     fi
   done
-
   while (( DONE < TOTAL )); do
     if wait -n; then :; fi
-    ((DONE++))
-    local pct=$(( 100 * DONE / TOTAL ))
+    ((DONE++)); local pct=$(( 100 * DONE / TOTAL ))
     gauge "$pct" "AAA fixed: $DONE / $TOTAL"
   done
 
   gauge 100 "Done"
+  log "Results: $AAAFIX_CSV"
   ui_stop
   sleep 0.3
-  dialog --no-shadow --infobox "AAA enforced (new-model, login default local, authz exec default local)." 6 70
-  sleep 2
   clear
   trap - EXIT
-
-  # restore stricter mode for whatever comes next in the script
-  set -u
-  set -o pipefail
+  set -u; set -o pipefail
   return 0
 }
+
 # =====================================================================
 # IP ROUTING / DEFAULT ROUTE FIX
 # =====================================================================
@@ -1164,14 +1018,10 @@ fix_ipr_one(){
   set +e
   local ip="$1"
   local need_en=0 raw out
-  local changed="no"
-  local mgmt_mode="static"
-  local mgmt_method=""
-  local gw=""
+  local changed="no" mgmt_mode="static" mgmt_method="" gw=""
   local iprt_before="unknown" iprt_after="unknown"
   local defrt_before="no" defrt_after="no"
-  local ping_ok="no"
-  local notes=""
+  local ping_ok="no" notes=""
   local route_dhcp_present="no" route_static_present="no"
 
   build_ssh_arr "$ip"; raw="$(mktemp)"; out="$(mktemp)"
@@ -1194,80 +1044,41 @@ fix_ipr_one(){
   tr -d '\r' < "$raw" > "$out"; mkdir -p "$RUN_DIR/devlogs"
   cat "$out" >> "$RUN_DIR/devlogs/${ip}.iprfix.log"; : > "$raw"
 
-  # ip routing state (before)
-  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then
-    iprt_before="off"
-  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then
-    iprt_before="on"
-  else
-    iprt_before="unknown"
-  fi
+  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then iprt_before="off"
+  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then iprt_before="on"
+  else iprt_before="unknown"; fi
 
-  # Determine mgmt method from "show ip interface brief" output
   mgmt_method="$(awk -v ip="$ip" '
     /^Interface[[:space:]]+IP-Address[[:space:]]+OK\?[[:space:]]+Method/ {hdr=1; next}
     hdr && $2==ip {print $4; exit}
   ' "$out")"
+  [[ "$mgmt_method" =~ ^[Dd][Hh][Cc][Pp]$ ]] && mgmt_mode="dhcp" || mgmt_mode="static"
 
-  if [[ "$mgmt_method" =~ ^[Dd][Hh][Cc][Pp]$ ]]; then
-    mgmt_mode="dhcp"
-  else
-    mgmt_mode="static"
-  fi
-
-  # default route presence from running-config
   if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+dhcp(\s|$)' "$out"; then
-    route_dhcp_present="yes"
-    defrt_before="yes"
+    route_dhcp_present="yes"; defrt_before="yes"
   fi
-
   if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+([0-9]+\.){3}[0-9]+(\s|$)' "$out"; then
-    route_static_present="yes"
-    defrt_before="yes"
-    [[ -z "$gw" ]] && gw="$(awk '
-      /^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $5; exit}
-    ' "$out")"
+    route_static_present="yes"; defrt_before="yes"
+    [[ -z "$gw" ]] && gw="$(awk '/^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $5; exit}' "$out")"
   fi
-
-  # if no static route yet, try ip default-gateway
   if [[ "$defrt_before" != "yes" || -z "$gw" ]]; then
-    local gw_tmp
-    gw_tmp="$(awk '
-      /^ip default-gateway[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $3; exit}
-    ' "$out")"
-    if [[ -n "$gw_tmp" ]]; then
-      gw="$gw_tmp"
-      [[ "$defrt_before" != "yes" ]] && defrt_before="legacy"
-    fi
+    local gw_tmp; gw_tmp="$(awk '/^ip default-gateway[[:space:]]+([0-9]+\.){3}[0-9]+/ {print $3; exit}' "$out")"
+    if [[ -n "$gw_tmp" ]]; then gw="$gw_tmp"; [[ "$defrt_before" != "yes" ]] && defrt_before="legacy"; fi
   fi
-
-  # if still no gw, try from ip route table
   if [[ -z "$gw" ]]; then
-    gw="$(awk '
-      /0\.0\.0\.0\/0/ {
-        for (i=1; i<=NF; i++) {
-          if ($i=="via") {print $(i+1); exit}
-        }
-      }
-    ' "$out")"
+    gw="$(awk '/0\.0\.0\.0\/0/ { for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit} }' "$out")"
     [[ -n "$gw" && "$defrt_before" != "yes" ]] && defrt_before="yes"
   fi
 
   log "[${ip}] BEFORE: IPRT=${iprt_before} MGMT_MODE=${mgmt_mode} METHOD=${mgmt_method:-<unknown>} GW=${gw:-<none>} ROUTE_DHCP=${route_dhcp_present} ROUTE_STATIC=${route_static_present} DEFRT=${defrt_before}"
 
-  # decide what to configure
   local do_iprt=0 do_route_dhcp=0 do_route_static=0
-
   [[ "$iprt_before" != "on" ]] && do_iprt=1
-
   if [[ "$mgmt_mode" == "dhcp" ]]; then
     [[ "$route_dhcp_present" != "yes" ]] && do_route_dhcp=1
   else
-    if [[ -z "$gw" ]]; then
-      notes+="no_gateway_detected_cannot_build_static_default;"
-    else
-      [[ "$route_static_present" != "yes" ]] && do_route_static=1
-    fi
+    if [[ -z "$gw" ]]; then notes+="no_gateway_detected_cannot_build_static_default;"
+    else [[ "$route_static_present" != "yes" ]] && do_route_static=1; fi
   fi
 
   if (( do_iprt || do_route_dhcp || do_route_static )); then
@@ -1276,15 +1087,9 @@ fix_ipr_one(){
       printf '\r\n'
       (( need_en )) && emit_enable
       printf 'configure terminal\r\n'
-      if (( do_route_dhcp )); then
-        printf 'ip route 0.0.0.0 0.0.0.0 dhcp\r\n'
-      fi
-      if (( do_route_static )); then
-        printf 'ip route 0.0.0.0 0.0.0.0 %s\r\n' "$gw"
-      fi
-      if (( do_iprt )); then
-        printf 'ip routing\r\n'
-      fi
+      (( do_route_dhcp   )) && printf 'ip route 0.0.0.0 0.0.0.0 dhcp\r\n'
+      (( do_route_static )) && printf 'ip route 0.0.0.0 0.0.0.0 %s\r\n' "$gw"
+      (( do_iprt         )) && printf 'ip routing\r\n'
       printf 'end\r\n'
       printf 'write memory\r\n'
       printf 'exit\r\n'
@@ -1294,7 +1099,6 @@ fix_ipr_one(){
     log "[${ip}] No ip routing/default-route changes needed."
   fi
 
-  # verify + ping 8.8.8.8
   {
     printf '\r\n'
     (( need_en )) && emit_enable
@@ -1308,30 +1112,21 @@ fix_ipr_one(){
 
   tr -d '\r' < "$raw" > "$out"; cat "$out" >> "$RUN_DIR/devlogs/${ip}.iprfix.log"
 
-  # ip routing state (after)
-  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then
-    iprt_after="off"
-  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then
-    iprt_after="on"
-  else
-    iprt_after="unknown"
-  fi
+  if grep -Eq '^no[[:space:]]+ip[[:space:]]+routing' "$out"; then iprt_after="off"
+  elif grep -Eq '^ip[[:space:]]+routing' "$out"; then iprt_after="on"
+  else iprt_after="unknown"; fi
 
-  # default route present (after)
   if grep -Eq '^ip route 0\.0\.0\.0 0\.0\.0\.0[[:space:]]+(dhcp|([0-9]+\.){3}[0-9]+)' "$out" || \
-     awk '/0\.0\.0\.0\/0/ {found=1} END{exit !found}' "$out"
-  then
+     awk '/0\.0\.0\.0\/0/ {found=1} END{exit !found}' "$out"; then
     defrt_after="yes"
   else
     defrt_after="no"
   fi
 
-  # ping 8.8.8.8 result
   if grep -Eiq 'Success +rate +is +([1-9][0-9]*|[0-9]*[1-9]) +percent' "$out" || grep -q '!' "$out"; then
     ping_ok="yes"
   else
-    ping_ok="no"
-    notes+="ping_8.8.8.8_failed;"
+    ping_ok="no"; notes+="ping_8.8.8.8_failed;"
   fi
 
   log "[${ip}] AFTER: IPRT=${iprt_after} DEFRT=${defrt_after} PING=${ping_ok} ${notes:+NOTES=}${notes}"
@@ -1344,21 +1139,15 @@ fix_ipr_one(){
 meraki_fix_ip_routing(){
   trap 'ui_stop' EXIT
 
-  # env
   [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
   SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
   SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
   ENABLE_PASSWORD="$(__deq "${ENABLE_PASSWORD-}")"
 
-  # latest preflight summary
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
   local LATEST_ENV="$PRE_ROOT/latest.env"
   local SUM=""
-
-  if [[ -f "$LATEST_ENV" ]]; then
-    source "$LATEST_ENV"
-    SUM="${PRE_FLIGHT_SUMMARY:-}"
-  fi
+  if [[ -f "$LATEST_ENV" ]]; then source "$LATEST_ENV"; SUM="${PRE_FLIGHT_SUMMARY:-}"; fi
 
   if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
     dialog --no-shadow --backtitle "$BACKTITLE" \
@@ -1366,38 +1155,24 @@ meraki_fix_ip_routing(){
     clear; trap - EXIT; return 1
   fi
 
-  # IOS-XE minimum version check (unless already done in 'all' pipeline)
   if [[ "${SKIP_IOS_CHECK:-0}" != "1" ]]; then
-    if ! enforce_min_ios_or_abort "$SUM"; then
-      trap - EXIT
-      return 1
-    fi
+    if ! enforce_min_ios_or_abort "$SUM"; then trap - EXIT; return 1; fi
   fi
 
-  # TARGETS: any device where ip_routing != "yes" OR default_route != "yes"
-  # CSV columns: ip,hostname,ios_ver,install_mode,meraki_mode,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,tunnel,ready,notes
   mapfile -t TARGETS < <(awk -F, 'NR>1 { if ($8!="yes" || $9!="yes") print $1 }' "$SUM")
-
   if (( ${#TARGETS[@]} == 0 )); then
     dialog --no-shadow --backtitle "$BACKTITLE" \
            --infobox "All switches already have ip routing enabled and a default route.\nNothing to do." 7 75
-    sleep 2
-    clear; trap - EXIT; return 0
+    sleep 2; clear; trap - EXIT; return 0
   fi
 
-  # run directory
   RUN_ID="ipr-$(date -u +%Y%m%d%H%M%S)"
   RUN_ROOT="$SCRIPT_DIR/runs/iprfix"; mkdir -p "$RUN_ROOT"
   RUN_DIR="$RUN_ROOT/$RUN_ID"; mkdir -p "$RUN_DIR" "$RUN_DIR/devlogs"
   ln -sfn "$RUN_DIR" "$RUN_ROOT/latest"
 
-  # CSV for results
   IPRFIX_CSV="$RUN_DIR/iprfix.csv"
   echo "ip,mgmt_mode,changed_config,ip_routing_enabled,default_route_present,ping_8_8_8_8_ok,notes" > "$IPRFIX_CSV"
-
-  dialog --no-shadow --backtitle "$BACKTITLE" \
-         --infobox "Ensuring ip routing + default route where needed...\nPlease wait." 7 75
-  sleep 2
 
   UI_TITLE="IP Routing Fix"
   set_backtitle "Meraki IP Routing Updater"
@@ -1408,7 +1183,6 @@ meraki_fix_ip_routing(){
 
   local MAX_CONCURRENCY="${MAX_CONCURRENCY:-5}"
   local ACTIVE=0 DONE=0 TOTAL=${#TARGETS[@]}
-
   rand_ms(){ awk -v m="${SPLAY_MS:-150}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}'; }
 
   for ip in "${TARGETS[@]}"; do
@@ -1417,96 +1191,548 @@ meraki_fix_ip_routing(){
     sleep "$(rand_ms)"
     if (( ACTIVE >= MAX_CONCURRENCY )); then
       if wait -n; then :; fi
-      ((DONE++))
-      local pct=$(( 100 * DONE / TOTAL ))
+      ((DONE++)); local pct=$(( 100 * DONE / TOTAL ))
       gauge "$pct" "Routing fixed on $DONE / $TOTAL"
       ((ACTIVE--))
     fi
   done
-
   while (( DONE < TOTAL )); do
     if wait -n; then :; fi
-    ((DONE++))
-    local pct=$(( 100 * DONE / TOTAL ))
+    ((DONE++)); local pct=$(( 100 * DONE / TOTAL ))
     gauge "$pct" "Routing fixed on $DONE / $TOTAL"
   done
 
   gauge 100 "Done"
+  log "Results: $IPRFIX_CSV"
   ui_stop
   sleep 0.5
-  dialog --no-shadow --backtitle "$BACKTITLE" \
-         --infobox "ip routing + default route ensured where needed.\nSee iprfix.csv for details." 7 80
-  sleep 2
   clear
   trap - EXIT
   return 0
 }
 
 # =====================================================================
-# PIPELINE
+# PIPELINE SUMMARY — reads all result CSVs and builds a report
+# =====================================================================
+_pipeline_summary(){
+  local mdir="$1" run_id="${2:-}"
+  local f
+
+  printf 'Run ID  : %s\n' "$run_id"
+  printf 'Results : %s\n' "$mdir"
+  printf '\n'
+
+  # ── Preflight ─────────────────────────────────────────────────────────────
+  f="$mdir/summary.csv"
+  printf '%-30s\n' "PREFLIGHT PROBE"
+  printf '%s\n'    "------------------------------"
+  if [[ -f "$f" ]]; then
+    awk -F, '
+      NR>1 && $1!="" {
+        total++
+        if ($12=="yes") ready++
+        else            need++
+      }
+      END {
+        printf "  Switches probed   : %d\n", total+0
+        printf "  Already ready     : %d\n", ready+0
+        printf "  Needed fixes      : %d\n", need+0
+      }
+    ' "$f"
+  else
+    printf '  (no data)\n'
+  fi
+  printf '\n'
+
+  # ── DNS ───────────────────────────────────────────────────────────────────
+  f="$mdir/dnsfix/dnsfix.csv"
+  printf '%-30s\n' "DNS FIX"
+  printf '%s\n'    "------------------------------"
+  if [[ -f "$f" ]]; then
+    awk -F, '
+      NR>1 && $1!="" {
+        total++
+        if ($2=="yes") { changed++; mod = (mod ? mod ", " : "") $1 }
+        else             unchanged++
+        if ($4=="yes") resolved++
+      }
+      END {
+        printf "  Modified          : %d%s\n", changed+0,   (mod   ? "  [" mod "]" : "")
+        printf "  Already correct   : %d\n",   unchanged+0
+        printf "  DNS resolution OK : %d / %d\n", resolved+0, total+0
+      }
+    ' "$f"
+  else
+    printf '  Skipped — all switches already compliant\n'
+  fi
+  printf '\n'
+
+  # ── NTP ───────────────────────────────────────────────────────────────────
+  f="$mdir/ntpfix/ntpfix.csv"
+  printf '%-30s\n' "NTP FIX"
+  printf '%s\n'    "------------------------------"
+  if [[ -f "$f" ]]; then
+    awk -F, '
+      NR>1 && $1!="" {
+        total++
+        if ($2=="yes") { changed++; mod = (mod ? mod ", " : "") $1 }
+        else             unchanged++
+        if ($3=="yes") synced++
+      }
+      END {
+        printf "  Modified          : %d%s\n", changed+0,   (mod ? "  [" mod "]" : "")
+        printf "  Already correct   : %d\n",   unchanged+0
+        printf "  Synchronized      : %d / %d\n", synced+0, total+0
+      }
+    ' "$f"
+  else
+    printf '  Skipped — no NTP servers defined or all already compliant\n'
+  fi
+  printf '\n'
+
+  # ── AAA ───────────────────────────────────────────────────────────────────
+  f="$mdir/aaafix/aaafix.csv"
+  printf '%-30s\n' "AAA FIX"
+  printf '%s\n'    "------------------------------"
+  if [[ -f "$f" ]]; then
+    awk -F, '
+      NR>1 && $1!="" {
+        total++
+        if ($2=="yes") { changed++; mod = (mod ? mod ", " : "") $1 }
+        else             unchanged++
+        if ($3=="on")  nm_ok++
+        if ($4=="yes") login_ok++
+        if ($5=="yes") exec_ok++
+      }
+      END {
+        printf "  Modified          : %d%s\n", changed+0,   (mod ? "  [" mod "]" : "")
+        printf "  Already correct   : %d\n",   unchanged+0
+        printf "  new-model OK      : %d / %d\n", nm_ok+0,    total+0
+        printf "  login local OK    : %d / %d\n", login_ok+0, total+0
+        printf "  exec local OK     : %d / %d\n", exec_ok+0,  total+0
+      }
+    ' "$f"
+  else
+    printf '  Skipped — all switches already compliant\n'
+  fi
+  printf '\n'
+
+  # ── IP Routing ────────────────────────────────────────────────────────────
+  f="$mdir/iprfix/iprfix.csv"
+  printf '%-30s\n' "IP ROUTING FIX"
+  printf '%s\n'    "------------------------------"
+  if [[ -f "$f" ]]; then
+    awk -F, '
+      NR>1 && $1!="" {
+        total++
+        if ($3=="yes") { changed++; mod = (mod ? mod ", " : "") $1 }
+        else             unchanged++
+        if ($6=="yes") ping_ok++
+      }
+      END {
+        printf "  Modified          : %d%s\n", changed+0,   (mod ? "  [" mod "]" : "")
+        printf "  Already correct   : %d\n",   unchanged+0
+        printf "  Ping 8.8.8.8 OK   : %d / %d\n", ping_ok+0, total+0
+      }
+    ' "$f"
+  else
+    printf '  Skipped — all switches already compliant\n'
+  fi
+  printf '\n'
+}
+
+# =====================================================================
+# PIPELINE — single UI window for all phases
 # =====================================================================
 meraki_all(){
-  echo "[hybrid] === Starting full preflight pipeline ==="
+  trap 'ui_stop' EXIT
+  set_backtitle "Meraki Migration — Full Pipeline"
 
-  # 1) Preflight
-  echo "[hybrid] -> meraki_preflight"
-  meraki_preflight || {
-    local rc=$?
-    echo "[hybrid] meraki_preflight failed with rc=$rc"
-    return "$rc"
+  # ── Load env ──────────────────────────────────────────────────────────────
+  [[ -f "$DISC_ENV" ]] && source "$DISC_ENV"
+  SSH_USERNAME="$(__deq "${SSH_USERNAME-}")"
+  SSH_PASSWORD="$(__deq "${SSH_PASSWORD-}")"
+  ENABLE_PASSWORD="$(__deq "${ENABLE_PASSWORD-}")"
+  DNS_PRIMARY="$(__deq "${DNS_PRIMARY-}")"
+  DNS_SECONDARY="$(__deq "${DNS_SECONDARY-}")"
+  NTP_PRIMARY="$(__deq "${NTP_PRIMARY-}")"
+  NTP_SECONDARY="$(__deq "${NTP_SECONDARY-}")"
+
+  if [[ -z "${SSH_KEY_PATH-}" && -n "$SSH_PASSWORD" ]] && ! command -v sshpass >/dev/null 2>&1; then
+    dlg --title "Missing requirement" --msgbox "sshpass is required when SSH_PASSWORD is used.\n\nInstall it or set SSH_KEY_PATH to a readable private key." 11 70
+    clear; trap - EXIT; return 1
+  fi
+  [[ -n "$SSH_USERNAME" ]] || {
+    dlg --title "Missing" --msgbox "SSH_USERNAME is empty in meraki_discovery.env" 7 60
+    clear; trap - EXIT; return 1
   }
 
-  # 2) Grab summary path from latest.env
+  # ── Determine device source ────────────────────────────────────────────────
+  local SRC="" have_disc="" have_sel_json="" have_sel_ips=""
+
+  [[ -s "$SEL_JSON" && "$(jq 'length' "$SEL_JSON" 2>/dev/null || echo 0)" -gt 0 ]] && have_sel_json=1
+  if [[ -f "$SEL_ENV" ]]; then
+    source "$SEL_ENV"
+    UPGRADE_SELECTED_IPS="$(__deq "${UPGRADE_SELECTED_IPS-}")"
+    [[ -n "$UPGRADE_SELECTED_IPS" ]] && have_sel_ips=1
+  fi
+  [[ -s "$DISC_JSON" ]] && have_disc=1
+
+  if   [[ -n "$have_sel_json" ]]; then SRC="seljson"
+  elif [[ -n "$have_sel_ips"  ]]; then SRC="selips"
+  elif [[ -n "$have_disc"     ]]; then SRC="disc"
+  else
+    dlg --title "Nothing to pick" --msgbox \
+      "No selected_upgrade.json, selected_upgrade.env, or discovery_results.json found.\nRun the IOS-XE upgrader or Discovery first." 10 75
+    clear; trap - EXIT; return 1
+  fi
+
+  # ── Discovery gate maps ────────────────────────────────────────────────────
+  declare -A DISC_SSH DISC_LOGIN DISC_BL DISC_BLR
+  if [[ -s "$DISC_JSON" ]]; then
+    while IFS=$'\t' read -r ip ssh login bl blr; do
+      DISC_SSH["$ip"]="$ssh"; DISC_LOGIN["$ip"]="$login"
+      DISC_BL["$ip"]="$bl";   DISC_BLR["$ip"]="$blr"
+    done < <(jq -r '.[] | [.ip, (.ssh//false), (.login//false), (.blacklisted//false), (.blacklist_reason//"")] | @tsv' "$DISC_JSON")
+  fi
+
+  # ── Load device lists ──────────────────────────────────────────────────────
+  declare -a IPS HOSTS PIDS VERS SER
+
+  if [[ "$SRC" == "disc" ]]; then
+    mapfile -t IPS   < <(jq -r '.[].ip'             "$DISC_JSON" 2>/dev/null)
+    mapfile -t HOSTS < <(jq -r '.[].hostname // ""' "$DISC_JSON" 2>/dev/null)
+    mapfile -t PIDS  < <(jq -r '.[].pid // ""'      "$DISC_JSON" 2>/dev/null)
+    mapfile -t VERS  < <(jq -r '.[].version // ""'  "$DISC_JSON" 2>/dev/null)
+    mapfile -t SER   < <(jq -r '.[].serial // ""'   "$DISC_JSON" 2>/dev/null)
+  elif [[ "$SRC" == "seljson" ]]; then
+    mapfile -t IPS   < <(jq -r '.[].ip'                      "$SEL_JSON" 2>/dev/null)
+    mapfile -t HOSTS < <(jq -r '.[].hostname // ""'          "$SEL_JSON" 2>/dev/null)
+    mapfile -t PIDS  < <(jq -r '.[].pid // ""'               "$SEL_JSON" 2>/dev/null)
+    mapfile -t VERS  < <(jq -r '.[].installed_version // ""' "$SEL_JSON" 2>/dev/null)
+    mapfile -t SER   < <(jq -r '.[].serial // ""'            "$SEL_JSON" 2>/dev/null)
+  else
+    read -r -a IPS <<<"${UPGRADE_SELECTED_IPS:-}"
+    HOSTS=(); PIDS=(); VERS=(); SER=()
+    if [[ -s "$DISC_JSON" ]]; then
+      declare -A HMAP VMAP PMAP SMAP
+      while IFS=$'\t' read -r ip h v p s; do
+        HMAP["$ip"]="$h"; VMAP["$ip"]="$v"; PMAP["$ip"]="$p"; SMAP["$ip"]="$s"
+      done < <(jq -r '.[] | [.ip, (.hostname // ""), (.version // ""), (.pid // ""), (.serial // "")] | @tsv' "$DISC_JSON")
+      for ip in "${IPS[@]}"; do
+        HOSTS+=( "${HMAP[$ip]:-}" ); VERS+=( "${VMAP[$ip]:-}" )
+        PIDS+=(  "${PMAP[$ip]:-}" ); SER+=(  "${SMAP[$ip]:-}" )
+      done
+    else
+      for _ in "${IPS[@]}"; do HOSTS+=(""); PIDS+=(""); VERS+=(""); SER+=(""); done
+    fi
+  fi
+
+  (( ${#IPS[@]} > 0 )) || {
+    dlg --title "No devices" --msgbox "The chosen source has zero devices." 7 60
+    clear; trap - EXIT; return 1
+  }
+
+  # ── Build checklist ────────────────────────────────────────────────────────
+  local CHK=()
+  for i in "${!IPS[@]}"; do
+    local ip="${IPS[$i]}" h="${HOSTS[$i]}" p="${PIDS[$i]}" s="${SER[$i]}"
+    if [[ -n "${DISC_SSH[$ip]+x}" ]]; then
+      [[ "${DISC_SSH[$ip]:-false}"   != "true" ]] && continue
+      [[ "${DISC_LOGIN[$ip]:-false}" != "true" ]] && continue
+      [[ "${DISC_BL[$ip]:-false}"   == "true"  ]] && continue
+    fi
+    local desc; desc="$(trim "${h:-$ip}  ${p:+($p) }${s:+SN:$s}")"
+    CHK+=( "$ip" "$desc" "on" )
+  done
+
+  if (( ${#CHK[@]} == 0 )); then
+    dlg --title "No eligible devices" --msgbox \
+      "Discovery found devices, but none are eligible.\n\n(ssh/login failed or they are explicitly blacklisted.)" 11 75
+    clear; trap - EXIT; return 1
+  fi
+
+  # Dialog checklist — the ONLY dialog before the single UI window opens
+  dlg --title "Select switches for full pipeline" \
+      --checklist "Devices will be probed then have DNS / NTP / AAA / Routing fixed in one pass:" \
+      20 78 12 "${CHK[@]}"
+  [[ $? -eq 0 ]] || { clear; trap - EXIT; return 1; }
+  read -r -a TARGETS <<<"$DOUT"
+  (( ${#TARGETS[@]} )) || { clear; trap - EXIT; return 0; }
+
+  # ── Master run directory ───────────────────────────────────────────────────
+  local MASTER_RUN_ID="pipeline-$(date -u +%Y%m%d%H%M%S)"
+  local MASTER_ROOT="$SCRIPT_DIR/runs/pipeline"
+  local MASTER_DIR="$MASTER_ROOT/$MASTER_RUN_ID"
+  mkdir -p "$MASTER_DIR/devlogs"
+
+  # Wire preflight symlinks so standalone fix-* commands can find this run later
   local PRE_ROOT="$SCRIPT_DIR/runs/preflight"
-  local LATEST_ENV="$PRE_ROOT/latest.env"
-  local SUM=""
+  mkdir -p "$PRE_ROOT"
+  PRE_FLIGHT_RUN_ID="$MASTER_RUN_ID"; export PRE_FLIGHT_RUN_ID
+  PRE_FLIGHT_RUN_DIR="$MASTER_DIR";   export PRE_FLIGHT_RUN_DIR
 
-  if [[ -f "$LATEST_ENV" ]]; then
-    # shellcheck disable=SC1090
-    source "$LATEST_ENV"
-    SUM="${PRE_FLIGHT_SUMMARY:-}"
+  SUMMARY_CSV="$MASTER_DIR/summary.csv"
+  echo "ip,hostname,ios_ver,install_mode,meraki_mode,dns_ok,ntp_ok,ip_routing,default_route,domain_lookup,tunnel,ready,notes" > "$SUMMARY_CSV"
+  PRE_FLIGHT_SUMMARY="$SUMMARY_CSV"; export PRE_FLIGHT_SUMMARY
+
+  printf 'export PRE_FLIGHT_RUN_ID=%q\nexport PRE_FLIGHT_RUN_DIR=%q\nexport PRE_FLIGHT_SUMMARY=%q\n' \
+    "$PRE_FLIGHT_RUN_ID" "$PRE_FLIGHT_RUN_DIR" "$PRE_FLIGHT_SUMMARY" > "$PRE_ROOT/latest.env"
+  ln -sfn "$MASTER_DIR"  "$PRE_ROOT/latest"
+  ln -sfn "$SUMMARY_CSV" "$PRE_ROOT/latest.csv"
+
+  # ── Open the single shared UI window — stays open for all phases ───────────
+  RUN_ID="$MASTER_RUN_ID"
+  RUN_DIR="$MASTER_DIR"
+  UI_TITLE="Migration Pipeline"
+  ui_start
+
+  log "Pipeline run: $MASTER_RUN_ID"
+  log "Master dir:   $MASTER_DIR"
+  log "Targets (${#TARGETS[@]}): ${TARGETS[*]}"
+
+  local MAX_CONCURRENCY="${MAX_CONCURRENCY:-5}"
+  local ACTIVE DONE TOTAL pct
+  rand_ms(){ awk -v m="${SPLAY_MS:-150}" 'BEGIN{srand(); printf "%.3f", (rand()*m)/1000.0}'; }
+
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PHASE 1 — PREFLIGHT PROBE"
+  # ══════════════════════════════════════════════════════════════════
+  log "Probing ${#TARGETS[@]} switch(es)…"
+  gauge 0 "Starting probe…"
+  ACTIVE=0; DONE=0; TOTAL=${#TARGETS[@]}
+
+  for ip in "${TARGETS[@]}"; do
+    ( probe_one "$ip" ) &
+    ((ACTIVE++))
+    sleep "$(rand_ms)"
+    if (( ACTIVE >= MAX_CONCURRENCY )); then
+      if wait -n; then :; fi
+      ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "Probed $DONE / $TOTAL"
+      ((ACTIVE--))
+    fi
+  done
+  while (( DONE < TOTAL )); do
+    if wait -n; then :; fi
+    ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+    gauge "$pct" "Probed $DONE / $TOTAL"
+  done
+  gauge 100 "Probe complete"
+  log "Preflight summary written: $SUMMARY_CSV"
+
+  # Post-probe artifacts (same as standalone preflight)
+  local VAL_ENV="$SCRIPT_DIR/validated_switches.env"
+  local VAL_JSON="$SCRIPT_DIR/validated_ips.json"
+  local validated_ips
+  validated_ips="$(awk -F, 'NR>1 && $12=="yes" {print $1}' "$SUMMARY_CSV" | xargs)"
+  if [[ -n "$validated_ips" ]]; then
+    printf 'export VALIDATED_SWITCH_IPS=%q\n' "$validated_ips" > "$VAL_ENV"
+    awk -F, 'NR>1 && $12=="yes" {printf "%s,%s\n",$1,$2}' "$SUMMARY_CSV" \
+      | jq -R -s 'split("\n") | map(select(length>0) | split(",") | {ip: .[0], hostname: .[1]})' \
+      > "$VAL_JSON" 2>/dev/null || true
+  else
+    rm -f "$VAL_ENV" "$VAL_JSON" 2>/dev/null || true
+  fi
+  {
+    echo "RUN_ID=$MASTER_RUN_ID"
+    echo "SUMMARY_CSV=$SUMMARY_CSV"
+    echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$SCRIPT_DIR/preflight_validated.flag"
+
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "IOS-XE VERSION CHECK  (minimum: ${MIN_IOS_VERSION})"
+  # ══════════════════════════════════════════════════════════════════
+  # enforce_min_ios_or_abort detects DPID is set and logs to tailbox instead of dialog
+  if ! enforce_min_ios_or_abort "$SUMMARY_CSV"; then
+    log "Pipeline aborted — one or more switches failed the IOS version check."
+    gauge 100 "Aborted"
+    sleep 2
+    ui_stop; clear; trap - EXIT; return 1
+  fi
+  log "IOS version check passed for all probed switches."
+
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PHASE 2 — DNS FIX"
+  # ══════════════════════════════════════════════════════════════════
+  RUN_DIR="$MASTER_DIR/dnsfix"; mkdir -p "$RUN_DIR/devlogs"
+  DNSFIX_CSV="$RUN_DIR/dnsfix.csv"
+  echo "ip,changed_dns,enabled_domain_lookup,resolution_ok,notes" > "$DNSFIX_CSV"
+
+  local -a DNS_TARGETS
+  mapfile -t DNS_TARGETS < <(awk -F, 'NR>1 { if ($6!="yes" || $10=="disabled") print $1 }' "$SUMMARY_CSV")
+
+  if (( ${#DNS_TARGETS[@]} == 0 )); then
+    log "All switches already have DNS and domain lookup enabled — skipping DNS phase."
+  else
+    log "DNS targets (${#DNS_TARGETS[@]}): ${DNS_TARGETS[*]}"
+    log "Using DNS servers: ${DNS_PRIMARY:-<none>} ${DNS_SECONDARY:-<none>}"
+    gauge 0 "Starting DNS fixes…"
+    ACTIVE=0; DONE=0; TOTAL=${#DNS_TARGETS[@]}
+
+    for ip in "${DNS_TARGETS[@]}"; do
+      ( fix_dns_one "$ip" ) &
+      ((ACTIVE++))
+      sleep "$(rand_ms)"
+      if (( ACTIVE >= MAX_CONCURRENCY )); then
+        if wait -n; then :; fi
+        ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+        gauge "$pct" "DNS fixed $DONE / $TOTAL"
+        ((ACTIVE--))
+      fi
+    done
+    while (( DONE < TOTAL )); do
+      if wait -n; then :; fi
+      ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "DNS fixed $DONE / $TOTAL"
+    done
+    gauge 100 "DNS phase complete"
+    log "DNS results: $DNSFIX_CSV"
   fi
 
-  if [[ -z "${SUM:-}" || ! -f "$SUM" ]]; then
-    echo "[hybrid] ERROR: Preflight summary missing after preflight. Aborting." >&2
-    return 1
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PHASE 3 — NTP FIX"
+  # ══════════════════════════════════════════════════════════════════
+  if [[ -z "${NTP_PRIMARY:-}" && -z "${NTP_SECONDARY:-}" ]]; then
+    log "WARNING: No NTP servers defined in meraki_discovery.env — skipping NTP phase."
+  else
+    RUN_DIR="$MASTER_DIR/ntpfix"; mkdir -p "$RUN_DIR/devlogs"
+    NTPFIX_CSV="$RUN_DIR/ntpfix.csv"
+    echo "ip,changed_ntp,synced,notes" > "$NTPFIX_CSV"
+
+    local -a NTP_TARGETS
+    mapfile -t NTP_TARGETS < <(awk -F, 'NR>1 { if ($7!="yes") print $1 }' "$SUMMARY_CSV")
+
+    if (( ${#NTP_TARGETS[@]} == 0 )); then
+      log "All switches already have NTP configured — skipping."
+    else
+      log "NTP targets (${#NTP_TARGETS[@]}): ${NTP_TARGETS[*]}"
+      log "Using NTP servers: ${NTP_PRIMARY:-<none>} ${NTP_SECONDARY:-<none>}"
+      gauge 0 "Starting NTP fixes…"
+      ACTIVE=0; DONE=0; TOTAL=${#NTP_TARGETS[@]}
+
+      for ip in "${NTP_TARGETS[@]}"; do
+        ( fix_ntp_one "$ip" ) &
+        ((ACTIVE++))
+        sleep "$(rand_ms)"
+        if (( ACTIVE >= MAX_CONCURRENCY )); then
+          if wait -n; then :; fi
+          ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+          gauge "$pct" "NTP fixed $DONE / $TOTAL"
+          ((ACTIVE--))
+        fi
+      done
+      while (( DONE < TOTAL )); do
+        if wait -n; then :; fi
+        ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+        gauge "$pct" "NTP fixed $DONE / $TOTAL"
+      done
+      gauge 100 "NTP phase complete"
+      log "NTP results: $NTPFIX_CSV"
+    fi
   fi
 
-  echo "[hybrid] Preflight summary: $SUM"
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PHASE 4 — AAA FIX"
+  # ══════════════════════════════════════════════════════════════════
+  RUN_DIR="$MASTER_DIR/aaafix"; mkdir -p "$RUN_DIR/devlogs"
+  AAAFIX_CSV="$RUN_DIR/aaafix.csv"
+  echo "ip,changed_aaa,new_model,auth_login_default_local,authz_exec_default_local,notes" > "$AAAFIX_CSV"
 
-  # 3) IOS min-version check ONCE for the whole pipeline
-  echo "[hybrid] -> enforce_min_ios_or_abort"
-  if ! enforce_min_ios_or_abort "$SUM"; then
-    echo "[hybrid] IOS minimum version check failed; stopping pipeline."
-    return 1
+  local -a AAA_TARGETS
+  mapfile -t AAA_TARGETS < <(
+    awk -F, 'NR>1 {
+      if (index($13,"aaa_new_model_missing;")>0 ||
+          index($13,"aaa_login_missing;")>0      ||
+          index($13,"aaa_exec_missing;")>0) print $1
+    }' "$SUMMARY_CSV"
+  )
+
+  if (( ${#AAA_TARGETS[@]} == 0 )); then
+    log "All switches already have required AAA settings — skipping."
+  else
+    log "AAA targets (${#AAA_TARGETS[@]}): ${AAA_TARGETS[*]}"
+    gauge 0 "Starting AAA fixes…"
+    ACTIVE=0; DONE=0; TOTAL=${#AAA_TARGETS[@]}
+
+    for ip in "${AAA_TARGETS[@]}"; do
+      ( fix_aaa_one "$ip" ) &
+      ((ACTIVE++))
+      sleep "$(rand_ms)"
+      if (( ACTIVE >= MAX_CONCURRENCY )); then
+        if wait -n; then :; fi
+        ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+        gauge "$pct" "AAA fixed $DONE / $TOTAL"
+        ((ACTIVE--))
+      fi
+    done
+    while (( DONE < TOTAL )); do
+      if wait -n; then :; fi
+      ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "AAA fixed $DONE / $TOTAL"
+    done
+    gauge 100 "AAA phase complete"
+    log "AAA results: $AAAFIX_CSV"
   fi
 
-  # Tell the per-fix functions to skip their own IOS checks
-  SKIP_IOS_CHECK=1
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PHASE 5 — IP ROUTING / DEFAULT ROUTE FIX"
+  # ══════════════════════════════════════════════════════════════════
+  RUN_DIR="$MASTER_DIR/iprfix"; mkdir -p "$RUN_DIR/devlogs"
+  IPRFIX_CSV="$RUN_DIR/iprfix.csv"
+  echo "ip,mgmt_mode,changed_config,ip_routing_enabled,default_route_present,ping_8_8_8_8_ok,notes" > "$IPRFIX_CSV"
 
-  # 4) DNS
-  echo "[hybrid] -> meraki_fix_dns"
-  meraki_fix_dns || {
-    local rc=$?
-    echo "[hybrid] meraki_fix_dns failed with rc=$rc (stopping)"
-    return "$rc"
-  }
+  local -a IPR_TARGETS
+  mapfile -t IPR_TARGETS < <(awk -F, 'NR>1 { if ($8!="yes" || $9!="yes") print $1 }' "$SUMMARY_CSV")
 
-  # 5) NTP
-  echo "[hybrid] -> meraki_fix_ntp"
-  meraki_fix_ntp || echo "[hybrid] meraki_fix_ntp returned non-zero (continuing)"
+  if (( ${#IPR_TARGETS[@]} == 0 )); then
+    log "All switches already have ip routing and a default route — skipping."
+  else
+    log "IP routing targets (${#IPR_TARGETS[@]}): ${IPR_TARGETS[*]}"
+    gauge 0 "Starting IP routing fixes…"
+    ACTIVE=0; DONE=0; TOTAL=${#IPR_TARGETS[@]}
 
-  # 6) AAA
-  echo "[hybrid] -> meraki_fix_aaa"
-  meraki_fix_aaa || echo "[hybrid] meraki_fix_aaa returned non-zero (continuing)"
+    for ip in "${IPR_TARGETS[@]}"; do
+      ( fix_ipr_one "$ip" ) &
+      ((ACTIVE++))
+      sleep "$(rand_ms)"
+      if (( ACTIVE >= MAX_CONCURRENCY )); then
+        if wait -n; then :; fi
+        ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+        gauge "$pct" "Routing fixed $DONE / $TOTAL"
+        ((ACTIVE--))
+      fi
+    done
+    while (( DONE < TOTAL )); do
+      if wait -n; then :; fi
+      ((DONE++)); pct=$(( 100 * DONE / TOTAL ))
+      gauge "$pct" "Routing fixed $DONE / $TOTAL"
+    done
+    gauge 100 "IP routing phase complete"
+    log "IP routing results: $IPRFIX_CSV"
+  fi
 
-  # 7) IP routing / default route
-  echo "[hybrid] -> meraki_fix_ip_routing"
-  meraki_fix_ip_routing || echo "[hybrid] meraki_fix_ip_routing returned non-zero (continuing)"
+  # ══════════════════════════════════════════════════════════════════
+  log_sep "PIPELINE COMPLETE"
+  # ══════════════════════════════════════════════════════════════════
+  log "All phases finished."
+  log "Run directory: $MASTER_DIR"
+  gauge 100 "All done — press any key to exit"
 
-  echo "[hybrid] === Preflight pipeline finished ==="
-  return 0
+  # Brief pause so the operator can read the final log before the window closes
+  sleep 2
+  ui_stop
+
+  # ── Post-run summary dialog ────────────────────────────────────────────────
+  local _stmp; _stmp="$(mktemp)"
+  _pipeline_summary "$MASTER_DIR" "$MASTER_RUN_ID" > "$_stmp"
+  set_backtitle "Meraki Migration — Pipeline Complete"
+  dlg --title " Pipeline Complete — $MASTER_RUN_ID " --textbox "$_stmp" 32 74
+  rm -f "$_stmp"
+  clear
+  trap - EXIT
 }
+
 # =====================================================================
 # Entry
 # =====================================================================
@@ -1517,7 +1743,7 @@ case "${1:-all}" in
   fix-aaa)     UI_TITLE="AAA Fix";          meraki_fix_aaa ;;
   fix-routing) UI_TITLE="IP Routing Fix";   meraki_fix_ip_routing ;;
   all|"")
-    UI_TITLE="Preflight / All Fixes"
+    UI_TITLE="Migration Pipeline"
     meraki_all
     ;;
   *)

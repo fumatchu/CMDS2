@@ -13,7 +13,7 @@
 #   - Meraki API paths still call it {serial}, but we always supply cloud_id.
 # ============================================================
 
-set -Euo pipefail
+set -uo pipefail
 exec 2> >(tee -a "/tmp/cloud_admin_port_mig.stderr.log" >&2)
 
 PORT_MIG_TRACE_LOG="/tmp/port_migration_trace.log"
@@ -3515,7 +3515,7 @@ apply_ports_from_diff() {
 Success:  $ok_count port(s)\n\
 Warnings: $warn_count port(s)\n\
 Failed:   $fail_count port(s)\n\n\
-See log file for details:\n  $apply_log"
+"
 
     "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
             --title "Port apply results" \
@@ -4201,22 +4201,36 @@ show_main_menu() {
     fi
 
     # run each selected switch
-    local ip ok=0 fail=0
-    for ip in "${ips[@]}"; do
-      ip="$(trim "$ip")"
-      [[ -n "$ip" ]] || continue
+    local ip ok=0 warn=0 fail=0
+local run_log
 
-      if auto_run_for_ip "$ip"; then
-        ((++ok))
-      else
-        ((++fail))
-      fi
-    done
+for ip in "${ips[@]}"; do
+  ip="$(trim "$ip")"
+  [[ -n "$ip" ]] || continue
+
+  run_log="/tmp/port_migration_${ip}.log"
+
+  # run with tee but preserve exit code
+  auto_run_for_ip "$ip" 2>&1 | tee "$run_log"
+  rc=${PIPESTATUS[0]}
+
+  if [[ $rc -eq 0 ]]; then
+    if grep -qi "warning" "$run_log"; then
+      ((++warn))
+    else
+      ((++ok))
+    fi
+  else
+    ((++fail))
+  fi
+done
 
     dlg --backtitle "$BACKTITLE_PORTS" \
         --title "Run complete" \
-        --msgbox "Automated run complete.\n\nOK:     $ok\nFailed: $fail\n\n(Review Logs if needed: Main Menu--> Logging--> Port Migration Runs)" \
-        12 80
+        --msgbox "Automated run complete.\n\n\
+
+(Review Logs if needed: Main Menu--> Logging--> Port Migration Runs)" \
+12 80
   done
 }
 
