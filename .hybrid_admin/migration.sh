@@ -697,10 +697,7 @@ validate_switches_before_migration() {
     echo "Connectivity, IOS-XE, config & Meraki compatibility validation"
     echo "================================================================"
     echo
-    echo "Discovery env:  $DISC_ENV"
     echo "Min IOS-XE required:  $MIN_IOS"
-    echo "Run directory:"
-    echo "  $RUN_DIR"
     echo
     echo "Checked switches:"
     echo
@@ -2333,9 +2330,6 @@ onboard_meraki_connect_switches() {
   {
     echo "Meraki connect onboarding summary"
     echo "================================"
-    echo
-    echo "Run directory:"
-    echo "  $RUN_DIR"
     echo
     echo "Switch Meraki connect state:"
     echo
