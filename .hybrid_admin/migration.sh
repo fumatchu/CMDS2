@@ -1179,31 +1179,33 @@ USAGE
 
     local tmp="$TMPDIR/switch_list.txt"
     {
-      echo "Planned switches to map (from upgrade_plan.*):"
-      echo
-      printf "%-16s %-24s %-15s %-15s %s\n" "IP" "Hostname" "PID" "Serial" "Status"
-      printf "%-16s %-24s %-15s %-15s %s\n" "----------------" "------------------------" "---------------" "---------------" "-------------------------------"
-      for i in "${!IPS[@]}"; do
-        local ip="${IPS[$i]}"
-        local h="${HOSTS[$i]:-<unknown>}"
-        local p="${PIDS[$i]:-}"
-        local s="${SER[$i]:-}"
-        local status
-        if [[ -z "${VAL_OK[$ip]:-}" ]]; then
-          status="NOT VALIDATED – not in last ping/version run (not mapped)"
-        elif [[ -z "$(trim "$p")" || -z "$(trim "$s")" ]]; then
-          status="INVALID – no model/serial (not mapped)"
-        else
-          status="OK – eligible for mapping"
-        fi
-        printf "%-16s %-24s %-15s %-15s %s\n" "$ip" "$h" "$p" "$s" "$status"
-      done
-      echo
-      echo "Only switches that BOTH:"
-      echo "  • passed the connectivity & IOS-XE validation step, and"
-      echo "  • have PID (model) and Serial number"
-      echo "will appear in the network mapping dialogs."
-    } > "$tmp"
+  echo "Only switches that BOTH:"
+  echo "  • passed the connectivity & IOS-XE validation step, and"
+  echo "  • have PID (model) and Serial number will appear in the network mapping dialogs."
+  echo
+  echo "Planned switches to map (from upgrade_plan.*):"
+  echo
+  printf "%-16s %-24s %-15s %-15s %s\n" "IP" "Hostname" "PID" "Serial" "Status"
+  printf "%-16s %-24s %-15s %-15s %s\n" "----------------" "------------------------" "---------------" "---------------" "-------------------------------"
+
+  for i in "${!IPS[@]}"; do
+    local ip="${IPS[$i]}"
+    local h="${HOSTS[$i]:-<unknown>}"
+    local p="${PIDS[$i]:-}"
+    local s="${SER[$i]:-}"
+    local status
+
+    if [[ -z "${VAL_OK[$ip]:-}" ]]; then
+      status="NOT VALIDATED – not in last ping (not mapped)"
+    elif [[ -z "$(trim "$p")" || -z "$(trim "$s")" ]]; then
+      status="INVALID – no model/serial (not mapped)"
+    else
+      status="OK – eligible for mapping"
+    fi
+
+    printf "%-16s %-24s %-15s %-15s %s\n" "$ip" "$h" "$p" "$s" "$status"
+  done
+} > "$tmp"
 
     dlg --backtitle "$BACKTITLE_M – review discovered & validated switches" \
         --title "Switches to map" \
@@ -1372,16 +1374,24 @@ USAGE
       (( remaining == 0 )) && break
 
       local -a menu_items=()
-      for i in "${!NET_IDS[@]}"; do
-        menu_items+=( "${NET_IDS[$i]}" "${NET_LABELS[$i]}" )
-      done
-      menu_items+=( "NEW" "Create a new 'switch' network" )
-      menu_items+=( "DONE" "Finish mapping (leave remaining unmapped)" )
 
-      local net_choice
-      net_choice="$(dlg --backtitle "$BACKTITLE_M: assign switches to networks" \
-                        --menu "Select a network for the next batch of switches.\nUnmapped, valid switches remaining: $remaining" \
-                        22 90 16 "${menu_items[@]}")" || return 1
+# --- NEW + DONE at the TOP ---
+menu_items+=( "NEW"  "Create a new 'switch' network" )
+menu_items+=( "DONE" "Finish mapping (leave remaining unmapped)" )
+
+# --- Existing networks BELOW ---
+for i in "${!NET_IDS[@]}"; do
+  menu_items+=( "${NET_IDS[$i]}" "${NET_LABELS[$i]}" )
+done
+
+# --- Updated dialog text (your Pic 1 moved to top) ---
+local menu_text="Select a network for the next batch of switches.
+Unmapped, valid switches remaining: $remaining"
+
+local net_choice
+net_choice="$(dlg --backtitle "$BACKTITLE_M: assign switches to networks" \
+                  --menu "$menu_text" \
+                  22 90 16 "${menu_items[@]}")" || return 1
 
       if [[ "$net_choice" == "DONE" ]]; then
         if (( remaining > 0 )); then
