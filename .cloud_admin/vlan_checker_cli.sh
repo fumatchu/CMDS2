@@ -57,6 +57,50 @@ load_env() {
   log "API Loaded: ${MERAKI_API_KEY:0:8}********"
 }
 
+
+# ------------------------------------------------------------
+# VALIDATED SELECTED IP SOURCE
+# Uses selected_upgrade.env first, selected_upgrade.json second,
+# and only returns IPs present in BOTH.
+# ------------------------------------------------------------
+
+get_valid_selected_ips() {
+  local -a env_ips json_ips
+  local env_count json_count
+
+  # ENV
+  read -r -a env_ips <<< "${UPGRADE_SELECTED_IPS:-}"
+  env_count=${#env_ips[@]}
+
+  # JSON (safe if empty/missing)
+  mapfile -t json_ips < <(
+    jq -r '.[].ip // empty' "$BASE_DIR/selected_upgrade.json" 2>/dev/null
+  )
+  json_count=${#json_ips[@]}
+
+  # --------------------------------------------------------
+  # LOGIC
+  # --------------------------------------------------------
+
+  if (( env_count > 0 )); then
+    log "Using selected IPs from ENV (${env_count})"
+    printf '%s\n' "${env_ips[@]}" | sort -u
+    return 0
+  fi
+
+  if (( json_count > 0 )); then
+    log "ENV empty — using selected IPs from JSON (${json_count})"
+    printf '%s\n' "${json_ips[@]}" | sort -u
+    return 0
+  fi
+
+  log "ERROR: No selected IPs found in ENV or JSON"
+  return 1
+}
+
+
+
+
 # ------------------------------------------------------------
 # API
 # ------------------------------------------------------------
@@ -97,11 +141,28 @@ get_network_name() {
 
 get_switches() {
   local net="$1"
-  jq -r --arg n "$net" '
-    select(.network_id == $n and .status == "CLAIMED") | .cloud_id
-  ' "$MEMORY_DIR"/*.json 2>/dev/null | sort -u
-}
+  local -a SELECTED_IPS
+  local ip
 
+  #Read selected IPs from JSON (NOT env anymore)
+  mapfile -t SELECTED_IPS < <(get_valid_selected_ips)
+  for ip in "${SELECTED_IPS[@]}"; do
+    [[ -z "$ip" ]] && continue
+
+    # Match IP → network
+    local mapped_net
+    mapped_net=$(jq -r --arg ip "$ip" '
+      .[] | select(.ip == $ip) | .networkId
+    ' "$MAP_FILE" | head -n1)
+
+    [[ "$mapped_net" != "$net" ]] && continue
+
+    #Now match ONLY those IPs to memory
+    jq -r --arg ip "$ip" '
+      select(.ip == $ip and .status == "CLAIMED") | .cloud_id
+    ' "$MEMORY_DIR"/*.json 2>/dev/null
+  done | sort -u
+}
 get_label() {
   local serial="$1"
   jq -r --arg s "$serial" '
@@ -212,7 +273,7 @@ build_vlan_summary() {
   log "Building VLAN summary..."
   tmpfile=$(mktemp)
 
-  read -r -a SELECTED <<< "${UPGRADE_SELECTED_IPS:-}"
+  mapfile -t SELECTED < <(get_valid_selected_ips)
 
   for ip in "${SELECTED[@]}"; do
     [[ -z "$ip" ]] && continue
@@ -563,6 +624,12 @@ main() {
   need base64
 
   load_env
+
+  log "Validated selected IPs:"
+get_valid_selected_ips | while read -r ip; do
+  log " - $ip"
+done
+
   build_vlan_summary || true
 
   ok=0

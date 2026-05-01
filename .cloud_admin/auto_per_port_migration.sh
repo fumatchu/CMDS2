@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # ============================================================
 # Cloud Migration – IOS Port Intent → Meraki Switch Ports
@@ -1813,15 +1812,18 @@ merge_ios_intent_with_meraki_ports() {
     )"
 
     if [[ -z "$ios_entry" && "$pid" =~ ^([0-9]+)_([^_]+)_([0-9]+)$ ]]; then
-      local m mod n type key
-      m="${BASH_REMATCH[1]}"
-      mod="${BASH_REMATCH[2]}"
-      n="${BASH_REMATCH[3]}"
-
-      if [[ "$m" != "$member" ]]; then
-        echo "  SKIP-MODULE-PORT: portId=$pid belongs to member=$m (building member=$member)" >>"$build_log"
-        continue
-      fi
+      # Meraki labels NM-module ports as "<modslot>_<modname>_<modport>".
+      # IMPORTANT: <modslot> here is the DEVICE-LOCAL module slot (always 1 for
+      # the only NM cage on a C9300), NOT the IOS stack member number. We are
+      # iterating ports returned by /devices/{cloud_id}/switch/ports for the
+      # device that corresponds to IOS stack member $member, so every port we
+      # see belongs to $member by construction. We must therefore use $member
+      # (the OUTER stack member) when looking up the IOS uplink interface,
+      # never the leading number parsed out of the Meraki portId.
+      local mod_slot mod n type key
+      mod_slot="${BASH_REMATCH[1]}"   # Meraki module slot, e.g. "1"  (device-local)
+      mod="${BASH_REMATCH[2]}"        # Module token, e.g. "C9300-NM-8X"
+      n="${BASH_REMATCH[3]}"          # Module port, e.g. "1"
 
       if ! is_allowed_meraki_module_token_for_ip "$ip" "$mod"; then
         echo "  SKIP-MODULE-PORT: portId=$pid mod=$mod (not in discovery NM list)" >>"$build_log"
@@ -1830,9 +1832,10 @@ merge_ios_intent_with_meraki_ports() {
 
       type="$(infer_ios_uplink_type_from_meraki_portid "$pid")"
       if [[ -n "$type" ]]; then
-        key="${m}/${n}/${type}"
+        key="${member}/${n}/${type}"
         if [[ -n "${IOS_UPLINK_MAP_BY_TYPE[$key]:-}" ]]; then
           ios_entry="${IOS_UPLINK_MAP_BY_TYPE[$key]}"
+          echo "  UPLINK-MATCH: portId=$pid mod_slot=$mod_slot member=$member key=$key (typed)" >>"$build_log"
         fi
       fi
 
@@ -1840,12 +1843,17 @@ merge_ios_intent_with_meraki_ports() {
         local pfx
         while IFS= read -r pfx; do
           [[ -n "$pfx" ]] || continue
-          key="${m}/${n}/${pfx}"
+          key="${member}/${n}/${pfx}"
           if [[ -n "${IOS_UPLINK_MAP_BY_TYPE[$key]:-}" ]]; then
             ios_entry="${IOS_UPLINK_MAP_BY_TYPE[$key]}"
+            echo "  UPLINK-MATCH: portId=$pid mod_slot=$mod_slot member=$member key=$key (prefix)" >>"$build_log"
             break
           fi
-        done < <(get_uplink_prefixes_for_ip_member "$ip" "$m" 2>/dev/null || true)
+        done < <(get_uplink_prefixes_for_ip_member "$ip" "$member" 2>/dev/null || true)
+      fi
+
+      if [[ -z "$ios_entry" ]]; then
+        echo "  UPLINK-MISS: portId=$pid mod_slot=$mod_slot member=$member mod=$mod (no IOS interface in /1/N for this stack member)" >>"$build_log"
       fi
     fi
 
@@ -1895,63 +1903,87 @@ merge_ios_intent_with_meraki_ports() {
   | sub("^ +"; "")
   | sub(" +$"; "");
 
+        # ----------------------------------------------------------------
+        # LAG-aware source-of-truth selector.
+        #
+        # When the physical port has a "channel-group N" line ($i.portChannelId
+        # is not null), the Cisco LAG semantics put the L2/STP/UDLD/QoS/PoE/EEE/
+        # shutdown config on the Port-channel<N> stanza, NOT on the physical
+        # member. So for those member ports, we use $pc as the source of truth
+        # and ignore $i for everything except interface naming and per-port
+        # discovery facts.
+        #
+        # For non-LAG ports, $i is the source of truth as before.
+        # ----------------------------------------------------------------
+        def is_lag_member: ($i.portChannelId != null);
+        def src: (if is_lag_member then $pc else $i end);
+
         def pick_vlan:
-          if      ($i.accessVlan   // null) != null then $i.accessVlan
-          elif    ($i.nativeVlan   // null) != null then $i.nativeVlan
-          elif    ($pc.accessVlan  // null) != null then $pc.accessVlan
-          elif    ($pc.nativeVlan  // null) != null then $pc.nativeVlan
-          else ($m.vlan // null) end;
+          src as $s
+          | if    ($s.accessVlan // null) != null then $s.accessVlan
+            elif  ($s.nativeVlan // null) != null then $s.nativeVlan
+            else  ($m.vlan // null) end;
 
         def desired_stp:
-          if   $i.stpGuard == "bpduGuard" then "bpdu guard"
-          elif $i.stpGuard == "rootGuard" then "root guard"
-          elif $i.stpGuard == "loopGuard" then "loop guard"
-          elif ($i.portfast // false) == true then "disabled"
-          else ($m.stpGuard // null) end;
+          src as $s
+          | if   ($s.stpGuard // "") == "bpduGuard" then "bpdu guard"
+            elif ($s.stpGuard // "") == "rootGuard" then "root guard"
+            elif ($s.stpGuard // "") == "loopGuard" then "loop guard"
+            elif (($s.portfast // false) == true)   then "disabled"
+            else ($m.stpGuard // null) end;
 
         def desired_dot3az:
-          if ($i | has("eeeEnabled")) then { enabled: $i.eeeEnabled }
-          else { enabled: ($m.dot3az.enabled // null) } end;
+          src as $s
+          | if ($s | has("eeeEnabled")) then { enabled: $s.eeeEnabled }
+            else { enabled: ($m.dot3az.enabled // null) } end;
 
         def desired_udld:
-          if ($i | has("udld")) then
-            $i.udld
-          elif (($globalUdld // "") | tostring | length) > 0 then
-            if ($udldClass == "A") then
-              $globalUdld
-            elif ($udldClass == "B") then
-              if ($isUplink == 1) then $globalUdld else ($m.udld // null) end
+          src as $s
+          | if ($s | has("udld")) then
+              $s.udld
+            elif (($globalUdld // "") | tostring | length) > 0 then
+              if ($udldClass == "A") then
+                $globalUdld
+              elif ($udldClass == "B") then
+                if ($isUplink == 1) then $globalUdld else ($m.udld // null) end
+              else
+                ($m.udld // null)
+              end
             else
               ($m.udld // null)
-            end
-          else
-            ($m.udld // null)
-          end;
+            end;
 
         def desired_type:
-          ($i.type // $pc.type // $m.type);
+          src as $s
+          | ($s.type // $m.type);
 
         def desired_enabled:
-          (if ($i | has("enabled")) then $i.enabled else $m.enabled end);
+          src as $s
+          | (if ($s | has("enabled")) then $s.enabled else $m.enabled end);
 
         def desired_voice:
-          ($i.voiceVlan // $pc.voiceVlan // ($m.voiceVlan // null));
+          src as $s
+          | ($s.voiceVlan // ($m.voiceVlan // null));
 
         def desired_allowed:
-          ($i.allowedVlans // $pc.allowedVlans // ($m.allowedVlans // null));
+          src as $s
+          | ($s.allowedVlans // ($m.allowedVlans // null));
 
         def desired_link:
-          ($i.linkNegotiation // ($m.linkNegotiation // null));
+          src as $s
+          | ($s.linkNegotiation // ($m.linkNegotiation // null));
 
         def desired_dai:
-          ($i.daiTrusted // ($m.daiTrusted // false));
+          src as $s
+          | ($s.daiTrusted // ($m.daiTrusted // false));
 
         def desired_poe:
-          (if ($i | has("poeEnabled")) then $i.poeEnabled else ($m.poeEnabled // null) end);
+          src as $s
+          | (if ($s | has("poeEnabled")) then $s.poeEnabled else ($m.poeEnabled // null) end);
 
         def desired_name:
           (
-            if ($i.portChannelId != null) and (($pc.description // null) != null) then
+            if is_lag_member and (($pc.description // null) != null) then
               $pc.description
             elif (($i.description // null) != null) then
               $i.description
@@ -2701,7 +2733,11 @@ build_lag_defs_from_member_diffs() {
     | group_by(.pcid)
     | map({
         pcid: (.[0].pcid),
-        members: (map(.member) | unique | sort_by(.serial, .portId))
+        members: (
+          map(.member)
+          | unique
+          | sort_by(.serial, ((.portId|tonumber?) // 0))
+        )
       })
   ' "$@"
 }
@@ -2728,7 +2764,11 @@ build_lag_defs_from_single_member_diff() {
     | group_by(.pcid)
     | map({
         pcid: (.[0].pcid),
-        members: (map(.member) | unique | sort_by(.serial, .portId))
+        members: (
+          map(.member)
+          | unique
+          | sort_by(.serial, ((.portId|tonumber?) // 0))
+        )
       })
   ' "$diff_file"
 }
@@ -3054,6 +3094,21 @@ apply_ports_from_diff() {
 
   echo "AUTO MODE – Applying all ports with changes: ${PORTS_TO_APPLY[*]}" >>"$apply_log"
 
+  # ----------------------------------------------------------------
+  # Port-channel inheritance fix.
+  #
+  # IOS-XE keeps the trunk/access VLAN config on interface Port-channel<N>.
+  # Meraki switch ports do not inherit that config from the LAG object the
+  # same way IOS members inherit from the Port-channel. Therefore, every
+  # physical member port must receive the desired config built from the
+  # Port-channel stanza before/alongside LAG creation.
+  #
+  # Previous logic picked a "lead" member and stripped LAG-controlled fields
+  # such as type/vlan/allowedVlans from all other members. That prevented the
+  # non-lead physical ports from getting the Port-channel VLAN config.
+  # ----------------------------------------------------------------
+  echo "LAG: Port-channel inheritance fix enabled - applying VLAN/trunk config to every physical member port." >>"$apply_log"
+
   ui_start "Applying ports for $ip (m${member}) cloud $cloud_id" "$apply_log"
   apply_ui_update "Starting port apply..." 0
 
@@ -3122,6 +3177,15 @@ apply_ports_from_diff() {
     )"
 
     echo "Computed body for port $p: ${body:-<empty>}" >>"$apply_log"
+
+    # ----------------------------------------------------------------
+    # Do NOT strip VLAN/trunk fields from LAG members.
+    #
+    # The desired row already uses the Port-channel stanza as source-of-truth
+    # for member ports. Keep allowedVlans/type/vlan/etc. in the PUT body so
+    # every physical Meraki port in AGGR0/AGGR1 receives the same effective
+    # config as the IOS Port-channel.
+    # ----------------------------------------------------------------
 
     if [[ -z "$body" || "$body" == "null" || "$body" == "{}" ]]; then
       echo "Skipping port $p – computed empty PUT body (no applicable fields)." >>"$apply_log"
@@ -3702,12 +3766,11 @@ fi
   fi
 
    "$DIALOG" --backtitle "$BACKTITLE_PORTS" \
-            --title "Whole stack apply complete" \
-            --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped\n\n(Skipped usually means: missing meraki_memory entry or no diff built for th
-at member.)\n\nLog:\n  $stack_apply_log" \
-            16 86
+  --title "Whole stack apply complete" \
+  --infobox "Whole stack apply finished for IP $ip.\n\nOK:      $ok\nFailed:  $fail\nSkipped: $skipped" \
+  12 70
 
-  sleep 4
+sleep 3
 
 
   return 0
