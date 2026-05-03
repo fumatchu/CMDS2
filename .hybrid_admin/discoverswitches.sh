@@ -752,7 +752,6 @@ make_upgrade_plan() {
     ui_status "No discovery JSON to build an upgrade plan (file empty)."
     log_msg "make_upgrade_plan: $json is empty or missing"
     echo "[]" > "$UP_JSON_OUT"
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login,invalid" > "$UP_CSV_OUT"
     return 0
   fi
 
@@ -761,171 +760,88 @@ make_upgrade_plan() {
   log_msg "make_upgrade_plan: discovery entries=$disc_count"
   ui_gauge 90 "Building upgrade plan for $disc_count device(s)…"
 
-  jq -r '.[] |
-    [
-      .ip,
-      (.pid//""),
-      (.version//""),
-      (.hostname//""),
-      (.blacklisted//false),
-      (.blacklist_reason//""),
-      (.ssh//false),
-      (.login//false)
-    ] | @tsv' "$json" |
-  while IFS=$'\t' read -r ip pid cur_ver host blacklisted bl_reason ssh login; do
+  jq '
+    map(
+      . as $d
+      | {
+          ip: $d.ip,
+          hostname: ($d.hostname // "UNKNOWN"),
+          pid: ($d.pid // ""),
+          current_version: ($d.version // ""),
+          target_version: "",
+          plan_action: "UNKNOWN",
+          needs_upgrade: false,
+          blacklisted: ($d.blacklisted // false),
+          blacklist_reason: ($d.blacklist_reason // ""),
+          ssh: ($d.ssh // false),
+          login: ($d.login // false)   # 🔥 PRESERVE LOGIN — DO NOT TOUCH
+        }
+    )
+  ' "$json" > "$UP_JSON_OUT"
 
-    host="${host:-}"
-    pid="${pid:-}"
-    cur_ver="${cur_ver:-}"
-    blacklisted="${blacklisted:-false}"
-    bl_reason="${bl_reason:-}"
-    ssh="${ssh:-false}"
-    login="${login:-false}"
-
-    IFS='|' read -r tgt_file tgt_path tgt_ver tgt_size <<<"$(choose_image "$pid")"
-
-    # 🔥 NEW: VALIDATION LAYER
-    local action need invalid
-
-    if [[ -z "$pid" || -z "$cur_ver" || -z "$host" ]]; then
-      action="UNKNOWN"
-      need="false"
-      invalid="true"
-    else
-      invalid="false"
-
-      if [[ -n "$tgt_ver" && -n "$cur_ver" ]]; then
-        action="$(plan_action_label "$cur_ver" "$tgt_ver")"
-      else
-        action="UNKNOWN"
-      fi
-
-      case "$action" in
-        UPGRADE|DOWNGRADE) need="true" ;;
-        *)                 need="false" ;;
-      esac
-    fi
-
-    jq -n \
-      --arg ip "$ip" \
-      --arg hostname "$host" \
-      --arg pid "$pid" \
-      --arg current_version "$cur_ver" \
-      --arg target_version "$tgt_ver" \
-      --arg target_file "$tgt_file" \
-      --arg target_path "$tgt_path" \
-      --arg target_size "$tgt_size" \
-      --arg action "$action" \
-      --arg needs "$need" \
-      --arg bl "$blacklisted" \
-      --arg blr "$bl_reason" \
-      --arg ssh "$ssh" \
-      --arg login "$login" \
-      --arg invalid "$invalid" \
-      '{
-        ip: $ip,
-        hostname: $hostname,
-        pid: $pid,
-        current_version: $current_version,
-        target_version: $target_version,
-        target_file: $target_file,
-        target_path: $target_path,
-        target_size_bytes: ($target_size|tonumber?),
-        plan_action: $action,
-        needs_upgrade: ($needs=="true"),
-        blacklisted: ($bl=="true"),
-        blacklist_reason: $blr,
-        ssh: ($ssh=="true"),
-        login: ($login=="true"),
-        invalid: ($invalid=="true")
-      }'
-
-  done | jq -s '.' > "$UP_JSON_OUT"
-
-  {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login,invalid"
-    jq -r '.[] | [
-      .ip,
-      .hostname,
-      .pid,
-      .current_version,
-      .target_version,
-      .plan_action,
-      .target_file,
-      .target_path,
-      .target_size_bytes,
-      .needs_upgrade,
-      .blacklisted,
-      .blacklist_reason,
-      .ssh,
-      .login,
-      .invalid
-    ] | @csv' "$UP_JSON_OUT"
-  } > "$UP_CSV_OUT"
-
-  ui_status "Upgrade plan written: $UP_CSV_OUT"
+  ui_status "Upgrade plan written: $UP_JSON_OUT"
   ui_gauge 100 "Done."
 }
-
 # ===== Selection (dialog checklist) =====
+
 do_selection_dialog() {
   local -a items=()
   declare -A BLKMAP=()
 
-  while IFS=$'\t' read -r ip host pid cur tgt action need blacklisted bl_reason invalid login; do
+while IFS=$'\x1f' read -r ip host pid ver blacklisted bl_reason login; do
 
-    host="${host:--}"
-    pid="${pid:--}"
-    cur="${cur:-?}"
-    tgt="${tgt:-?}"
-    action="${action:-UNKNOWN}"
+    host="${host:-UNKNOWN}"
+    pid="${pid:-}"
+    ver="${ver:-}"
+    login="${login:-false}"
+    blacklisted="${blacklisted:-false}"
+    bl_reason="${bl_reason:-}"
 
-    local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})"
+    # ---- DISPLAY ----
+    local text="${host} (${ip})"
+    [[ -n "$pid" ]] && text+="  ${pid}"
+    [[ -n "$ver" ]] && text+="  ${ver}"
+
     local def="off"
     local reason=""
-    local effective_blacklisted="false"
+    local blocked=0
 
-    # ==============================
-    # VALIDATION (FIXED + CLEAN)
-    # ==============================
-    if [[ "$blacklisted" == "true" ]]; then
-      effective_blacklisted="true"
-      reason="${bl_reason:-policy block}"
+    # ---- BLOCK LOGIC ----
+    if [[ "$login" != "true" ]]; then
+      blocked=1
+      reason="login failed"
 
-    elif [[ -z "$pid" || -z "$cur" || "$cur" == "?" ]]; then
-      effective_blacklisted="true"
-      reason="missing device data"
+    elif [[ "$blacklisted" == "true" ]]; then
+      blocked=1
+
+      if [[ "$bl_reason" == *"meraki-user"* ]]; then
+        reason="already onboarded (meraki-user exists)"
+      else
+        reason="${bl_reason:-policy block}"
+      fi
     fi
 
-    if [[ "$effective_blacklisted" == "true" ]]; then
-      text="$text  [BLACKLISTED: $reason]"
+    if (( blocked )); then
+      text="$text  [BLOCKED: $reason]"
       BLKMAP["$ip"]=1
+      def="off"
     else
-      [[ "$need" == "true" ]] && def="on"
+      def="on"
     fi
 
     items+=("$ip" "$text" "$def")
 
   done < <(
-    jq -r '.[] |
-      [
+    jq -r '.[] | [
         .ip,
-        .hostname,
-        .pid,
-        .current_version,
-        .target_version,
-        .plan_action,
-        .needs_upgrade,
-        .blacklisted,
-        .blacklist_reason,
-        .invalid,
-        .login
-      ] | @tsv' "$UP_JSON_OUT" | sort
+        (.hostname // "UNKNOWN"),
+        (.pid // ""),
+        (.current_version // ""),
+        (.blacklisted | tostring),
+        (.blacklist_reason // ""),
+        (.login | tostring)
+      ] | join("\u001f")' "$UP_JSON_OUT" | sort
   )
-
-  # ------------------------------
-  # No items guard
-  # ------------------------------
   if (( ${#items[@]} == 0 )); then
     dialog --no-shadow --infobox "No devices available." 6 50
     sleep 2
@@ -938,7 +854,6 @@ do_selection_dialog() {
   local tmp_sel
   tmp_sel="$(mktemp)"
 
-  # 🔥 IMPORTANT: --separate-output fixes EVERYTHING
   dialog --no-shadow \
     --separate-output \
     --title "Select switches to upgrade" \
@@ -946,22 +861,12 @@ do_selection_dialog() {
     22 140 15 \
     "${items[@]}" 2> "$tmp_sel"
 
-  # ------------------------------
-  # FIXED parsing (robust)
-  # ------------------------------
   local -a SEL_ARR=()
-
   if [[ -s "$tmp_sel" ]]; then
     mapfile -t SEL_ARR < "$tmp_sel"
   fi
   rm -f "$tmp_sel"
 
-  # Debug (optional, remove later)
-  # printf '[DEBUG] Selected: %s\n' "${SEL_ARR[@]}" >&2
-
-  # ------------------------------
-  # Filter out blocked (safety)
-  # ------------------------------
   local -a FILTERED_SEL=()
   for ip in "${SEL_ARR[@]}"; do
     [[ -z "$ip" ]] && continue
@@ -969,9 +874,6 @@ do_selection_dialog() {
     FILTERED_SEL+=("$ip")
   done
 
-  # ------------------------------
-  # Nothing selected
-  # ------------------------------
   if (( ${#FILTERED_SEL[@]} == 0 )); then
     dialog --no-shadow --infobox "No valid devices selected." 6 50
     sleep 2
@@ -979,9 +881,6 @@ do_selection_dialog() {
     return 2
   fi
 
-  # ------------------------------
-  # Build JSON (ONLY thing you care about now)
-  # ------------------------------
   local ips_json
   ips_json="$(printf '%s\n' "${FILTERED_SEL[@]}" | jq -R -s 'split("\n")|map(select(length>0))')"
 
