@@ -318,6 +318,7 @@ Have these ready:
   • Meraki Dashboard API key
   • Two DNS server IPs (fallbacks)
   • At least one NTP server (hostname or IP)
+  • You MUST have firmware files uploaded for Universal and LITE (9300 & 9200)
   • Firmware file(s) in ${FIRMWARE_DIR} or upload to ${COCKPIT_UPLOAD_DIR}" \
   "$WELCOME_H" "$WELCOME_W"
 

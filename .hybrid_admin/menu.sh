@@ -43,7 +43,7 @@ dlg() {
 # Map menu labels -> artifact file that indicates completion
 declare -A DONE_FILE=(
   ["Setup Wizard"]="/root/.hybrid_admin/meraki_discovery.env"
-  ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.env"
+  ["Switch Discovery"]="/root/.hybrid_admin/selected_upgrade.json"
   ["Validate IOS-XE configuration"]="/root/.hybrid_admin/preflight_validated.flag"
   ["Migrate Switches"]="/root/.hybrid_admin/meraki_claim.log"   # symlink to latest claim log
 )

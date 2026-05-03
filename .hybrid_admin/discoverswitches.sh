@@ -375,11 +375,12 @@ plan_action_label(){  # UPGRADE/DOWNGRADE/SAME/UNKNOWN
 
 # ===== SSH probe (pure Bash; no expect) =====
 probe_host() {
-  local ip="$1" log="$PROBE_LOG_DIR/$ip.log"
+  local ip="$1"
+  local log="$PROBE_LOG_DIR/$ip.log"
   : > "$log"
+
   log_msg "probe_host: start ip=$ip"
   ui_status "[${ip}] Probing via SSH…"
-  ui_status "[${ip}] SSH: connecting…"
 
   local -a SSH_CMD
   if [[ -n "$SSH_KEY_PATH" && -r "$SSH_KEY_PATH" ]]; then
@@ -389,8 +390,7 @@ probe_host() {
       -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
       -o PreferredAuthentications=publickey,password,keyboard-interactive
       -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=yes
-      -o NumberOfPasswordPrompts=1
-      -i "$SSH_KEY_PATH" -tt "$SSH_USERNAME@$ip"
+      -tt "$SSH_USERNAME@$ip"
     )
   else
     SSH_CMD=(sshpass -p "$SSH_PASSWORD" ssh
@@ -399,13 +399,12 @@ probe_host() {
       -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1
       -o PreferredAuthentications=password,keyboard-interactive
       -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no
-      -o NumberOfPasswordPrompts=1
       -tt "$SSH_USERNAME@$ip"
     )
   fi
 
   _run_ssh_script() {
-    local timeout_secs="$1"; shift
+    local timeout_secs="$1"
     if command -v timeout >/dev/null 2>&1; then
       timeout -k 5s "${timeout_secs}s" "${SSH_CMD[@]}"
     else
@@ -413,176 +412,134 @@ probe_host() {
     fi
   }
 
-  local out_priv facts outn
-  out_priv="$(mktemp)"
-  facts="$(mktemp)"
-  outn="$(mktemp)"
+  local raw out
+  raw="$(mktemp)"
+  out="$(mktemp)"
+
+  ui_status "[${ip}] Collecting device facts…"
 
   {
-    printf '\r\n\r\n'
-    printf 'terminal length 0\r\n'
+    printf '\r\nterminal length 0\r\n'
     printf 'terminal width 511\r\n'
     printf 'show privilege\r\n'
+    printf 'show clock\r\n'
+    printf 'show version\r\n'
+    printf 'show running-config | include ^hostname\r\n'
+    printf 'show running-config | include ^username\r\n'
+    printf 'show inventory\r\n'
     printf 'exit\r\n'
-  } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$out_priv" 2>&1
+  } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$raw" 2>&1
 
-  tr -d '\r' < "$out_priv" | tee -a "$log" > "$outn"
+  # Normalize + log
+  tr -d '\r' < "$raw" | tee -a "$log" > "$out"
 
-  local at15=0
-  if grep -Eq 'Current privilege level is[[:space:]]*15' "$outn"; then
-    at15=1
-  fi
-  log_msg "probe_host: ip=$ip after pass1 at15=$at15"
-
-  : > "$outn"
-  if (( at15 == 1 )); then
-    ui_status "[${ip}] Privilege 15 detected; collecting facts…"
-    {
-      printf '\r\n\r\n'
-      printf 'terminal length 0\r\n'
-      printf 'terminal width 511\r\n'
-      printf 'show clock\r\n'
-      printf 'show version\r\n'
-      printf 'show running-config | include ^hostname\r\n'
-      printf 'show running-config | include ^username\r\n'
-      printf 'show inventory\r\n'
-      printf 'exit\r\n'
-    } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
-  else
-    if [[ -n "${ENABLE_PASSWORD:-}" ]]; then
-      ui_status "[${ip}] Not privileged; attempting enable…"
-      {
-        printf '\r\n\r\n'
-        printf 'terminal length 0\r\n'
-        printf 'terminal width 511\r\n'
-        printf 'enable\r\n'
-        printf '%s\r\n' "$ENABLE_PASSWORD"
-        printf 'show privilege\r\n'
-        printf 'show clock\r\n'
-        printf 'show version\r\n'
-        printf 'show running-config | include ^hostname\r\n'
-        printf 'show running-config | include ^username\r\n'
-        printf 'show inventory\r\n'
-        printf 'exit\r\n'
-      } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
-    else
-      ui_status "[${ip}] No enable secret; collecting what we can…"
-      {
-        printf '\r\n\r\n'
-        printf 'terminal length 0\r\n'
-        printf 'terminal width 511\r\n'
-        printf 'show clock\r\n'
-        printf 'show version\r\n'
-        printf 'show running-config | include ^hostname\r\n'
-        printf 'show running-config | include ^username\r\n'
-        printf 'show inventory\r\n'
-        printf 'exit\r\n'
-      } | _run_ssh_script "${SSH_TIMEOUT:-30}" >"$facts" 2>&1
-    fi
-  fi
-
-  tr -d '\r' < "$facts" | tee -a "$log" > "$outn"
-
-  local login_ok=0
-  if grep -Eq 'Cisco IOS|IOS XE| uptime is |^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$|Current privilege level is' "$outn"; then
-    login_ok=1
-  fi
-  (( login_ok )) && ui_status "[${ip}] SSH: logged in and collected output."
-
+  # -----------------------------
+  # Parse data (THIS is truth)
+  # -----------------------------
   local hostname version pid sn
-  hostname="$(awk '/^hostname[[:space:]]+/{print $2}' "$outn" | tail -n1)"
-  [[ -z "$hostname" ]] && hostname="$(grep -E '^[A-Za-z0-9_.:/-]+[>#][[:space:]]*$' "$outn" | tail -n1 | sed -E 's/[>#].*$//')"
-  [[ -z "$hostname" ]] && hostname="$(grep -m1 -E ' uptime is ' "$outn" | awk '{print $1}')"
+
+  hostname="$(awk '/^hostname[[:space:]]+/{print $2}' "$out" | tail -n1)"
+  [[ -z "$hostname" ]] && hostname="$(grep -E '^[A-Za-z0-9_.:/-]+[>#]' "$out" | tail -n1 | sed -E 's/[>#].*$//')"
+  [[ -z "$hostname" ]] && hostname="$(grep -m1 -E ' uptime is ' "$out" | awk '{print $1}')"
   hostname="$(clean_field "${hostname:-}")"
 
-  version="$(grep -m1 -E 'Cisco IOS XE Software, Version[[:space:]]+' "$outn" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
-  [[ -z "$version" ]] && version="$(grep -m1 -E 'Cisco IOS Software|Version[[:space:]]+[0-9]' "$outn" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
+  version="$(grep -m1 -E 'Cisco IOS XE Software, Version' "$out" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
+  [[ -z "$version" ]] && version="$(grep -m1 -E 'Version[[:space:]]+[0-9]' "$out" | sed -E 's/.*Version[[:space:]]+([^, ]+).*/\1/')"
   version="$(clean_field "${version:-}")"
 
-  pid="$(grep -m1 -E 'PID:[[:space:]]*[^,]+' "$outn" | sed -E 's/.*PID:[[:space:]]*([^,]+).*/\1/')"
-  sn="$(grep -m1 -E 'SN:[[:space:]]*[A-Za-z0-9]+' "$outn" | sed -E 's/.*SN:[[:space:]]*([^,[:space:]]+).*/\1/')"
+  pid="$(grep -m1 -E 'PID:[[:space:]]*[^,]+' "$out" | sed -E 's/.*PID:[[:space:]]*([^,]+).*/\1/')"
+  sn="$(grep -m1 -E 'SN:[[:space:]]*[A-Za-z0-9]+' "$out" | sed -E 's/.*SN:[[:space:]]*([^,[:space:]]+).*/\1/')"
   pid="$(clean_field "${pid:-}")"
   sn="$(clean_field "${sn:-}")"
 
-  # --- Blacklist detection: username meraki-user ---
+  # -----------------------------
+  # REAL login detection (FIXED)
+  # -----------------------------
+  local login_ok=0
+  if [[ -n "$hostname" || -n "$version" || -n "$pid" ]]; then
+    login_ok=1
+    ui_status "[${ip}] Login successful (data parsed)."
+  else
+    ui_status "[${ip}] Login failed (no usable data)."
+  fi
+
+  # -----------------------------
+  # Blacklist detection
+  # -----------------------------
   local bl_flag="false"
   local bl_reason=""
-  if grep -Eq '^username[[:space:]]+meraki-user\b' "$outn"; then
+
+  if grep -Eq '^username[[:space:]]+meraki-user\b' "$out"; then
     bl_flag="true"
     bl_reason="meraki-user exists"
     log_msg "probe_host: ip=$ip blacklist meraki-user exists"
   fi
 
-  # --- Optional TFTP backup of running-config (only if login_ok and TFTP_BASE set) ---
+  # -----------------------------
+  # Optional TFTP backup
+  # -----------------------------
   if (( login_ok )) && [[ -n "$TFTP_BASE" ]]; then
-    local bk_hn bk_ts bk_url bk_raw bk_rc=0
-    # Use discovered hostname if we have it; otherwise synthesize one from IP
-    bk_hn="${hostname:-}"
-    [[ -z "$bk_hn" ]] && bk_hn="sw-${ip//./-}"
+    local bk_hn bk_ts bk_url bk_raw
+
+    bk_hn="${hostname:-sw-${ip//./-}}"
     bk_ts="$(date -u +%Y%m%d-%H%M)"
     bk_url="${TFTP_BASE}/${bk_hn}-${bk_ts}.cfg"
 
-    ui_status "[${ip}] Backing up running-config via TFTP…"
+    ui_status "[${ip}] TFTP backup…"
     log_msg "backup: ip=$ip url=$bk_url"
 
     bk_raw="$(mktemp)"
 
     {
-      printf '\r\nterminal length 0\r\nterminal width 511\r\n'
-      # If we were not at privilege 15 in the first pass but we do have an
-      # enable password, try entering enable before copying.
-      if (( at15 == 0 )) && [[ -n "${ENABLE_PASSWORD:-}" ]]; then
-        printf 'enable\r\n'
-        printf '%s\r\n' "$ENABLE_PASSWORD"
-      fi
+      printf '\r\nterminal length 0\r\n'
+      printf 'terminal width 511\r\n'
       printf 'copy running-config %s\r\n' "$bk_url"
-      printf '\r\n'; sleep 0.5; printf '\r\n'
+      printf '\r\n\r\n'
       printf 'exit\r\n'
-    } | _run_ssh_script "${SSH_TIMEOUT:-120}" >"$bk_raw" 2>&1 || bk_rc=$?
+    } | _run_ssh_script "${SSH_TIMEOUT:-120}" >"$bk_raw" 2>&1
 
-    # Append backup session to the per-host log
     tr -d '\r' < "$bk_raw" >> "$log"
 
     if grep -qiE 'bytes copied|Copy complete|[Ss]uccess' "$bk_raw"; then
-      ui_status "[${ip}] TFTP backup complete."
-      log_msg "backup: ip=$ip status=OK rc=$bk_rc"
+      ui_status "[${ip}] Backup OK"
+      log_msg "backup: ip=$ip status=OK"
       rm -f "$bk_raw"
     else
-      ui_status "[${ip}] TFTP backup FAILED (see devlogs)."
-      log_msg "backup: ip=$ip status=FAILED rc=$bk_rc"
+      ui_status "[${ip}] Backup FAILED"
+      log_msg "backup: ip=$ip status=FAILED"
       mv -f "$bk_raw" "$RUN_DIR/${ip}.backup.out"
     fi
   fi
 
-  rm -f "$out_priv" "$facts" "$outn"
+  rm -f "$raw" "$out"
 
+  # -----------------------------
+  # OUTPUT JSON
+  # -----------------------------
   if (( login_ok )); then
-    log_msg "probe_host: ip=$ip login=ok hostname='${hostname:-}' version='${version:-}' pid='${pid:-}' sn='${sn:-}'"
     jq -n \
       --arg ip "$ip" \
-      --arg host "${hostname:-}" \
-      --arg ver "${version:-}" \
-      --arg pid "${pid:-}" \
-      --arg sn "${sn:-}" \
+      --arg host "$hostname" \
+      --arg ver "$version" \
+      --arg pid "$pid" \
+      --arg sn "$sn" \
       --arg bl "$bl_flag" \
       --arg blr "$bl_reason" \
       '{
-         ip: $ip,
-         ssh: true,
-         login: true,
-         hostname: $host,
-         version: $ver,
-         pid: $pid,
-         serial: $sn,
-         blacklisted: ($bl == "true"),
-         blacklist_reason: $blr
-       }'
+        ip: $ip,
+        ssh: true,
+        login: true,
+        hostname: $host,
+        version: $ver,
+        pid: $pid,
+        serial: $sn,
+        blacklisted: ($bl == "true"),
+        blacklist_reason: $blr
+      }'
   else
-    log_msg "probe_host: ip=$ip login=failed"
     jq -n --arg ip "$ip" '{ip:$ip, ssh:true, login:false}'
   fi
 }
-
 # ===== Discovery =====
 resolve_targets() {
   local mode="${DISCOVERY_MODE,,}" targets=()
@@ -790,13 +747,12 @@ choose_image() {
 
 make_upgrade_plan() {
   local json="$JSON_OUT"
+
   if [[ ! -s "$json" ]]; then
     ui_status "No discovery JSON to build an upgrade plan (file empty)."
     log_msg "make_upgrade_plan: $json is empty or missing"
     echo "[]" > "$UP_JSON_OUT"
-    {
-      echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login"
-    } > "$UP_CSV_OUT"
+    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login,invalid" > "$UP_CSV_OUT"
     return 0
   fi
 
@@ -805,23 +761,19 @@ make_upgrade_plan() {
   log_msg "make_upgrade_plan: discovery entries=$disc_count"
   ui_gauge 90 "Building upgrade plan for $disc_count device(s)…"
 
-  # Pull ssh/login as well so we can keep them for debugging, but
-  # DO NOT use them to force blacklisting here. Blacklist decisions
-  # based on "unknown" are handled later in the selection dialog by
-  # looking at hostname/pid/version/plan_action.
   jq -r '.[] |
-         [
-           .ip,
-           (.pid//""),
-           (.version//""),
-           (.hostname//""),
-           (.blacklisted//false),
-           (.blacklist_reason//""),
-           (.ssh//false),
-           (.login//false)
-         ] | @tsv' "$json" |
+    [
+      .ip,
+      (.pid//""),
+      (.version//""),
+      (.hostname//""),
+      (.blacklisted//false),
+      (.blacklist_reason//""),
+      (.ssh//false),
+      (.login//false)
+    ] | @tsv' "$json" |
   while IFS=$'\t' read -r ip pid cur_ver host blacklisted bl_reason ssh login; do
-    # Normalise
+
     host="${host:-}"
     pid="${pid:-}"
     cur_ver="${cur_ver:-}"
@@ -830,244 +782,214 @@ make_upgrade_plan() {
     ssh="${ssh:-false}"
     login="${login:-false}"
 
-    # Choose target image based on PID
     IFS='|' read -r tgt_file tgt_path tgt_ver tgt_size <<<"$(choose_image "$pid")"
 
-    # Decide upgrade / downgrade / same
-    local action need
-    if [[ -n "$tgt_ver" && -n "$cur_ver" ]]; then
-      action="$(plan_action_label "$cur_ver" "$tgt_ver")"
-    else
-      action="UNKNOWN"
-    fi
-    case "$action" in
-      UPGRADE|DOWNGRADE) need="true" ;;
-      SAME|UNKNOWN|"")   need="false" ;;
-    esac
+    # 🔥 NEW: VALIDATION LAYER
+    local action need invalid
 
-    # Blacklist flag: honour ONLY what discovery already set
-    # (e.g. meraki-user exists). Do NOT auto-mark based on ssh/login.
-    local bl_flag="$blacklisted"
-    local blr="$bl_reason"
+    if [[ -z "$pid" || -z "$cur_ver" || -z "$host" ]]; then
+      action="UNKNOWN"
+      need="false"
+      invalid="true"
+    else
+      invalid="false"
+
+      if [[ -n "$tgt_ver" && -n "$cur_ver" ]]; then
+        action="$(plan_action_label "$cur_ver" "$tgt_ver")"
+      else
+        action="UNKNOWN"
+      fi
+
+      case "$action" in
+        UPGRADE|DOWNGRADE) need="true" ;;
+        *)                 need="false" ;;
+      esac
+    fi
 
     jq -n \
       --arg ip "$ip" \
-      --arg hostname "${host:-}" \
+      --arg hostname "$host" \
       --arg pid "$pid" \
-      --arg current_version "${cur_ver:-}" \
-      --arg target_version "${tgt_ver:-}" \
-      --arg target_file "${tgt_file:-}" \
-      --arg target_path "${tgt_path:-}" \
-      --arg target_size "${tgt_size:-}" \
+      --arg current_version "$cur_ver" \
+      --arg target_version "$tgt_ver" \
+      --arg target_file "$tgt_file" \
+      --arg target_path "$tgt_path" \
+      --arg target_size "$tgt_size" \
       --arg action "$action" \
       --arg needs "$need" \
-      --arg bl "$bl_flag" \
-      --arg blr "${blr:-}" \
+      --arg bl "$blacklisted" \
+      --arg blr "$bl_reason" \
       --arg ssh "$ssh" \
       --arg login "$login" \
+      --arg invalid "$invalid" \
       '{
-         ip: $ip,
-         hostname: $hostname,
-         pid: $pid,
-         current_version: $current_version,
-         target_version: $target_version,
-         target_file: $target_file,
-         target_path: $target_path,
-         target_size_bytes: ($target_size|tonumber?),
-         plan_action: $action,
-         needs_upgrade: ($needs=="true"),
-         blacklisted: ($bl=="true"),
-         blacklist_reason: $blr,
-         ssh: ($ssh=="true"),
-         login: ($login=="true")
-       }'
+        ip: $ip,
+        hostname: $hostname,
+        pid: $pid,
+        current_version: $current_version,
+        target_version: $target_version,
+        target_file: $target_file,
+        target_path: $target_path,
+        target_size_bytes: ($target_size|tonumber?),
+        plan_action: $action,
+        needs_upgrade: ($needs=="true"),
+        blacklisted: ($bl=="true"),
+        blacklist_reason: $blr,
+        ssh: ($ssh=="true"),
+        login: ($login=="true"),
+        invalid: ($invalid=="true")
+      }'
+
   done | jq -s '.' > "$UP_JSON_OUT"
 
-  local up_count
-  up_count="$(jq 'length' "$UP_JSON_OUT" 2>/dev/null || echo 0)"
-  log_msg "make_upgrade_plan: plan entries=$up_count"
-
-  # CSV export (includes ssh/login for debugging)
   {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login"
+    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason,ssh,login,invalid"
     jq -r '.[] | [
-        .ip,
-        (.hostname//""),
-        (.pid//""),
-        (.current_version//""),
-        (.target_version//""),
-        (.plan_action//""),
-        (.target_file//""),
-        (.target_path//""),
-        (.target_size_bytes//""),
-        (.needs_upgrade//false),
-        (.blacklisted//false),
-        (.blacklist_reason//""),
-        (.ssh//false),
-        (.login//false)
-      ] | @csv' "$UP_JSON_OUT"
+      .ip,
+      .hostname,
+      .pid,
+      .current_version,
+      .target_version,
+      .plan_action,
+      .target_file,
+      .target_path,
+      .target_size_bytes,
+      .needs_upgrade,
+      .blacklisted,
+      .blacklist_reason,
+      .ssh,
+      .login,
+      .invalid
+    ] | @csv' "$UP_JSON_OUT"
   } > "$UP_CSV_OUT"
 
-  ui_status "Upgrade plan written: $UP_CSV_OUT (entries: $up_count)"
+  ui_status "Upgrade plan written: $UP_CSV_OUT"
   ui_gauge 100 "Done."
 }
 
 # ===== Selection (dialog checklist) =====
 do_selection_dialog() {
   local -a items=()
-  # Map ip -> blacklist reason (if any), so we can ignore them later
   declare -A BLKMAP=()
 
-  while IFS=$'\t' read -r ip host pid cur tgt action need blacklisted bl_reason; do
+  while IFS=$'\t' read -r ip host pid cur tgt action need blacklisted bl_reason invalid login; do
+
     host="${host:--}"
     pid="${pid:--}"
     cur="${cur:-?}"
     tgt="${tgt:-?}"
     action="${action:-UNKNOWN}"
-    need="${need:-false}"
-    blacklisted="${blacklisted:-false}"
-    bl_reason="${bl_reason:-}"
 
-    # Human-readable row text
     local text="${host} (${ip})  ${pid}  ${cur} -> ${tgt} (${action})"
     local def="off"
-
-    # Figure out *effective* blacklist state and reason
-    local effective_blacklisted="false"
     local reason=""
+    local effective_blacklisted="false"
 
+    # ==============================
+    # VALIDATION (FIXED + CLEAN)
+    # ==============================
     if [[ "$blacklisted" == "true" ]]; then
-      # Explicitly blacklisted (e.g. meraki-user exists)
       effective_blacklisted="true"
-      reason="${bl_reason:-meraki-user exists}"
-    else
-      # Auto-blacklist devices we *don’t* trust:
-      #  - missing or bogus hostname / PID / version
-      #  - or plan_action == UNKNOWN
-      local is_bad_host=0
-      [[ -z "$host" || "$host" == "-" || "$host" == "false" ]] && is_bad_host=1
+      reason="${bl_reason:-policy block}"
 
-      local is_bad_pid=0
-      [[ -z "$pid"  || "$pid"  == "-" || "$pid"  == "false" ]] && is_bad_pid=1
-
-      local is_bad_ver=0
-      [[ -z "$cur"  || "$cur"  == "?" || "$cur"  == "false" ]] && is_bad_ver=1
-
-      if (( is_bad_host || is_bad_pid || is_bad_ver )) || [[ "$action" == "UNKNOWN" ]]; then
-        effective_blacklisted="true"
-        reason="login failed or unknown device"
-      fi
+    elif [[ -z "$pid" || -z "$cur" || "$cur" == "?" ]]; then
+      effective_blacklisted="true"
+      reason="missing device data"
     fi
 
     if [[ "$effective_blacklisted" == "true" ]]; then
-      # Show, but don’t allow selection
-      text="$text  [BLACKLISTED: ${reason}]"
-      def="off"
-      BLKMAP["$ip"]="$reason"
+      text="$text  [BLACKLISTED: $reason]"
+      BLKMAP["$ip"]=1
     else
-      # Normal devices: only pre-select if we *actually* need upgrade
       [[ "$need" == "true" ]] && def="on"
     fi
 
     items+=("$ip" "$text" "$def")
-  done < <(
-  jq -r '.[] |
-    [
-      .ip,
-      (.hostname//"-"),
-      (.pid//"-"),
-      (.current_version//"?"),
-      (.target_version//"?"),
-      (.plan_action//"UNKNOWN"),
-      (.needs_upgrade//false),
-      (.blacklisted//false),
-      (.blacklist_reason//"")
-    ] | @tsv' "$UP_JSON_OUT" \
-  | sort -t $'\t' -k1,1V
-)
 
+  done < <(
+    jq -r '.[] |
+      [
+        .ip,
+        .hostname,
+        .pid,
+        .current_version,
+        .target_version,
+        .plan_action,
+        .needs_upgrade,
+        .blacklisted,
+        .blacklist_reason,
+        .invalid,
+        .login
+      ] | @tsv' "$UP_JSON_OUT" | sort
+  )
+
+  # ------------------------------
+  # No items guard
+  # ------------------------------
   if (( ${#items[@]} == 0 )); then
-    dialog --no-shadow --infobox \
-      "No devices available for selection.\n(Upgrade plan had zero items.)" 7 60
-    sleep 3
+    dialog --no-shadow --infobox "No devices available." 6 50
+    sleep 2
+    echo "[]" > "$SEL_JSON_OUT"
     return 1
   fi
 
-  # Show selection dialog
   ui_stop
-  local tmp_sel; tmp_sel="$(mktemp)"
-  dialog --no-shadow --title "Select switches to upgrade" \
-         --backtitle "Upgrade Selection" \
-         --checklist "Use <SPACE> to toggle. BLACKLISTED entries are shown for visibility but cannot be selected (ignored even if checked)." \
-         22 140 15 \
-         "${items[@]}" 2> "$tmp_sel"
-  local rc=$?
-  if (( rc != 0 )); then
-    rm -f "$tmp_sel"
-    dialog --no-shadow --infobox "Selection cancelled." 5 40
-    sleep 2
-    return 2
-  fi
 
-  mapfile -t SEL_ARR < <(tr -d '"' < "$tmp_sel")
+  local tmp_sel
+  tmp_sel="$(mktemp)"
+
+  # 🔥 IMPORTANT: --separate-output fixes EVERYTHING
+  dialog --no-shadow \
+    --separate-output \
+    --title "Select switches to upgrade" \
+    --checklist "Select switches to include" \
+    22 140 15 \
+    "${items[@]}" 2> "$tmp_sel"
+
+  # ------------------------------
+  # FIXED parsing (robust)
+  # ------------------------------
+  local -a SEL_ARR=()
+
+  if [[ -s "$tmp_sel" ]]; then
+    mapfile -t SEL_ARR < "$tmp_sel"
+  fi
   rm -f "$tmp_sel"
 
-  # Filter out any blacklisted IPs from the user’s choices
+  # Debug (optional, remove later)
+  # printf '[DEBUG] Selected: %s\n' "${SEL_ARR[@]}" >&2
+
+  # ------------------------------
+  # Filter out blocked (safety)
+  # ------------------------------
   local -a FILTERED_SEL=()
-  local ip
   for ip in "${SEL_ARR[@]}"; do
     [[ -z "$ip" ]] && continue
-    if [[ -n "${BLKMAP[$ip]:-}" ]]; then
-      # BLACKLISTED: ignore this entry entirely
-      continue
-    fi
+    [[ -n "${BLKMAP[$ip]:-}" ]] && continue
     FILTERED_SEL+=("$ip")
   done
 
+  # ------------------------------
+  # Nothing selected
+  # ------------------------------
   if (( ${#FILTERED_SEL[@]} == 0 )); then
-    dialog --no-shadow --infobox \
-"All selected devices are BLACKLISTED (e.g. meraki-user exists or unknown device).
-Clean up configuration before attempting to migrate these switches." 8 80
-    sleep 3
-    return 3
+    dialog --no-shadow --infobox "No valid devices selected." 6 50
+    sleep 2
+    echo "[]" > "$SEL_JSON_OUT"
+    return 2
   fi
 
+  # ------------------------------
+  # Build JSON (ONLY thing you care about now)
+  # ------------------------------
   local ips_json
   ips_json="$(printf '%s\n' "${FILTERED_SEL[@]}" | jq -R -s 'split("\n")|map(select(length>0))')"
-  jq --argjson ips "$ips_json" '[ .[] | select( (.ip|tostring) as $x | $ips | index($x) ) ]' "$UP_JSON_OUT" > "$SEL_JSON_OUT"
 
-  {
-    echo "ip,hostname,pid,current_version,target_version,plan_action,target_file,target_path,target_size_bytes,needs_upgrade,blacklisted,blacklist_reason"
-    jq -r '.[] | [
-        .ip,
-        (.hostname//""),
-        (.pid//""),
-        (.current_version//""),
-        (.target_version//""),
-        (.plan_action//""),
-        (.target_file//""),
-        (.target_path//""),
-        (.target_size_bytes//""),
-        (.needs_upgrade//false),
-        (.blacklisted//false),
-        (.blacklist_reason//"")
-      ] | @csv' "$SEL_JSON_OUT"
-  } > "$SEL_CSV_OUT"
+  jq --argjson ips "$ips_json" \
+    '[ .[] | select(.ip as $x | $ips | index($x)) ]' \
+    "$UP_JSON_OUT" > "$SEL_JSON_OUT"
 
-  {
-    echo "# Generated $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    printf "export UPGRADE_BASE_ENV=%q\n" "$ENV_FILE"
-    printf "export UPGRADE_SELECTED_IPS=%q\n" "${FILTERED_SEL[*]}"
-    printf "export UPGRADE_SELECTED_JSON=%q\n" "$SEL_JSON_OUT"
-    printf "export UPGRADE_SELECTED_CSV=%q\n" "$SEL_CSV_OUT"
-  } > "$SEL_ENV_OUT"
-
-  dialog --no-shadow --infobox \
-"Selection saved.
-
-BLACKLISTED entries (e.g. meraki-user exists or unknown device) were ignored." 8 90
-  sleep 3
-  return 0
+  ui_status "Selection complete: ${#FILTERED_SEL[@]} device(s)."
 }
 
 # ===== Main =====
@@ -1176,4 +1098,4 @@ main() {
   log_msg "=== scan run complete ==="
 }
 
-main "$@
+main "$@"
