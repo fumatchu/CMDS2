@@ -245,18 +245,75 @@ build_vlan_summary() {
 # ------------------------------------------------------------
 # PROFILE + ASSIGN (UNCHANGED CORE)
 # ------------------------------------------------------------
+active_vlans_to_json() {
+  local s="${1:-}"
+
+  if [[ -z "$s" || "$s" == "null" ]]; then
+    echo '[]'
+    return 0
+  fi
+
+  printf '%s\n' "$s" \
+    | tr ',' '\n' \
+    | awk '
+        /^[0-9]+-[0-9]+$/ {
+          split($0, a, "-");
+          for (i = a[1]; i <= a[2]; i++) print i;
+          next
+        }
+        /^[0-9]+$/ { print $0 }
+      ' \
+    | sort -n \
+    | uniq \
+    | jq -R . \
+    | jq -s 'map(select(length > 0) | tonumber)'
+}
+
 apply_profile() {
   local net="$1"
   local vlans="$2"
-  local name iname payload resp
+
+  local name iname
+  local existing existing_vlans existing_json
+  local merged vlan_str payload resp update_resp
+
+  ACTION=""
+  ACTION_REASON=""
 
   name="CMDS-VLAN-PROFILE-$net"
   iname=$(echo "$name" | tr -cd 'A-Za-z0-9')
 
+  # ------------------------------------------------------------
+  # GET EXISTING PROFILE DATA
+  # ------------------------------------------------------------
+  existing=$(meraki_api GET "/networks/$net/vlanProfiles")
+
+  existing_vlans=$(echo "$existing" | jq -r --arg i "$iname" '
+    .[] | select(.iname == $i) | .activeVlans // ""
+  ' | head -n1)
+
+  # ------------------------------------------------------------
+  # CONVERT EXISTING VLAN STRING → JSON ARRAY
+  # ------------------------------------------------------------
+  existing_json=$(active_vlans_to_json "$existing_vlans")
+
+  # ------------------------------------------------------------
+  # MERGE EXISTING + NEW VLANS (NON-DESTRUCTIVE)
+  # ------------------------------------------------------------
+  merged=$(jq -n \
+    --argjson a "$existing_json" \
+    --argjson b "$vlans" \
+    '($a + $b + [1]) | unique | sort')
+
+  vlan_str=$(echo "$merged" | jq -r 'join(",")')
+
+  # ------------------------------------------------------------
+  # BUILD PAYLOAD
+  # ------------------------------------------------------------
   payload=$(jq -n \
     --arg n "$name" \
     --arg i "$iname" \
-    --arg v "$(echo "$vlans" | jq -r 'join(",")')" '
+    --arg v "$vlan_str" '
     {
       name: $n,
       iname: $i,
@@ -265,16 +322,29 @@ apply_profile() {
       vlanGroups: []
     }')
 
+  # ------------------------------------------------------------
+  # CREATE OR UPDATE PROFILE
+  # ------------------------------------------------------------
   resp=$(meraki_api POST "/networks/$net/vlanProfiles" "$payload")
 
-  if echo "$resp" | jq -e '.errors' >/dev/null; then
-    meraki_api PUT "/networks/$net/vlanProfiles/$iname" "$payload" >/dev/null
+  if echo "$resp" | jq -e '.errors' >/dev/null 2>&1; then
+    log "INFO: Profile exists or POST failed → updating"
+
+    update_resp=$(meraki_api PUT "/networks/$net/vlanProfiles/$iname" "$payload")
+
+    if echo "$update_resp" | jq -e '.errors' >/dev/null 2>&1; then
+      ACTION="FAILED"
+      ACTION_REASON="$update_resp"
+      return 1
+    fi
+
     ACTION="UPDATED"
   else
     ACTION="CREATED"
   fi
-}
 
+  return 0
+}
 assign_profile() {
   local net="$1"
   local iname="$2"
