@@ -1176,4 +1176,4 @@ main() {
   log_msg "=== scan run complete ==="
 }
 
-main "$@"
+main "$@
