@@ -2,7 +2,7 @@
 
 ##############################################################
 THIS REPOSIROTY IS ARCHIVED AND NO LONGER MAINTAINED
-Please use **CMDS2** instead:
+Please use **CMDS_WEB** instead:
 👉 https://github.com/fumatchu/CMDS_WEB
 
 This code remains available for historical reference.
