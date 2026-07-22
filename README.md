@@ -1,3 +1,15 @@
+# ⚠️ Archived Project
+
+##############################################################
+THIS REPOSIROTY IS ARCHIVED AND NO LONGER MAINTAINED
+Please use **CMDS2** instead:
+👉 https://github.com/fumatchu/CMDS_WEB
+
+This code remains available for historical reference.
+##############################################################
+
+
+
 # CMDS2 – Meraki / Catalyst Migration Platform
 
 With the changes to the Meraki platform and Catalyst integration, this is **Version 2 of CMDS**, designed to migrate switches leveraging **Service Meraki Connect** within IOS-XE packaging.
